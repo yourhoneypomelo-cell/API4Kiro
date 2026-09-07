@@ -1,0 +1,44 @@
+# 依赖与构建产物
+node_modules/
+dist/
+out/
+*.vsix
+*.tsbuildinfo
+
+# 测试构建输出（源码 *.ts / *.js / run.js 保留，仅排除生成目录）
+tests/.out/
+tests/**/.build/
+tests/**/.out/
+
+# Kiro 专有编译产物的本地拷贝（选择器补丁测试用；不随开源仓分发，避免转发第三方专有代码）
+tests/selector/fixtures/
+.verify-artifacts/
+
+# 内部工作区状态 / 规格 / 日志 / 基线（开源仓只放可构建源码）
+docs/
+
+# AI 工作区公约适配器（内部流程，非产品）
+AGENTS.md
+CLAUDE.md
+.cursor/
+.gemini/
+.github/copilot-instructions.md
+
+# 根目录开发草稿（截图 / 一次性脚本 / 快照），非构建所需；仅保留 esbuild.js 等构建文件
+/*.png
+/*.html
+/*.py
+/*.js
+!/esbuild.js
+/CONTEXT_SNAPSHOT.md
+/来源.md
+/补或砍.md
+/real-sankey-data.json
+
+# 本地专有密钥：Antigravity（Google Cloud Code）登录 client secret，构建时注入，不进公开仓
+/antigravity.secret
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db
