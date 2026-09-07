@@ -304,6 +304,7 @@ API4Kiro/
 │
 ├── assets/
 │   ├── icon.png / icon.svg     扩展图标 / 活动栏单色图标
+│   ├── icon-source.svg         彩色图标源；scripts/render-icon.py 渲染为 icon.png（不进 vsix）
 │   ├── providers/              厂商 Logo（SVG + PNG 剪影）+ LICENSE.md
 │   ├── glyphs/                 自绘几何线稿 Logo（自定义渠道可选）
 │   ├── ccswitch.png            CC Switch 标识（导入入口）
@@ -313,7 +314,8 @@ API4Kiro/
 │   ├── ARCHITECTURE.md         架构概览：请求流程、模块边界、Key 池状态机、Kiro 补丁机制
 │   └── CONFIGURATION.md        全部配置项参考（由 package.json 生成）
 ├── scripts/
-│   └── gen-config-doc.js       生成 docs/CONFIGURATION.md
+│   ├── gen-config-doc.js       生成 docs/CONFIGURATION.md
+│   └── render-icon.py          从 assets/icon-source.svg 渲染并像素级校验 assets/icon.png（Playwright + Pillow）
 ├── .github/
 │   ├── workflows/ci.yml        push / PR：npm ci → tsc → 打包并上传 vsix；v* tag：挂到 Release
 │   └── ISSUE_TEMPLATE/         Bug 报告 / 功能建议表单

@@ -29,7 +29,8 @@
 3. 提交前确认 `npm run compile` 与 `npm run package` 通过；CI 会在 PR 上再跑一遍
 4. 改动涉及 Kiro 前端补丁（`src/selectorStyle.ts`）时，请在 PR 描述中写明验证过的 Kiro 版本
 5. 改了 `package.json` 里的配置项后运行 `node scripts/gen-config-doc.js` 重新生成 `docs/CONFIGURATION.md`，一并提交
-6. 不要提交任何密钥、token、个人端点地址
+6. 改图标只编辑 `assets/icon-source.svg`，然后 `python scripts/render-icon.py`（需 `pip install playwright pillow` 与 `python -m playwright install chromium`）重新渲染 `assets/icon.png`；脚本会校验圆角外全透明、无白边
+7. 不要提交任何密钥、token、个人端点地址
 
 ## 版本与发布
 
