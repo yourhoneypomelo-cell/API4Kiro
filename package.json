@@ -510,15 +510,8 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./tsconfig.json --noEmit && node scripts/check-webview.js",
-    "test": "npm run test:core && npm run test:proto && npm run test:store",
-    "test:core": "node tests/build.js --run",
-    "test:proto": "node tests/proto/build.js && node tests/proto/run.js",
-    "test:store": "node tests/store/build.js && node tests/store/run.js",
-    "test:selector": "node tests/selector/build.js && node tests/selector/run.js",
-    "probe:kiro": "node tests/selector/build.js && node tests/selector/probe-kiro.js",
-    "check:selector-patch": "node scripts/check-selector-patch.js",
-    "render:panel": "node scripts/render-panel.js --all",
+    "compile": "tsc -p ./tsconfig.json --noEmit",
+    "watch": "node esbuild.js --watch",
     "bundle": "node esbuild.js",
     "package": "node esbuild.js && npx @vscode/vsce package --allow-star-activation --skip-license --allow-missing-repository --no-dependencies"
   },

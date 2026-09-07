@@ -1,3 +1,10 @@
+# 开源公开仓只放插件本体（src / assets / 构建配置 / README / LICENSE）：
+# 测试套件、开发 / QA / 工作区治理脚本一律不进公开仓（本地保留，仅不跟踪）。
+tests/
+scripts/
+__pycache__/
+*.pyc
+
 # 依赖与构建产物
 node_modules/
 dist/
