@@ -1,6 +1,6 @@
 # 配置项参考
 
-> 本文由 `node scripts/gen-config-doc.js` 从 `package.json` 生成（版本 4.13.51），请勿手改；改设置项后重新生成。
+> 本文由 `node scripts/gen-config-doc.js` 从 `package.json` 生成（版本 4.13.52），请勿手改；改设置项后重新生成。
 
 共 41 项：`api2kiroDual.*` 38 项 + 由扩展自动管理的 Kiro 内部端点 3 项。所有设置都在 VS Code / Kiro 的 settings.json 里生效；渠道相关的项一般在侧边栏面板里维护，无需手填。
 

@@ -2,7 +2,7 @@
   "name": "api2kiro-dual",
   "displayName": "API4Kiro",
   "description": "把多家 API 聚合接入 Kiro：厂商账号登录（Kimi / Codex / xAI / Antigravity / Anthropic / Kiro 官方多账号）、第三方 Key、自定义端点（Anthropic Messages / Chat Completions / Responses / Gemini 四种格式）；按模型自动路由、模型测活、用量统计、提示词注入。",
-  "version": "4.13.51",
+  "version": "4.13.52",
   "publisher": "api2kiro-dual",
   "license": "MIT",
   "icon": "assets/icon.png",
