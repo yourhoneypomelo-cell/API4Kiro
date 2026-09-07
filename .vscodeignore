@@ -7,6 +7,8 @@ node_modules/**
 tsconfig.json
 esbuild.js
 .gitignore
+.gitattributes
+antigravity.secret
 .editorconfig
 **/.DS_Store
 kiro2cc-proxy/**
