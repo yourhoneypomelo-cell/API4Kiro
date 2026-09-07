@@ -35,6 +35,7 @@ docs/**
 .cursor/**
 .gemini/**
 .github/**
+CONTRIBUTING.md
 AGENTS.md
 CLAUDE.md
 CONTEXT_SNAPSHOT.md

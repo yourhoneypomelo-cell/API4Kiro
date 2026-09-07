@@ -1,0 +1,23 @@
+name: 功能建议
+description: 新渠道 / 新协议 / 新能力 / 体验改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 现在哪一步不顺、缺什么
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的做法
+      description: 希望它如何工作；有参考实现或文档链接请一起给出
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案（可选）

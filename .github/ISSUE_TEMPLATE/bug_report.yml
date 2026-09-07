@@ -1,0 +1,65 @@
+name: Bug 报告
+description: 功能异常、请求失败、界面错乱等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: kiro-version
+    attributes:
+      label: Kiro 版本
+      description: Kiro → 帮助 → 关于
+      placeholder: "1.0.437"
+    validations:
+      required: true
+  - type: input
+    id: ext-version
+    attributes:
+      label: API4Kiro 版本
+      description: 侧边栏设置页「关于」卡片，或扩展面板
+      placeholder: "4.13.51"
+    validations:
+      required: true
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: 涉及的渠道协议
+      multiple: true
+      options:
+        - Anthropic Messages
+        - OpenAI Chat Completions
+        - OpenAI Responses
+        - Gemini generateContent
+        - 厂商账号登录（OAuth）
+        - Kiro 官方
+        - 与渠道无关（界面 / 用量 / 设置）
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 添加渠道 …
+        2. 选择模型 …
+        3. 发送 …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 有截图请一起贴
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: 调试日志片段（可选）
+      description: 设置里打开 `api2kiroDual.debug` 复现后，用命令「API4Kiro: 打开调试日志」导出。日志已脱敏 Key，贴出前请再自查
+      render: text
