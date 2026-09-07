@@ -28,7 +28,8 @@
 2. 提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)：`feat:`、`fix:`、`docs:`、`refactor:`、`chore:` 等
 3. 提交前确认 `npm run compile` 与 `npm run package` 通过；CI 会在 PR 上再跑一遍
 4. 改动涉及 Kiro 前端补丁（`src/selectorStyle.ts`）时，请在 PR 描述中写明验证过的 Kiro 版本
-5. 不要提交任何密钥、token、个人端点地址
+5. 改了 `package.json` 里的配置项后运行 `node scripts/gen-config-doc.js` 重新生成 `docs/CONFIGURATION.md`，一并提交
+6. 不要提交任何密钥、token、个人端点地址
 
 ## 版本与发布
 
