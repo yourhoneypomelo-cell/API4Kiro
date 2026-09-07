@@ -56,7 +56,7 @@
 
 ## 从源码构建
 
-需要 Node.js 18 或更高版本（CI 使用 Node 20）。
+需要 Node.js 18 或更高版本（CI 使用 Node 22）。
 
 ```bash
 npm ci
