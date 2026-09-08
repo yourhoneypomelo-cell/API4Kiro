@@ -3,10 +3,10 @@
  * 登录会话（起流程 / 取消 / 把进度推给 UI）。
  */
 
-import { Credential, PRIMARY_CREDENTIAL_ID, ProviderConfig, credentialsOf, tokenKeyOf } from "../providers";
+import { Credential, PRIMARY_CREDENTIAL_ID, ProviderConfig, checkOAuthHost, credentialsOf, tokenKeyOf } from "../providers";
 import { debug, error, info } from "../log";
 import { CancelSignal, DeviceCode, LoginCancelled } from "./core";
-import { OAuthToken, getToken, setToken } from "./tokenStore";
+import { OAuthToken, getToken, setToken, tokenStoreLoadError } from "./tokenStore";
 import { LoginContext, LoginMode, OAuthVendorId, VendorModel, VendorSpec, getVendor } from "./vendors";
 
 /** 过期前这么久就刷新（对齐 CPA 的 5 分钟）。 */
@@ -33,7 +33,9 @@ export function oauthState(p: ProviderConfig, credentialId: string = PRIMARY_CRE
   const key = tokenKeyOf(p.id, credentialId);
   const tok = getToken(key);
   if (!tok) {
-    return { state: "missing" };
+    // 钥匙串没读出来（不是真的没登录）：把原因带给 UI（编辑弹窗会显示 loginError）
+    const le = tokenStoreLoadError();
+    return le ? { state: "missing", error: le.message } : { state: "missing" };
   }
   const err = invalid.get(key);
   if (err) {
@@ -65,12 +67,19 @@ export async function ensureAccessToken(p: ProviderConfig, force = false, cred?:
   if (!spec) {
     throw new Error("provider 不是 OAuth 登录类型");
   }
+  // 地址不是厂商规格宿主（且未 allowCustomHost）：连 token 都不交出去。调用方都是「拿到 token 就去请求 p.baseUrl」，
+  // 这里拒绝等于那次请求根本不发生；原因不含凭据，可直接给用户看。
+  const rejected = checkOAuthHost(p);
+  if (rejected) {
+    throw new Error(`「${p.name}」${rejected}`);
+  }
   const c = credOf(p, cred);
   const key = tokenKeyOf(p.id, c.id);
   const who = c.id === PRIMARY_CREDENTIAL_ID ? p.name : `${p.name} · ${c.label || c.id}`;
   const tok = getToken(key);
   if (!tok) {
-    throw new NeedsLoginError(p.id, `「${who}」尚未登录，请在 provider 设置里登录`);
+    const le = tokenStoreLoadError();
+    throw new NeedsLoginError(p.id, le ? `「${who}」${le.message}` : `「${who}」尚未登录，请在 provider 设置里登录`);
   }
   if (!needsRefresh(tok, force)) {
     if (invalid.has(key) && !force) {

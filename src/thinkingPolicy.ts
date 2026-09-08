@@ -27,7 +27,9 @@
  *   回传的前提是 Kiro 得先把思考留在历史里。Kiro 只保留**带签名**的 reasoning
  *   （"Dropping unsigned reasoning from history"），OpenAI 协议没有签名，所以转换器在思考结束时
  *   补一个合成签名占位；Anthropic 侧回传历史时要认出它并跳过（见 translate.extractThinkingBlock），
- *   否则用户中途把模型切到 Claude 会撞上 "Invalid signature" 400。
+ *   否则用户中途把模型切到 Claude 会撞上 "Invalid signature" 400。Gemini / Responses 通路同样借
+ *   signature 字段存自己的 thoughtSignature / encrypted_content（带前缀封装），对 Anthropic 一样是
+ *   外来签名——全部前缀集中在 RELAY_SIGNATURE_PREFIXES，Anthropic 用 isRelaySignature 一次过滤。
  *
  * 三、把回答写进思考通道的习惯
  *   GLM-5.3 系（模板无条件注入 <think>）在闲聊 / 问候式问题上常常不推敲，直接在 think 里把最终回答
@@ -43,11 +45,37 @@
 import { lookupCapability } from "./modelCatalog";
 import { EffortLevel } from "./modelStore";
 
-/** 合成签名：OpenAI 通路上"没有签名"的占位，让 Kiro 把思考留在历史里。 */
-export const SYNTHETIC_REASONING_SIGNATURE = "api4kiro:unsigned-reasoning";
+/** Chat 通路占位签名的前缀；后面不带任何可回放内容。 */
+const SYNTHETIC_SIGNATURE_PREFIX = "api4kiro:";
 
+/** 合成签名：OpenAI 通路上"没有签名"的占位，让 Kiro 把思考留在历史里。 */
+export const SYNTHETIC_REASONING_SIGNATURE = SYNTHETIC_SIGNATURE_PREFIX + "unsigned-reasoning";
+
+/**
+ * 本扩展各通路写进 Kiro 历史 reasoning signature 的**全部**前缀。新增通路封装签名时必须加到这里
+ * （tests/proto/anthropic.test.ts 用各通路的 encode 函数对照校验，漏了会红）：
+ *  - "api4kiro:"  Chat Completions 的占位（openaiStream → SYNTHETIC_REASONING_SIGNATURE），无可回放内容；
+ *  - "a2k-gm:"    Gemini thoughtSignature 的封装（geminiStream.encodeGeminiSignature），只有 Gemini 通路能回放；
+ *  - "a2k-rs:"    Responses encrypted_content 的封装（responsesStream.encodeReasoningSignature），只有 Responses 通路能回放。
+ * 不带这些前缀的才可能是 Anthropic 真签名（anthropicStream 把 signature_delta 原样透传，不加前缀）。
+ */
+export const RELAY_SIGNATURE_PREFIXES: readonly string[] = [SYNTHETIC_SIGNATURE_PREFIX, "a2k-gm:", "a2k-rs:"];
+
+/**
+ * 占位合成签名（api4kiro:）：任何通路都没法回放，一律当"无签名"。
+ * 故意只认这一个前缀——Gemini 通路（geminiTranslate.reasoningOf）用它把占位剔掉后再解自己的 a2k-gm:，
+ * 若把 a2k-gm: 也算进来，Gemini 就丢了自己的签名。跨通路的"是不是别家造的"判定用 isRelaySignature。
+ */
 export function isSyntheticSignature(sig: string | undefined | null): boolean {
-  return typeof sig === "string" && sig.startsWith("api4kiro:");
+  return typeof sig === "string" && sig.startsWith(SYNTHETIC_SIGNATURE_PREFIX);
+}
+
+/**
+ * 是不是本扩展任一通路造的签名（占位，或 Gemini / Responses 的封装）。Anthropic 回放历史 thinking 块时
+ * 用它过滤：这些都不是 Anthropic 签发的，原样发出去只会换来 400 "Invalid signature"。
+ */
+export function isRelaySignature(sig: string | undefined | null): boolean {
+  return typeof sig === "string" && RELAY_SIGNATURE_PREFIXES.some((p) => sig.startsWith(p));
 }
 
 function bare(modelId: string): string {

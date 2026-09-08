@@ -109,9 +109,10 @@ export class PortHolder {
       return;
     }
 
-    const holder = await probeIdentity(this.port);
+    // 身份验签与让位签名都绑定本端口的角色（krs / cps）：把探测中转给另一角色的合法实例换不来能用的签名。
+    const holder = await probeIdentity(this.port, this.role);
     if (!holder) {
-      // 端口被外部进程占着，无法共享，也不该去动它。
+      // 端口被外部进程占着（包括 4.13.53 起「自称自己人但身份签名不过」的冒占者），无法共享，也不该去动它。
       this.owned = false;
       this.foreign = true;
       debug(`${this.label} port ${this.port} held by a foreign process`);
@@ -125,7 +126,9 @@ export class PortHolder {
       info(
         `${this.label} 端口 ${this.port} 被旧版本 v${holder.version} (pid ${holder.pid}) 占用，请求让位…`
       );
-      const answer = await probeIdentity(this.port, mine);
+      // 4.13.53 起对方应答里带一次性 nonce，让位请求要对它签名（共享密钥）；更旧的对端不给 nonce，
+      // 请求就不带签名头，对方也不看——升级路径与之前一致。
+      const answer = await probeIdentity(this.port, this.role, mine, holder.nonce);
       if (answer?.yielding) {
         await delay(YIELD_SETTLE_MS);
         if ((await this.bindOnce()) === "ok") {

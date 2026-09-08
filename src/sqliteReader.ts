@@ -61,6 +61,10 @@ function readVarint(b: Buffer, off: number): [bigint, number] {
     }
   }
   v = (v << 8n) | BigInt(b[off + 8]);
+  // 9 字节形式是完整的 64 位二进制补码：负 rowid（如 INTEGER PRIMARY KEY 显式插入负值）要补符号
+  if (v >= 1n << 63n) {
+    v -= 1n << 64n;
+  }
   return [v, 9];
 }
 
@@ -173,8 +177,8 @@ function walkTable(pg: Pager, rootPage: number, onRow: (values: SqlValue[], rowi
   visit(rootPage);
 }
 
-/** 从 CREATE TABLE 语句里抠出列名（按顶层逗号切，忽略表级约束）。 */
-export function columnsFromCreateSql(sql: string): string[] {
+/** CREATE TABLE 括号体按顶层逗号切成若干段（列定义或表级约束），去掉首尾空白，空段丢弃。 */
+function splitCreateSqlParts(sql: string): string[] {
   const open = sql.indexOf("(");
   const close = sql.lastIndexOf(")");
   if (open < 0 || close < open) {
@@ -198,23 +202,104 @@ export function columnsFromCreateSql(sql: string): string[] {
     }
   }
   parts.push(cur);
+  return parts.map((p) => p.trim()).filter((p) => p.length > 0);
+}
+
+const TABLE_CONSTRAINT_RE = /^(PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN\s+KEY|CONSTRAINT)\b/i;
+/** 标识符：双引号 / 反引号 / 方括号 / 裸名。 */
+const IDENT_RE = /^("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))/;
+
+function identName(m: RegExpExecArray): string {
+  return m[2] || m[3] || m[4] || m[5];
+}
+
+/** 一段列定义 → { name, type（声明类型的原文，可能为空）, rest（类型之后的约束串）}。不是列定义返回 undefined。 */
+function parseColumnDef(part: string): { name: string; type: string; rest: string } | undefined {
+  if (TABLE_CONSTRAINT_RE.test(part)) {
+    return undefined;
+  }
+  const m = IDENT_RE.exec(part);
+  if (!m) {
+    return undefined;
+  }
+  const after = part.slice(m[0].length).trim();
+  // 声明类型 = 第一个列约束关键字之前的全部（可含空格与括号，如 VARCHAR(20)、UNSIGNED BIG INT）
+  const kw = /\b(CONSTRAINT|PRIMARY|NOT|NULL|UNIQUE|CHECK|DEFAULT|COLLATE|REFERENCES|GENERATED|AS)\b/i.exec(after);
+  const type = (kw ? after.slice(0, kw.index) : after).trim();
+  const rest = kw ? after.slice(kw.index) : "";
+  return { name: identName(m), type, rest };
+}
+
+/** 从 CREATE TABLE 语句里抠出列名（按顶层逗号切，忽略表级约束）。 */
+export function columnsFromCreateSql(sql: string): string[] {
   const cols: string[] = [];
-  for (const raw of parts) {
-    const s = raw.trim();
-    if (!s || /^(PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN\s+KEY|CONSTRAINT)\b/i.test(s)) {
-      continue;
-    }
-    const m = /^("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))/.exec(s);
-    if (m) {
-      cols.push(m[2] || m[3] || m[4] || m[5]);
+  for (const part of splitCreateSqlParts(sql)) {
+    const col = parseColumnDef(part);
+    if (col) {
+      cols.push(col.name);
     }
   }
   return cols;
 }
 
 /**
+ * 找出 rowid 别名列（SQLite 文档「ROWID and the INTEGER PRIMARY KEY」）：声明类型恰为 `INTEGER`（大小写不敏感）且
+ * - 列约束 `PRIMARY KEY` / `PRIMARY KEY ASC`（`PRIMARY KEY DESC` 是历史怪癖，**不是**别名），或
+ * - 表级 `PRIMARY KEY (col)` / `(col ASC)` / `(col DESC)` 单列（表级写法带 DESC 仍是别名）。
+ * 这样的列在记录里存 NULL，真值是 rowid。`INT PRIMARY KEY`、`INTEGER PRIMARY KEY DESC`、复合主键、WITHOUT ROWID 表都不算。
+ * 找不到返回 undefined。
+ */
+export function rowidAliasFromCreateSql(sql: string): string | undefined {
+  if (/\bWITHOUT\s+ROWID\b/i.test(sql.slice(sql.lastIndexOf(")") + 1))) {
+    return undefined;
+  }
+  const cols: Array<{ name: string; type: string; rest: string }> = [];
+  const tableConstraints: string[] = [];
+  for (const part of splitCreateSqlParts(sql)) {
+    const col = parseColumnDef(part);
+    if (col) {
+      cols.push(col);
+    } else {
+      tableConstraints.push(part);
+    }
+  }
+  const isInteger = (t: string) => t.toUpperCase() === "INTEGER";
+  for (const col of cols) {
+    const pk = /\bPRIMARY\s+KEY\b(\s+(ASC|DESC)\b)?/i.exec(col.rest);
+    if (pk && isInteger(col.type) && !(pk[2] && pk[2].toUpperCase() === "DESC")) {
+      return col.name;
+    }
+  }
+  for (const tc of tableConstraints) {
+    const m = /^(?:CONSTRAINT\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)\s+)?PRIMARY\s+KEY\s*\(([^)]*)\)/i.exec(tc);
+    if (!m) {
+      continue;
+    }
+    const inner = m[1].trim();
+    if (inner.includes(",")) {
+      return undefined; // 复合主键
+    }
+    const im = IDENT_RE.exec(inner);
+    if (!im) {
+      return undefined;
+    }
+    const name = identName(im);
+    const col = cols.find((c) => c.name.toLowerCase() === name.toLowerCase());
+    return col && isInteger(col.type) ? col.name : undefined;
+  }
+  return undefined;
+}
+
+/** rowid（有符号 64 位）转成 number；超出安全整数范围保留 bigint。 */
+function rowidValue(rowid: bigint): number | bigint {
+  return rowid >= BigInt(Number.MIN_SAFE_INTEGER) && rowid <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rowid) : rowid;
+}
+
+/**
  * 读出一张表的所有行（按列名组织）。表不存在返回 undefined。
  * 老行可能比当前列少（后来 ALTER 加的列），缺的填 null。
+ * rowid 别名列（`INTEGER PRIMARY KEY`，见 `rowidAliasFromCreateSql`）在记录里存 NULL，读出时用 rowid 填充；
+ * `__rowid` 一律附带。
  */
 export function readTable(dbPath: string, table: string): Array<Record<string, SqlValue>> | undefined {
   const pg = openPager(dbPath);
@@ -232,14 +317,16 @@ export function readTable(dbPath: string, table: string): Array<Record<string, S
       return undefined;
     }
     const cols = columnsFromCreateSql(createSql);
+    const alias = rowidAliasFromCreateSql(createSql);
     const rows: Array<Record<string, SqlValue>> = [];
     walkTable(pg, root, (v, rowid) => {
       const row: Record<string, SqlValue> = {};
       cols.forEach((c, i) => {
-        // INTEGER PRIMARY KEY 列在记录里存 NULL，真值是 rowid
-        row[c] = i < v.length ? v[i] : null;
+        const stored = i < v.length ? v[i] : null;
+        // 别名列记录里恒为 NULL，真值是 rowid；万一存了非 NULL（不该发生）也以 rowid 为准，与 SQLite 语义一致
+        row[c] = c === alias ? rowidValue(rowid) : stored;
       });
-      row.__rowid = Number(rowid);
+      row.__rowid = rowidValue(rowid);
       rows.push(row);
     });
     return rows;

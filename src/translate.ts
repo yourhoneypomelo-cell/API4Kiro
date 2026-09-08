@@ -15,7 +15,8 @@ import { hasEffortVariant, thinkingVariantOf, EffortLevel } from "./modelStore";
 import { budgetForEffort, getEffortMode } from "./effort";
 import { activePromptText } from "./promptStore";
 import { inlineLocalRefs } from "./schemaUtil";
-import { isSyntheticSignature } from "./thinkingPolicy";
+import { imageMediaType } from "./mediaType";
+import { isRelaySignature } from "./thinkingPolicy";
 
 const DEFAULT_MODEL_ID = "CLAUDE_SONNET_4_20250514_V1_0";
 
@@ -46,9 +47,10 @@ function extractThinkingBlock(
     signature = arm.reasoningSignature;
   }
   // Anthropic 硬要求 thinking 块带签名，否则后端 400。无签名则不回传。
-  // OpenAI 通路为了让 Kiro 保留思考而补的合成签名也算"无签名"：那段思考是别家模型想的，
-  // 用户中途切到 Claude 时带过去只会换来 "Invalid signature"。
-  if (text && signature && text.length > 0 && signature.length > 0 && !isSyntheticSignature(signature)) {
+  // 本扩展其它通路写进历史的签名也算"无签名"（Chat 的 api4kiro: 占位、Gemini 的 a2k-gm: 封装、
+  // Responses 的 a2k-rs: 封装，见 thinkingPolicy.RELAY_SIGNATURE_PREFIXES）：那段思考是别家模型想的，
+  // 用户中途切到 Claude 时原样带过去只会换来 400 "Invalid signature"。整块丢弃，不降级成正文。
+  if (text && signature && text.length > 0 && signature.length > 0 && !isRelaySignature(signature)) {
     return { type: "thinking", thinking: text, signature };
   }
   return null;
@@ -262,7 +264,8 @@ export function buildAnthropicRequest(req: CwRequest, provider: ProviderConfig):
           type: "image",
           source: {
             type: "base64",
-            media_type: "image/" + img.format.toLowerCase(),
+            // Anthropic 只认 image/jpeg|png|gif|webp：jpg → jpeg、缺失 → png，与其它三通路同一归一
+            media_type: imageMediaType(img.format),
             data: img.source.bytes,
           },
         });

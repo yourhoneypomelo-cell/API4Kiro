@@ -23,6 +23,7 @@ import { initPromptStore } from "./promptStore";
 import { flushTokens, initTokenStore } from "./oauth/tokenStore";
 import { setOAuthClientVersion } from "./oauth/vendors";
 import { cancelAllLogins } from "./oauth";
+import { initIdentityKey } from "./identityKey";
 
 let krsServer: KrsProxyServer | undefined;
 let cpsServer: CpsProxyServer | undefined;
@@ -35,6 +36,9 @@ let reloadPrompted = false;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   initLog();
   initConfig(context);
+  // 多窗口握手（让位 / 对端认证）的共享密钥：同一用户的所有窗口读 globalStorage 下同一个文件。
+  // 必须在 startAndOverride 之前就位；失败只降级（拒绝一切让位、探测沿用旧判定），不阻塞激活。
+  await initIdentityKey(context);
   // 本地改动：endpoints 需要 globalState 来暂存被覆盖前的 workspace 端点原值。
   initEndpoints(context);
   // 学到的"纯文本模型"名单也落 globalState，重启后不必再被 400 一次。

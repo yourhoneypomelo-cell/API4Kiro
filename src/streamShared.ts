@@ -176,19 +176,100 @@ export function buildMeteringEvents(usage: CapturedUsage): CwEvent[] {
  */
 export type CwStopReason = "END_TURN" | "MAX_TOKENS" | "TOOL_USE" | "STOP_SEQUENCE";
 
-/** 把各协议的结束原因归一到 Kiro 的枚举。认不出的一律 END_TURN——宁可少一次续写，也别再触发重发。 */
+/**
+ * 把各协议的结束原因归一到 Kiro 的枚举。认不出的一律 END_TURN——宁可少一次续写，也别再触发重发。
+ *
+ * 长度截断（Anthropic max_tokens / OpenAI length / Responses max_output_tokens / Gemini MAX_TOKENS 归一后的 max_tokens）
+ * **优先于** sawToolUse：Kiro 的 ProcessChunkStream 只认 `stopReason=max_tokens`（或末尾工具没收到 stop）来触发原生的
+ * OutputTruncatedError——工具不执行、把「输出被截断，请拆小再调」的指导作为工具结果回给模型。以前 sawToolUse 压过它、
+ * 有工具就恒发 TOOL_USE，等于把一次被截断的工具调用伪装成完成：Kiro 会照常执行半截参数（Anthropic 通路原样透传的截断
+ * JSON 会被 Kiro 的 partial-JSON 解析修补成半个对象，fs_write 就写出半个文件）。
+ */
 export function toCwStopReason(raw: string | undefined | null, sawToolUse: boolean): CwStopReason {
   const r = String(raw || "").toLowerCase();
-  if (sawToolUse || r === "tool_use" || r === "tool_calls" || r === "function_call") {
-    return "TOOL_USE";
-  }
   if (r === "max_tokens" || r === "length" || r === "max_output_tokens") {
     return "MAX_TOKENS";
+  }
+  if (sawToolUse || r === "tool_use" || r === "tool_calls" || r === "function_call") {
+    return "TOOL_USE";
   }
   if (r === "stop_sequence") {
     return "STOP_SEQUENCE";
   }
   return "END_TURN";
+}
+
+/**
+ * 工具参数是否「没收全」：缓冲区非空、但不是完整 JSON（JSON.parse 抛错 = 括号 / 引号没闭合，流在参数中途被切）。
+ *
+ * 与合法空参数的区分：空缓冲区**不算**截断——那是本就无参数的工具（Anthropic 只发 content_block_start / OpenAI
+ * arguments:""），Kiro 侧同样把空参补成 {}，必须照常以 TOOL_USE 发出。能解析但不是对象（"null" / 数组）也不算：
+ * 那是完整的 JSON 值，只是形状不对，各通路维持原有降级（OpenAI 侧 {}、Anthropic 原样）。
+ */
+export function isTruncatedToolInput(args: string): boolean {
+  const s = (args || "").trim();
+  if (!s) {
+    return false;
+  }
+  try {
+    JSON.parse(s);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 上游在 2xx 流里塞的错误帧：OpenAI `{"error":…}` / Anthropic `type:"error"` / Responses `error`·`response.failed` /
+ * Gemini `{"error":…}`。转换器识别到就置到 `StreamConverter.streamError`，泵在流末据此把这次请求记成失败并给凭证冷却——
+ * 否则「200 + 流内配额错误」会被记成成功、这把 key 也不会避让。
+ */
+export interface StreamError {
+  /** 用户可见的 ❌ 文案正文（也是账本 error 字段的内容）。 */
+  message: string;
+  /** 上游给的错误类型 / 代码串（insufficient_quota / overloaded_error / rate_limit_exceeded / RESOURCE_EXHAUSTED …），分类时一并看。 */
+  type?: string;
+  /** 上游给的数字状态码（OpenAI error.code 为数字时 / Gemini error.code）。 */
+  status?: number;
+}
+
+/**
+ * 给流内错误帧推一个 HTTP 状态码，让它走 credentialPool.markFailure → classifyFailure 与非 2xx 相同的分流
+ * （401 鉴权 / 402 额度 / 403 无权限 / 429 限流 / 5xx 上游抖动 / 400 其它）。有数字码直接用；否则按类型串与文本里的关键字判。
+ * 额度类先判：New API 系中转把欠费塞在 429 / 403 的文案里，classifyFailure 对这两个状态码也是按文案再分一次。
+ */
+export function streamErrorStatus(err: StreamError): number {
+  if (typeof err.status === "number" && err.status >= 400 && err.status <= 599) {
+    return err.status;
+  }
+  const t = `${err.type || ""} ${err.message || ""}`.toLowerCase();
+  if (/quota|balance|insufficient|余额|额度|credit|billing|payment|exceeded your current|out of credits|extra usage/.test(t)) {
+    return 402;
+  }
+  if (/unauthorized|authentication|invalid[ _-]?(api[ _-]?)?key|incorrect api key|api key not valid|invalid token|token (has )?expired|鉴权|认证/.test(t)) {
+    return 401;
+  }
+  if (/forbidden|permission[ _]?(denied|error)|not allowed|无权限/.test(t)) {
+    return 403;
+  }
+  if (/rate[ _-]?limit|too many requests|resource[ _]?exhausted|throttl|限流/.test(t)) {
+    return 429;
+  }
+  if (/overloaded|server_error|api_error|internal|unavailable|bad gateway|timeout|timed out|upstream/.test(t)) {
+    return 503;
+  }
+  return 400;
+}
+
+/** 账本 / 日志用的一行错误文本：类型串 + 文案（文案本身已以类型开头时不重复）。 */
+export function streamErrorText(err: StreamError): string {
+  const t = err.type || "";
+  return t && !err.message.startsWith(t) ? `${t}: ${err.message}` : err.message;
+}
+
+/** 四条通路共用的「上游在流中返回错误」提示帧，紧跟已吐出的正文之后、stopReason 之前。 */
+export function streamErrorNotice(err: StreamError, modelId: string): CwEvent {
+  return { assistantResponseEvent: { content: `\n\n❌ 上游在流中返回错误：${err.message.slice(0, 800)}`, modelId } };
 }
 
 /** 流末必发的 stopReason 帧。放在 metadataEvent 里（Kiro 从 metadataEvent.stopReason 读）。 */
@@ -232,4 +313,9 @@ export interface StreamConverter {
    * 结算轮次账本并上报页脚用量（见 turnLedger.ts）。
    */
   readonly sawToolUse: boolean;
+  /**
+   * 上游在 2xx 流里返回的错误帧（见 StreamError）。flush 之后仍可读：泵据此把账本记成 ok:false、
+   * 给凭证 markFailure（按 streamErrorStatus 分类冷却）。没有错误帧时为 undefined。
+   */
+  readonly streamError: StreamError | undefined;
 }

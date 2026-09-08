@@ -375,8 +375,14 @@ const SVG_IMAGE =
 const SVG_OPENAI =
   '<svg viewBox="0 0 40 40" width="15" height="15" fill="currentColor"><path d="M32.837 16.48a9.49 9.49 0 0 0-.825-7.85 9.61 9.61 0 0 0-10.368-4.63 9.64 9.64 0 0 0-7.876 4.02 9.51 9.51 0 0 0-6.386 4.63 9.61 9.61 0 0 0 1.187 11.33 9.5 9.5 0 0 0 .817 7.84 9.62 9.62 0 0 0 10.378 4.63 9.64 9.64 0 0 0 7.87-4.01 9.53 9.53 0 0 0 6.384-4.63 9.63 9.63 0 0 0-1.181-11.33zm-14.4 20.1a7.14 7.14 0 0 1-4.59-1.66l.23-.13 7.62-4.4a1.27 1.27 0 0 0 .63-1.09v-10.74l3.22 1.86a.11.11 0 0 1 .06.08v8.9a7.18 7.18 0 0 1-7.17 7.18zm-15.42-6.58a7.13 7.13 0 0 1-.85-4.8l.23.14 7.63 4.4a1.23 1.23 0 0 0 1.24 0l9.31-5.37v3.72a.13.13 0 0 1-.05.1l-7.7 4.45a7.18 7.18 0 0 1-9.81-2.64zm-3.73-13.1a7.15 7.15 0 0 1 3.77-3.15V22.4a1.22 1.22 0 0 0 .62 1.08l9.27 5.35-3.22 1.86a.12.12 0 0 1-.11 0l-7.7-4.44a7.18 7.18 0 0 1-2.63-9.8zm26.47 6.15-9.3-5.37 3.22-1.86a.12.12 0 0 1 .11 0l7.7 4.45a7.17 7.17 0 0 1-1.08 12.92v-9.05a1.26 1.26 0 0 0-.65-1.09zm3.2-4.82-.22-.14-7.61-4.43a1.24 1.24 0 0 0-1.25 0l-9.31 5.37V15.3a.11.11 0 0 1 .05-.1l7.7-4.44a7.18 7.18 0 0 1 10.64 7.43zM13.25 20.5l-3.22-1.85a.13.13 0 0 1-.06-.09V9.69a7.18 7.18 0 0 1 11.76-5.5l-.23.13-7.61 4.4a1.27 1.27 0 0 0-.64 1.1zm1.75-3.77 4.15-2.39 4.16 2.39v4.78l-4.14 2.39-4.17-2.39z"/></svg>';
 
+/**
+ * 选项行补丁（4.13.53 起带「标记门」）：只有 description 以 CPS 私有前缀 `__A2K_GRP__|` / `__A2K_MDL__|` 开头的条目
+ * 才加 `a2k-exclusive-model-option` 与卡片 / 模型行类名并接管点击；其余条目（Kiro 官方模型列表、本扩展未运行）
+ * 的 className、事件与 children 与出厂表达式逐字等价（`tests/selector` native-fallback 用例以出厂表达式为 oracle）。
+ * 4.13.52 及更早的变体把 `a2k-exclusive-model-option` 无条件写进 className，出厂列表也会带上该类。
+ */
 const PATCHED_JS_CODE =
-  `className:"chat-input-popup-option a2k-exclusive-model-option"+(typeof k==="string"&&k.startsWith("__A2K_GRP__|")?" a2k-opt-grp":typeof k==="string"&&k.startsWith("__A2K_MDL__|")?(" a2k-opt-mdl"+(k.endsWith("|1")?" a2k-opt-last":"")):""),"data-selected":C||void 0,"data-active":S||void 0,role:"option","aria-selected":C,tabIndex:S?0:-1,...p({onClick:a((e)=>{if(T?.startsWith?.("a2k-group:")||!E||(typeof k==="string"&&k.startsWith("__A2K_GRP__|"))){e?.preventDefault?.();e?.stopPropagation?.();return}g(T)},"onClick"),onKeyDown:a(O=>{if(T?.startsWith?.("a2k-group:")||!E||(typeof k==="string"&&k.startsWith("__A2K_GRP__|")))return;O.key==="Enter"&&(O.preventDefault(),g(T))},"onKeyDown")}),children:(typeof k==="string"&&k.startsWith("__A2K_GRP__|"))?(()=>{const p=k.split("|");let logoHtml="";try{if(p[5]){logoHtml="<span class=\\\"a2k-logo\\\">"+atob(p[5])+"</span>";}}catch(_e){}if(!logoHtml){logoHtml=p[4]==="openai"?'<span class=\\"a2k-logo\\">${SVG_OPENAI}</span>':'<span class=\\"a2k-logo\\">'+(p[3]||"P")+'</span>';}return b.jsx("div",{className:"a2k-card-head",dangerouslySetInnerHTML:{__html:"<span class=\\\"a2k-chev\\\">▼</span>"+logoHtml+"<span class=\\\"a2k-title\\\">"+p[1]+"</span><span class=\\\"a2k-count\\\">"+p[2]+" ↑</span>"}})})():(typeof k==="string"&&k.startsWith("__A2K_MDL__|"))?(()=>{const p=k.split("|"),caps=(p[1]==="1"?'<span class=\\"a2k-cap a2k-cap-reason\\" title=\\"推理\\">${SVG_BRAIN}</span>':'')+(p[2]==="1"?'<span class=\\"a2k-cap a2k-cap-vision\\" title=\\"图片\\">${SVG_IMAGE}</span>':'');return b.jsx("div",{className:"a2k-model-row",dangerouslySetInnerHTML:{__html:"<div class=\\\"a2k-model-name-box\\\"><span class=\\\"chat-input-popup-option-name\\\" title=\\\""+E+"\\\">"+E+"</span></div><div class=\\\"a2k-caps-box\\\">"+caps+"</div>"}})})():b.jsxs("div",{className:"chat-input-popup-option-content",children:[b.jsxs("div",{className:"model-selector-option-header",children:[b.jsx("span",{className:"chat-input-popup-option-name",children:E}),R?.rateMultiplier!=null&&b.jsxs("span",{className:"model-selector-option-rate",children:[R.rateMultiplier,"x ",R.rateUnit??"credits"]})]}),k&&b.jsx("span",{className:"chat-input-popup-option-description",children:k})]})`;
+  `className:"chat-input-popup-option"+(typeof k==="string"&&k.startsWith("__A2K_GRP__|")?" a2k-exclusive-model-option a2k-opt-grp":typeof k==="string"&&k.startsWith("__A2K_MDL__|")?(" a2k-exclusive-model-option a2k-opt-mdl"+(k.endsWith("|1")?" a2k-opt-last":"")):""),"data-selected":C||void 0,"data-active":S||void 0,role:"option","aria-selected":C,tabIndex:S?0:-1,...p({onClick:a((e)=>{if(T?.startsWith?.("a2k-group:")||(typeof k==="string"&&k.startsWith("__A2K_GRP__|"))||(typeof k==="string"&&k.startsWith("__A2K_")&&!E)){e?.preventDefault?.();e?.stopPropagation?.();return}g(T)},"onClick"),onKeyDown:a(O=>{if(T?.startsWith?.("a2k-group:")||(typeof k==="string"&&k.startsWith("__A2K_GRP__|"))||(typeof k==="string"&&k.startsWith("__A2K_")&&!E))return;O.key==="Enter"&&(O.preventDefault(),g(T))},"onKeyDown")}),children:(typeof k==="string"&&k.startsWith("__A2K_GRP__|"))?(()=>{const p=k.split("|");let logoHtml="";try{if(p[5]){logoHtml="<span class=\\\"a2k-logo\\\">"+atob(p[5])+"</span>";}}catch(_e){}if(!logoHtml){logoHtml=p[4]==="openai"?'<span class=\\"a2k-logo\\">${SVG_OPENAI}</span>':'<span class=\\"a2k-logo\\">'+(p[3]||"P")+'</span>';}return b.jsx("div",{className:"a2k-card-head",dangerouslySetInnerHTML:{__html:"<span class=\\\"a2k-chev\\\">▼</span>"+logoHtml+"<span class=\\\"a2k-title\\\">"+p[1]+"</span><span class=\\\"a2k-count\\\">"+p[2]+" ↑</span>"}})})():(typeof k==="string"&&k.startsWith("__A2K_MDL__|"))?(()=>{const p=k.split("|"),caps=(p[1]==="1"?'<span class=\\"a2k-cap a2k-cap-reason\\" title=\\"推理\\">${SVG_BRAIN}</span>':'')+(p[2]==="1"?'<span class=\\"a2k-cap a2k-cap-vision\\" title=\\"图片\\">${SVG_IMAGE}</span>':'');return b.jsx("div",{className:"a2k-model-row",dangerouslySetInnerHTML:{__html:"<div class=\\\"a2k-model-name-box\\\"><span class=\\\"chat-input-popup-option-name\\\" title=\\\""+E+"\\\">"+E+"</span></div><div class=\\\"a2k-caps-box\\\">"+caps+"</div>"}})})():b.jsxs("div",{className:"chat-input-popup-option-content",children:[b.jsxs("div",{className:"model-selector-option-header",children:[b.jsx("span",{className:"chat-input-popup-option-name",children:E}),R?.rateMultiplier!=null&&b.jsxs("span",{className:"model-selector-option-rate",children:[R.rateMultiplier,"x ",R.rateUnit??"credits"]})]}),k&&b.jsx("span",{className:"chat-input-popup-option-description",children:k})]})`;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -429,17 +435,31 @@ async function sweepStaleTmp(file: string): Promise<void> {
 /** 单个靶点的同步结果；detail 只在「本应写入却写失败」时给出（只读 / 被占用 / 权限不足）。 */
 type TargetResult = { status: TargetStatus; detail?: string };
 
+/**
+ * 一份 Kiro 文件的写入计划（4.13.53 起三处靶点先全部算完再落盘）：`original` 是本轮读到的磁盘内容，`next` 是应写入的内容，
+ * 相等则本轮不碰该文件。`original` 同时是提交失败时的回滚依据（不依赖仓内出厂串，任何 Kiro 版本都能回到本轮读到的状态）。
+ */
+type FilePlan = { file: string; original: string; next: string };
+/** 一个靶点的计划：`status` 是「全部写成功后」应报的状态；`files` 是该靶点涉及的文件（mermaid 可能多份）。 */
+type TargetPlan = { status: TargetStatus; detail?: string; files: FilePlan[] };
+
 const ORIG_MENU_PATTERN =
   'children:b.jsx("div",{ref:c.setFloating,className:"chat-input-popup-menu",style:d,role:"listbox","data-keyboard-nav":l!=="mouse"||void 0,...h(),children:r.map((y,x)=>{const{description:k,name:E,value:T}=y';
 
+/**
+ * 菜单容器补丁（4.13.53 起带「标记门」）：只有当前选项列表 `r` 里至少一条 description 以 `__A2K_` 开头（CPS 分组列表）
+ * 才加 `a2k-model-selector-menu`（CARD_CSS 的 270px 宽 / resize 手柄 / 高度上限只命中这个类）；Kiro 官方列表得到的
+ * className 逐字等于出厂 `"chat-input-popup-menu"`。4.13.52 及更早的变体无条件加类，出厂列表的菜单也会被收窄。
+ */
 const PATCHED_MENU_CODE =
-  'children:b.jsx("div",{ref:c.setFloating,className:"chat-input-popup-menu a2k-model-selector-menu",style:d,role:"listbox","data-keyboard-nav":l!=="mouse"||void 0,...h(),children:r.map((y,x)=>{const{description:k,name:E,value:T}=y';
+  'children:b.jsx("div",{ref:c.setFloating,className:"chat-input-popup-menu"+(r.some(v=>typeof v?.description==="string"&&v.description.startsWith("__A2K_"))?" a2k-model-selector-menu":""),style:d,role:"listbox","data-keyboard-nav":l!=="mouse"||void 0,...h(),children:r.map((y,x)=>{const{description:k,name:E,value:T}=y';
 
 const ORIG_REF_PATTERN =
   'ref:a(O=>{m.current[x]=O},"ref")';
 
+/** 选中项居中滚动（4.13.53 起带「标记门」）：只对 description 以 `__A2K_MDL__|` 开头的选中行做一次居中；出厂列表不滚动。 */
 const PATCHED_REF_CODE =
-  'ref:a(O=>{m.current[x]=O;if(O&&C&&!O.dataset.a2kScrolled){O.dataset.a2kScrolled="1";setTimeout(()=>{O.scrollIntoView({block:"center",behavior:"instant"});},10);}},"ref")';
+  'ref:a(O=>{m.current[x]=O;if(O&&C&&typeof k==="string"&&k.startsWith("__A2K_MDL__|")&&!O.dataset.a2kScrolled){O.dataset.a2kScrolled="1";setTimeout(()=>{O.scrollIntoView({block:"center",behavior:"instant"});},10);}},"ref")';
 
 const ORIG_TRIGGER_PATTERN =
   'className:"model-selector-trigger",disabled:t||r.length===0';
@@ -474,9 +494,14 @@ const ORIG_POPOVER_PATTERN =
  * 本串同样是以 1.0.411 压缩名书写的规范模板（Bde / Pde / l0 三个外部名）；写盘前用 renderTemplate() 换成当前 Kiro
  * 文件里实际的名字（弹层函数名与警告函数名来自 findPopoverFactory 的捕获，useSessionConfig 的压缩名按
  * `a(压缩名,"useSessionConfig")` 标签反查），并在 `function <fn>(t){` 之后紧跟插入 a2k-orig 携带标记。
+ *
+ * 标记门（4.13.53 起）：`A2K` = 当前会话模型列表（同一 useSessionConfig 数据）里至少一条 description 以 `__A2K_` 开头，
+ * 即列表来自本扩展 CPS 的分组输出。`!A2K`（本扩展未运行 / Kiro 官方列表）时走 `N*` 原生分支：与出厂函数体
+ * ORIG_POPOVER_PATTERN 逐节点等价（同类名、同文案、同 `&&` 短路值，只是不用 memo 槽位；两个 hook 仍无条件在顶层调用，
+ * 两条分支 hook 顺序一致）。`tests/selector` native-fallback 用例以出厂函数为 oracle 做树比较。
  */
 const PATCHED_POPOVER_CODE =
-  'function Bde(t){const e=re.c(30),[a2kCfg]=l0(),{livePercentage:n,conversationPct:r,mcpPct:s,steeringPct:i,hasBreakdown:o,warning:l,showWarning:u,style:c,floatingProps:d,summarizationThreshold:f,a2kUsage:A}=t,g=Math.ceil(n),y=n>=f-5;const CW=(()=>{try{const q=(a2kCfg||[]).find(z=>z&&z.category==="model");if(!q||q.type!=="select")return 0;const z=(q.options||[]).flatMap(v=>v&&Array.isArray(v.options)?v.options:[v]).find(v=>v&&v.value===q.currentValue);const p=typeof z?.description==="string"?z.description.split("|"):null;const w=p&&p[0]==="__A2K_MDL__"?Number(p[3]):0;return w>0?w:0}catch(_e){return 0}})();const x=u&&l!=null&&b.jsxs("div",{className:"kiro-context-popover-warning",children:[b.jsx("div",{className:"kiro-context-popover-warning-header",children:b.jsx("span",{children:"High initial context usage"})}),b.jsx("div",{className:"kiro-context-popover-warning-message",children:Pde(l)})]});const K=v=>{if(v>=1e6){const q=(v/1e6).toFixed(1);return(q.endsWith(".0")?q.slice(0,-2):q)+"M"}if(v>=1e3){const q=(v/1e3).toFixed(1);return(q.endsWith(".0")?q.slice(0,-2):q)+"K"}return String(Math.round(v))};const V=A&&A.breakdown,W=V&&V.tools||{},D=[["prompts","Your prompts",V&&V.yourPrompts],["responses","Kiro responses",V&&V.kiroResponses],["files","Session files",V&&V.sessionFiles],["builtin","Built-in tools",W.builtin],["mcp","MCP tools",W.mcp],["steering","Steering files",V&&V.contextFiles]].filter(q=>q[2]&&typeof q[2].percent=="number"&&typeof q[2].tokens=="number");const J=D.length>0,Q=J?D.map(q=>({k:q[0],n:q[1],p:q[2].percent,v:q[2].tokens,h:q[0]==="mcp"?l?.mcpTools:q[0]==="steering"?l?.steering:void 0})):[{k:"conv",n:"Conversation",p:r,v:0,h:void 0}].concat(o?[{k:"mcp",n:"MCP tools",p:s,v:0,h:l?.mcpTools},{k:"steering",n:"Steering files",p:i,v:0,h:l?.steering}]:[]);const G=J?Q.reduce((q,w)=>q+w.v,0):0;const T=b.jsxs(b.Fragment,{children:[b.jsx("div",{className:"a2k-cu-head",children:b.jsx("span",{className:"a2k-cu-title",children:"Context Usage"})}),b.jsxs("div",{className:"a2k-cu-sub",children:[b.jsx("span",{className:"a2k-cu-pct",children:`${g}% Full`}),CW>0?b.jsx("span",{className:"a2k-cu-tokens",title:"Total = real usage reported by the upstream (percentage x context window). Per-category counts below are a rough client-side estimate by Kiro and may not add up to the total.",children:`~${K(Math.round(n/100*CW))} / ${K(CW)} tokens`}):J&&b.jsx("span",{className:"a2k-cu-tokens",title:"Token counts are a rough client-side estimate by Kiro; the percentage comes from the real token usage reported by the upstream.",children:`~${K(G)} tokens est.`})]}),b.jsx("div",{className:"a2k-cu-bar",children:Q.map(q=>b.jsx("div",{className:"a2k-cu-seg a2k-cu-c-"+q.k,style:{width:`${Math.max(0,Math.min(100,q.p))}%`}},q.k))})]});const L=b.jsx("div",{className:"kiro-context-popover-breakdown a2k-cu-rows",children:Q.map(q=>b.jsxs("div",{className:"kiro-context-popover-breakdown-row a2k-cu-row","data-high":q.h||void 0,children:[b.jsxs("span",{className:"a2k-cu-left",children:[b.jsx("span",{className:"a2k-cu-sw a2k-cu-c-"+q.k}),b.jsx("span",{children:q.n})]}),b.jsx("span",{className:"a2k-cu-val",children:J?K(q.v):`${Math.ceil(q.p)}%`})]},q.k))});const I=y&&b.jsx("div",{className:"kiro-context-popover-hint",children:`Auto-summarization at ${f}%`});const B=b.jsxs("div",{className:"kiro-context-popover-content",children:[T,L,I]});return b.jsxs("div",{className:"kiro-context-popover a2k-cu",style:c,role:"tooltip",...d,children:[x,B]})}a(Bde,"ContextUsagePopover");';
+  'function Bde(t){const e=re.c(30),[a2kCfg]=l0(),{livePercentage:n,conversationPct:r,mcpPct:s,steeringPct:i,hasBreakdown:o,warning:l,showWarning:u,style:c,floatingProps:d,summarizationThreshold:f,a2kUsage:A}=t,g=Math.ceil(n),y=n>=f-5;const[CW,A2K]=(()=>{try{const q=(a2kCfg||[]).find(z=>z&&z.category==="model");if(!q||q.type!=="select")return[0,false];const F=(q.options||[]).flatMap(v=>v&&Array.isArray(v.options)?v.options:[v]);const M=F.some(v=>typeof v?.description==="string"&&v.description.startsWith("__A2K_"));const z=F.find(v=>v&&v.value===q.currentValue);const p=typeof z?.description==="string"?z.description.split("|"):null;const w=p&&p[0]==="__A2K_MDL__"?Number(p[3]):0;return[w>0?w:0,M]}catch(_e){return[0,false]}})();const x=u&&l!=null&&b.jsxs("div",{className:"kiro-context-popover-warning",children:[b.jsx("div",{className:"kiro-context-popover-warning-header",children:b.jsx("span",{children:"High initial context usage"})}),b.jsx("div",{className:"kiro-context-popover-warning-message",children:Pde(l)})]});if(!A2K){const NH=Math.ceil(r),NP=Math.ceil(s),NM=Math.ceil(i);const NT=b.jsxs("div",{className:"kiro-context-popover-header",children:[b.jsx("span",{children:"Context Usage"}),b.jsx("span",{children:`${g}%`})]});const NR=b.jsxs("div",{className:"kiro-context-popover-breakdown-row",children:[b.jsx("span",{children:"Conversation"}),b.jsx("span",{children:`${NH}%`})]});const NO=o&&b.jsxs(b.Fragment,{children:[b.jsxs("div",{className:"kiro-context-popover-breakdown-row","data-high":l?.mcpTools||void 0,children:[b.jsx("span",{children:"MCP tools"}),b.jsx("span",{children:`${NP}%`})]}),b.jsxs("div",{className:"kiro-context-popover-breakdown-row","data-high":l?.steering||void 0,children:[b.jsx("span",{children:"Steering files"}),b.jsx("span",{children:`${NM}%`})]})]});const NL=b.jsxs("div",{className:"kiro-context-popover-breakdown",children:[NR,NO]});const NI=y&&b.jsx("div",{className:"kiro-context-popover-hint",children:`Auto-summarization at ${f}%`});const NB=b.jsxs("div",{className:"kiro-context-popover-content",children:[NT,NL,NI]});return b.jsxs("div",{className:"kiro-context-popover",style:c,role:"tooltip",...d,children:[x,NB]})}const K=v=>{if(v>=1e6){const q=(v/1e6).toFixed(1);return(q.endsWith(".0")?q.slice(0,-2):q)+"M"}if(v>=1e3){const q=(v/1e3).toFixed(1);return(q.endsWith(".0")?q.slice(0,-2):q)+"K"}return String(Math.round(v))};const V=A&&A.breakdown,W=V&&V.tools||{},D=[["prompts","Your prompts",V&&V.yourPrompts],["responses","Kiro responses",V&&V.kiroResponses],["files","Session files",V&&V.sessionFiles],["builtin","Built-in tools",W.builtin],["mcp","MCP tools",W.mcp],["steering","Steering files",V&&V.contextFiles]].filter(q=>q[2]&&typeof q[2].percent=="number"&&typeof q[2].tokens=="number");const J=D.length>0,Q=J?D.map(q=>({k:q[0],n:q[1],p:q[2].percent,v:q[2].tokens,h:q[0]==="mcp"?l?.mcpTools:q[0]==="steering"?l?.steering:void 0})):[{k:"conv",n:"Conversation",p:r,v:0,h:void 0}].concat(o?[{k:"mcp",n:"MCP tools",p:s,v:0,h:l?.mcpTools},{k:"steering",n:"Steering files",p:i,v:0,h:l?.steering}]:[]);const G=J?Q.reduce((q,w)=>q+w.v,0):0;const T=b.jsxs(b.Fragment,{children:[b.jsx("div",{className:"a2k-cu-head",children:b.jsx("span",{className:"a2k-cu-title",children:"Context Usage"})}),b.jsxs("div",{className:"a2k-cu-sub",children:[b.jsx("span",{className:"a2k-cu-pct",children:`${g}% Full`}),CW>0?b.jsx("span",{className:"a2k-cu-tokens",title:"Total = real usage reported by the upstream (percentage x context window). Per-category counts below are a rough client-side estimate by Kiro and may not add up to the total.",children:`~${K(Math.round(n/100*CW))} / ${K(CW)} tokens`}):J&&b.jsx("span",{className:"a2k-cu-tokens",title:"Token counts are a rough client-side estimate by Kiro; the percentage comes from the real token usage reported by the upstream.",children:`~${K(G)} tokens est.`})]}),b.jsx("div",{className:"a2k-cu-bar",children:Q.map(q=>b.jsx("div",{className:"a2k-cu-seg a2k-cu-c-"+q.k,style:{width:`${Math.max(0,Math.min(100,q.p))}%`}},q.k))})]});const L=b.jsx("div",{className:"kiro-context-popover-breakdown a2k-cu-rows",children:Q.map(q=>b.jsxs("div",{className:"kiro-context-popover-breakdown-row a2k-cu-row","data-high":q.h||void 0,children:[b.jsxs("span",{className:"a2k-cu-left",children:[b.jsx("span",{className:"a2k-cu-sw a2k-cu-c-"+q.k}),b.jsx("span",{children:q.n})]}),b.jsx("span",{className:"a2k-cu-val",children:J?K(q.v):`${Math.ceil(q.p)}%`})]},q.k))});const I=y&&b.jsx("div",{className:"kiro-context-popover-hint",children:`Auto-summarization at ${f}%`});const B=b.jsxs("div",{className:"kiro-context-popover-content",children:[T,L,I]});return b.jsxs("div",{className:"kiro-context-popover a2k-cu",style:c,role:"tooltip",...d,children:[x,B]})}a(Bde,"ContextUsagePopover");';
 
 /**
  * ContextUsageIndicator（1.0.411 压缩名 Ude）里挂载弹层的一行：多传 store 原对象 `n`（contextUsage），其余不动。
@@ -500,6 +525,17 @@ const LEGACY_POPOVER_VARIANTS = {
   STEERING_ORIG: 'b.jsx("span",{children:"Steering files"})',
   STEERING_PATCHED:
     'b.jsxs("span",{className:"cursor-row-left",children:[b.jsx("span",{className:"cursor-legend-dot dot-steering"}),b.jsx("span",{children:"Steering files"})]})',
+};
+
+/**
+ * 4.13.52 及更早版本的菜单容器 / 选中项居中补丁串（无标记门：出厂列表也被加类、也被滚动）。
+ * 磁盘实拍 fixture（1.0.411）与真机只读副本（1.0.437）都处于这个形态；只用于测试描述历史变体，还原走锚点路径。
+ */
+const LEGACY_SELECTOR_VARIANTS = {
+  MENU_4_13_52:
+    'children:b.jsx("div",{ref:c.setFloating,className:"chat-input-popup-menu a2k-model-selector-menu",style:d,role:"listbox","data-keyboard-nav":l!=="mouse"||void 0,...h(),children:r.map((y,x)=>{const{description:k,name:E,value:T}=y',
+  REF_4_13_52:
+    'ref:a(O=>{m.current[x]=O;if(O&&C&&!O.dataset.a2kScrolled){O.dataset.a2kScrolled="1";setTimeout(()=>{O.scrollIntoView({block:"center",behavior:"instant"});},10);}},"ref")',
 };
 
 
@@ -744,33 +780,22 @@ function applyBackendHook(content: string): string {
   return content.slice(0, hook.start) + renderTemplate(PATCHED_QPE_PATTERN, BACKEND_CANON, actual) + content.slice(hook.end);
 }
 
-async function syncKiroAgentBackend(enabled: boolean): Promise<TargetResult> {
+/** 后端钩子的写入计划（只读盘、不写）。文件不存在 / 不可读（非 Kiro 宿主）→ unavailable 且无文件。 */
+async function planKiroAgentBackend(enabled: boolean): Promise<TargetPlan> {
   const file = kiroAgentBackendFile();
   let original: string;
   try {
     original = await fs.promises.readFile(file, "utf8");
   } catch {
-    // 文件不存在 / 不可读（非 Kiro 宿主）：静默放行
-    return { status: "unavailable" };
+    return { status: "unavailable", files: [] };
   }
   await sweepStaleTmp(file);
   let content = restoreBackendHook(original);
   if (enabled) content = applyBackendHook(content);
-  if (content !== original) {
-    try {
-      await writeAtomic(file, content);
-    } catch (e) {
-      // 写失败（只读 / 被占用 / 权限不足）：文件维持原样，但必须带 detail 上报——还原失败不能报成 removed
-      const msg = (e as Error).message || String(e);
-      error("kiroAgent backend write failed:", file, msg);
-      return { status: "unavailable", detail: `${path.basename(file)}: ${msg}` };
-    }
-    info(enabled ? "hooked kiroAgent modelConfigProvider bridge" : "restored kiroAgent modelConfigProvider bridge");
-    return { status: enabled ? "applied" : "removed" };
-  }
+  if (content !== original) return { status: enabled ? "applied" : "removed", files: [{ file, original, next: content }] };
   // 开启但结构锚点找不到、文件里也没有任何版本的钩子：Kiro 版本漂移，静默放行、不写文件。
-  if (enabled && !/__kiroModelConfigProvider=t/.test(content)) return { status: "unavailable" };
-  return { status: "unchanged" };
+  if (enabled && !/__kiroModelConfigProvider=t/.test(content)) return { status: "unavailable", files: [] };
+  return { status: "unchanged", files: [] };
 }
 
 /**
@@ -831,6 +856,8 @@ export async function triggerKiroModelRefresh(): Promise<boolean> {
 
 /** 选项行补丁各历史变体共有的尾巴：ORIG_JS_PATTERN 里 children: 之后原样保留的兜底分支。 */
 const JS_OPTION_TAIL = ORIG_JS_PATTERN.slice(ORIG_JS_PATTERN.indexOf('b.jsxs("div",{className:"chat-input-popup-option-content"'));
+/** 4.13.53 起标记门形态选项行的起始锚（出厂文件里绝不出现 `__A2K_GRP__`）。 */
+const JS_OPTION_GATED_START = 'className:"chat-input-popup-option"+(typeof k==="string"&&k.startsWith("__A2K_GRP__|")';
 
 /**
  * 把 mermaid 里所有 API4Kiro 注入（无论哪个版本打的）还原为出厂。
@@ -838,15 +865,19 @@ const JS_OPTION_TAIL = ORIG_JS_PATTERN.slice(ORIG_JS_PATTERN.indexOf('b.jsxs("di
  */
 function restoreSelectorScript(content: string): string {
   let out = content;
-  // 1. 选项行（a2k-exclusive-model-option … 出厂兜底分支尾巴）
+  // 1. 选项行：a) 4.13.53 起的标记门形态（className 表达式以 __A2K_GRP__ 判定开头）；b) 4.13.52 及更早无条件带
+  //    a2k-exclusive-model-option 的形态。两者都以出厂兜底分支尾巴收口。
   out = out.split(PATCHED_JS_CODE).join(ORIG_JS_PATTERN);
+  out = replaceSpan(out, JS_OPTION_GATED_START, JS_OPTION_TAIL, ORIG_JS_PATTERN, 20000);
   out = replaceSpan(out, 'className:"chat-input-popup-option a2k-exclusive-model-option"', JS_OPTION_TAIL, ORIG_JS_PATTERN, 20000);
-  // 2. 菜单容器类名
+  // 2. 菜单容器类名：a) 4.13.53 起 `"chat-input-popup-menu"+(r.some(…)?" a2k-model-selector-menu":"")`（任何以 `+(` 开头、
+  //    到 `,style:d,role:"listbox"` 为止的表达式变体都回到出厂字面量）；b) 旧版逐字类名
   out = out.split(PATCHED_MENU_CODE).join(ORIG_MENU_PATTERN);
+  out = replaceSpan(out, 'className:"chat-input-popup-menu"+(', '),style:d,role:"listbox"', 'className:"chat-input-popup-menu",style:d,role:"listbox"', 400);
   out = out.replace(/className:"chat-input-popup-menu a2k-[^"]*"/g, 'className:"chat-input-popup-menu"');
-  // 3. 选中项居中滚动 ref
+  // 3. 选中项居中滚动 ref（任何带 if(…) 分支的变体都回到出厂单句）
   out = out.split(PATCHED_REF_CODE).join(ORIG_REF_PATTERN);
-  out = replaceSpan(out, "ref:a(O=>{m.current[x]=O;if(O&&C&&!O.dataset.a2kScrolled)", '},"ref")', ORIG_REF_PATTERN, 2000);
+  out = replaceSpan(out, "ref:a(O=>{m.current[x]=O;if(", '},"ref")', ORIG_REF_PATTERN, 2000);
   // 4. 通道 B 触发器：用户已关闭，任何残留一律清掉
   out = out.split(PATCHED_TRIGGER_CODE).join(ORIG_TRIGGER_PATTERN);
   out = replaceSpan(out, 'className:"model-selector-trigger",onMouseDown:', '"onMouseDown"),disabled:t||r.length===0', ORIG_TRIGGER_PATTERN, 2000);
@@ -909,49 +940,31 @@ function applySelectorScript(content: string): string {
   return applyPopover(out) ?? out;
 }
 
-async function syncModelSelectorScript(enabled: boolean): Promise<TargetResult> {
+/** mermaid-*.js 的写入计划（只读盘、不写）。目录不存在 / 不可读（非 Kiro 宿主）→ unavailable 且无文件。 */
+async function planModelSelectorScript(enabled: boolean): Promise<TargetPlan> {
   const dir = jsDir();
-  let changedAny = false;
+  const files: FilePlan[] = [];
   let patchedPresent = false;
-  const writeErrors: string[] = [];
   try {
-    const files = await fs.promises.readdir(dir);
-    for (const f of files) {
-      if (f.endsWith(".js") && f.startsWith("mermaid-")) {
-        const p = path.join(dir, f);
-        const original = await fs.promises.readFile(p, "utf8");
-        await sweepStaleTmp(p);
-        // 先归一到出厂，再按需打当前版本补丁：旧版本补丁孤儿会被顺手升级 / 清除，
-        // 已是当前补丁的文件往返后逐字相同，不会产生无意义写入。
-        let content = restoreSelectorScript(original);
-        if (enabled) content = applySelectorScript(content);
-        const changed = content !== original;
-
-        if (changed) {
-          try {
-            await writeAtomic(p, content);
-            changedAny = true;
-            info(enabled ? "patched model selector script:" : "restored model selector script:", p);
-          } catch (e) {
-            // 单个文件写失败（只读 / 被占用）：不留半补丁，本文件维持原样，但带 detail 上报
-            const msg = (e as Error).message || String(e);
-            error("model selector script write failed:", p, msg);
-            writeErrors.push(`${f}: ${msg}`);
-            continue;
-          }
-        }
-        if (content.includes(PATCHED_JS_CODE)) patchedPresent = true;
-      }
+    for (const f of await fs.promises.readdir(dir)) {
+      if (!f.endsWith(".js") || !f.startsWith("mermaid-")) continue;
+      const p = path.join(dir, f);
+      const original = await fs.promises.readFile(p, "utf8");
+      await sweepStaleTmp(p);
+      // 先归一到出厂，再按需打当前版本补丁：旧版本补丁孤儿会被顺手升级 / 清除，
+      // 已是当前补丁的文件往返后逐字相同，不会产生无意义写入。
+      let content = restoreSelectorScript(original);
+      if (enabled) content = applySelectorScript(content);
+      if (content !== original) files.push({ file: p, original, next: content });
+      if (content.includes(PATCHED_JS_CODE)) patchedPresent = true;
     }
-  } catch (e) {
-    // 目录不存在 / 不可读（非 Kiro 宿主）：静默放行
-    return { status: "unavailable" };
+  } catch {
+    return { status: "unavailable", files: [] };
   }
-  if (writeErrors.length > 0) return { status: "unavailable", detail: writeErrors.join("; ") };
-  if (changedAny) return { status: enabled ? "applied" : "removed" };
+  if (files.length > 0) return { status: enabled ? "applied" : "removed", files };
   // 开启却没有任何 mermaid 文件带补丁：靶点不命中（Kiro 版本漂移）
-  if (enabled && !patchedPresent) return { status: "unavailable" };
-  return { status: "unchanged" };
+  if (enabled && !patchedPresent) return { status: "unavailable", files: [] };
+  return { status: "unchanged", files: [] };
 }
 
 /**
@@ -1005,32 +1018,88 @@ function stripStrayA2kRules(css: string): string {
   return out;
 }
 
-async function syncStyleSheet(enabled: boolean): Promise<{ status: TargetStatus; detail?: string }> {
+/** style.css 的写入计划（只读盘、不写）。文件不可读 → unavailable + `<code> <path>` detail（ENOENT 表示非 Kiro 宿主）。 */
+async function planStyleSheet(enabled: boolean): Promise<TargetPlan> {
   const file = styleFile();
   let current: string;
   try {
     current = await fs.promises.readFile(file, "utf8");
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code || "";
-    return { status: "unavailable", detail: `${code} ${file}`.trim() };
+    return { status: "unavailable", detail: `${code} ${file}`.trim(), files: [] };
   }
   await sweepStaleTmp(file);
-
   const stripped = stripBlock(current);
   const next = enabled ? `${stripped.replace(/\s+$/, "")}\n${CARD_CSS}\n` : stripped;
-  if (next === current) {
-    return { status: "unchanged" };
-  }
+  if (next === current) return { status: "unchanged", files: [] };
+  return { status: enabled ? "applied" : "removed", files: [{ file, original: current, next }] };
+}
 
-  try {
-    await writeAtomic(file, next);
-  } catch (e) {
-    const msg = (e as Error).message || String(e);
-    error("selector style write failed:", msg);
-    return { status: "unavailable", detail: msg };
+type TargetKey = "selectorScript" | "backend" | "style";
+const COMMIT_ORDER: TargetKey[] = ["selectorScript", "backend", "style"];
+const TARGET_LOG: Record<TargetKey, { on: string; off: string }> = {
+  selectorScript: { on: "patched model selector script:", off: "restored model selector script:" },
+  backend: { on: "hooked kiroAgent modelConfigProvider bridge", off: "restored kiroAgent modelConfigProvider bridge" },
+  style: { on: "applied card model selector style:", off: "restored original Kiro style:" },
+};
+
+/**
+ * 提交三处计划（4.13.53 起）。
+ *
+ * enabled=true：**全有或全无**。按 mermaid → extension.js → style.css 的顺序逐个 writeAtomic；任一份写失败，立刻停止，
+ * 并把本轮已替换的文件用各自的 `original` 回滚，返回 unavailable + detail（含回滚结果）。CSS 排在最后，所以只在
+ * 前两处都成功后才落盘——不再出现「补丁 JS 已写、CSS 未写」或「CSS 已写、JS 写失败」的半补丁窗口
+ * （2026-09-07 4.13.46 事故的同一时序）。被中止 / 回滚的靶点报 unavailable（文件不在目标态），不报 applied。
+ *
+ * enabled=false：**尽力还原**，每份独立写、失败各自上报（`scripts/check-selector-patch.js` readonly 节与
+ * `tests/selector` readonly-restore 锁定该语义）。用户明确要关闭时，能还原的先还原；写失败的那份带 detail 让调用方提示。
+ * 4.13.53 起补丁 JS 自带标记门，CPS 一停、列表里没有 `__A2K_` 标记，残留的补丁 JS 渲染即出厂，这条路径不再产生可见半补丁。
+ */
+async function commitPlans(enabled: boolean, plans: Record<TargetKey, TargetPlan>): Promise<Record<TargetKey, TargetResult>> {
+  const result: Record<TargetKey, TargetResult> = {
+    selectorScript: { status: plans.selectorScript.status, detail: plans.selectorScript.detail },
+    backend: { status: plans.backend.status, detail: plans.backend.detail },
+    style: { status: plans.style.status, detail: plans.style.detail },
+  };
+  const written: FilePlan[] = [];
+  for (const key of COMMIT_ORDER) {
+    const plan = plans[key];
+    const errors: string[] = [];
+    for (const fp of plan.files) {
+      try {
+        await writeAtomic(fp.file, fp.next);
+        written.push(fp);
+        info(enabled ? TARGET_LOG[key].on : TARGET_LOG[key].off, fp.file);
+      } catch (e) {
+        const msg = (e as Error).message || String(e);
+        error(`${key} write failed:`, fp.file, msg);
+        errors.push(`${path.basename(fp.file)}: ${msg}`);
+        if (enabled) break;
+      }
+    }
+    if (errors.length === 0) continue;
+    result[key] = { status: "unavailable", detail: errors.join("; ") };
+    if (!enabled) continue;
+    // 全有或全无：回滚本轮已写的文件，其余未写的靶点标记为未落盘
+    const rollbackErrors: string[] = [];
+    for (const fp of written.reverse()) {
+      try {
+        await writeAtomic(fp.file, fp.original);
+        info("rolled back after partial patch failure:", fp.file);
+      } catch (e) {
+        const msg = (e as Error).message || String(e);
+        error("ROLLBACK FAILED:", fp.file, msg);
+        rollbackErrors.push(`rollback failed ${path.basename(fp.file)}: ${msg}`);
+      }
+    }
+    for (const other of COMMIT_ORDER) {
+      if (other === key || plans[other].files.length === 0) continue;
+      result[other] = { status: "unavailable", detail: `not written (aborted: ${key} failed)` };
+    }
+    if (rollbackErrors.length > 0) result[key] = { status: "unavailable", detail: [result[key].detail, ...rollbackErrors].join("; ") };
+    break;
   }
-  info(enabled ? "applied card model selector style:" : "restored original Kiro style:", file);
-  return { status: enabled ? "applied" : "removed" };
+  return result;
 }
 
 // 三个文件都是「读-改-写」，并发调用（配置监听里 groupHeaderStyle 与 enabled 同时变化、
@@ -1051,26 +1120,31 @@ export function syncGroupHeaderStyle(enabled: boolean): Promise<StyleSyncResult>
 }
 
 async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSyncResult> {
-  const selectorScript = await syncModelSelectorScript(enabled);
-  const backend = await syncKiroAgentBackend(enabled);
+  const selectorScript = await planModelSelectorScript(enabled);
+  const backend = await planKiroAgentBackend(enabled);
   // mermaid 靶点不命中（Kiro 升级）时不追加 CSS：CSS 里 .kiro-context-popover* 等规则
   // 不带专属类，单独落下就是「改了 IDE 外观却没有对应功能」的半补丁。
   const styleEnabled = enabled && selectorScript.status !== "unavailable";
-  const style = await syncStyleSheet(styleEnabled);
+  const style = await planStyleSheet(styleEnabled);
+  const committed = await commitPlans(enabled, { selectorScript, backend, style });
 
-  const targets = { style: style.status, selectorScript: selectorScript.status, backend: backend.status };
+  const targets = {
+    style: committed.style.status,
+    selectorScript: committed.selectorScript.status,
+    backend: committed.backend.status,
+  };
   // 任一 Kiro 文件「本应写入却写失败」都上浮为 unavailable 并带 detail：尤其是还原路径，
   // 否则 mermaid / extension.js 没还原成功却报 removed，调用方无从提示用户。
-  const writeErrors = [selectorScript.detail, backend.detail].filter((d): d is string => !!d);
+  const writeErrors = [committed.selectorScript.detail, committed.backend.detail].filter((d): d is string => !!d);
   let status: TargetStatus;
-  let detail = style.detail;
-  if (style.status === "unavailable") {
+  let detail = committed.style.detail;
+  if (committed.style.status === "unavailable") {
     status = "unavailable";
-    detail = [style.detail, ...writeErrors].filter(Boolean).join("; ") || undefined;
+    detail = [committed.style.detail, ...writeErrors].filter(Boolean).join("; ") || undefined;
   } else if (writeErrors.length > 0) {
     status = "unavailable";
     detail = writeErrors.join("; ");
-  } else if (enabled && selectorScript.status === "unavailable") {
+  } else if (enabled && committed.selectorScript.status === "unavailable") {
     status = "unavailable";
     detail = "model selector target not found in mermaid-*.js (Kiro version drift); style not applied";
   } else if (Object.values(targets).some((s) => s === "applied")) {
@@ -1125,5 +1199,6 @@ export const __selectorStyleInternals = {
     PATCHED_QPE_PATTERN,
   },
   legacy: LEGACY_POPOVER_VARIANTS,
+  legacySelector: LEGACY_SELECTOR_VARIANTS,
   paths: { styleFile, jsDir, kiroAgentBackendFile },
 };

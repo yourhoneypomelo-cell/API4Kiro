@@ -63,16 +63,19 @@ import {
 } from "./config";
 import { debug, error, info } from "./log";
 import { serveIdentity } from "./proxyIdentity";
+import { applyGuard } from "./requestGuard";
 import { addRequestUsage, beginTurn, takeTurnTotals } from "./turnLedger";
-import { buildMeteringEvents, stopReasonEvent } from "./streamShared";
+import { StreamError, buildMeteringEvents, stopReasonEvent, streamErrorStatus, streamErrorText } from "./streamShared";
 import {
   ImageCount,
+  confirmTextOnly,
   countImages,
+  dismissTextOnly,
   isTextOnly,
   looksLikeImageRejection,
-  markTextOnly,
   stripImages,
   strippedNotice,
+  suspectTextOnly,
 } from "./imagePolicy";
 
 /**
@@ -139,6 +142,27 @@ interface ImageFallback {
   images: ImageCount;
 }
 
+/**
+ * 客户端连接状态（4.13.53）。`res` 的 `close` 只发一次，晚于它注册的监听收不到——泵里的监听在上游 2xx
+ * 之后才挂，所以 handleRequest 一进来就挂一个，专门覆盖「上游响应头到达前」这段窗口：重试循环与 2xx 分支
+ * 据 `closed` 放弃；`onClose` 只在一次上游请求在途期间挂着，用来中止它。
+ */
+interface ClientLink {
+  /** 客户端在我们结束响应之前断开了（Kiro 点了「停止」/ 关了窗口）。 */
+  closed: boolean;
+  onClose?: () => void;
+}
+
+/**
+ * 泵的收尾结果（4.13.53）。`retryStreamError` 非空 = 上游 2xx 之后在流里报了错、而我们还没向客户端吐出任何
+ * 正文 / 思考 / 工具：泵没有 flush 也没有落账，由 streamWithRetry 按非 2xx 的口径决定换 key / 重试 / 终态。
+ */
+interface PumpOutcome {
+  retryStreamError?: StreamError;
+  /** 泵已写出 messageMetadataEvent（终态时不再补一帧）。 */
+  metaWritten?: boolean;
+}
+
 interface DispatchOpts {
   /** 发送前已剥图时给用户的提示（紧跟 messageMetadataEvent 之后输出）。 */
   notice?: string;
@@ -151,6 +175,8 @@ interface DispatchOpts {
   inHeaders?: http.IncomingHttpHeaders;
   /** 提取的原始上下文成分字符数，供结束时按真实 inputTokens 严格无损分配。 */
   rawContextBreakdown?: RawContextBreakdown;
+  /** 客户端连接状态（见 ClientLink）；缺省视为一直在线。 */
+  client?: ClientLink;
 }
 
 interface RetryOpts extends DispatchOpts {
@@ -244,6 +270,13 @@ export class KrsProxyServer {
     const url = req.url || "/";
     const method = req.method || "GET";
 
+    // 来源守卫（4.13.53 起，requestGuard.ts）：只放行本机非浏览器客户端（Host 回环、无 Origin / Sec-Fetch-Site、
+    // 远端回环），其余 403。必须先于下面的 CORS 头——拒绝响应不得带 Access-Control-*，网页读不到任何内容。
+    // 下面的 CORS 头与 OPTIONS→200 从此只对通过守卫的非浏览器客户端可达（对它们没有意义）；保留不删以求零改动。
+    if (!applyGuard(req, res, "KRS")) {
+      return;
+    }
+
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
@@ -254,9 +287,20 @@ export class KrsProxyServer {
       return;
     }
 
-    if (serveIdentity(url, res, "krs")) {
+    // 头里有让位签名（4.13.53 起），身份握手要看它。
+    if (serveIdentity(url, res, "krs", req.headers)) {
       return;
     }
+
+    // 客户端断开要在这里就开始听：`close` 事件不重放，等上游回了头再挂监听就漏掉了「响应头之前」的取消。
+    // 正常结束（我们先 end）也会发 close，用 writableEnded 区分开。
+    const client: ClientLink = { closed: false };
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        client.closed = true;
+        client.onClose?.();
+      }
+    });
 
     // 入站体按 UTF-8 流式解码：Kiro 每轮重放全部历史，几百 KB 的中文请求体会被 TCP 切成多块，
     // 逐块 toString() 会把跨块的多字节字解成 U+FFFD，提示词被静默改写后发往上游。
@@ -283,7 +327,7 @@ export class KrsProxyServer {
         if (isGenerate) {
           // Kiro 官方直通要镜像这套头；顺带记下客户端标识，供我们自己发起的官方接口调用复用
           rememberKiroClientHeaders(req.headers);
-          await this.handleGenerate(res, body, req.headers);
+          await this.handleGenerate(res, body, req.headers, client);
         } else if (method === "POST" && this.looksLikeJsonRpc(body)) {
           // Kiro 的 InvokeMCPCommand（服务端 MCP 工具发现）走的是流式客户端端点，
           // 会被路由到这里。本地就地应答一个合法的 JSON-RPC 结果。
@@ -375,6 +419,10 @@ export class KrsProxyServer {
   }
 
   private beginEventStream(res: http.ServerResponse): void {
+    if (res.headersSent) {
+      // 上游 2xx 后在流里报错且尚未吐字的重试（streamWithRetry 第 4 步）：响应头已经是 event-stream，接着往同一条流里写。
+      return;
+    }
     res.writeHead(200, {
       "Content-Type": EVENT_STREAM_CONTENT_TYPE,
       "Transfer-Encoding": "chunked",
@@ -433,7 +481,7 @@ export class KrsProxyServer {
     return active[0];
   }
 
-  private async handleGenerate(res: http.ServerResponse, rawBody: string, inHeaders: http.IncomingHttpHeaders = {}): Promise<void> {
+  private async handleGenerate(res: http.ServerResponse, rawBody: string, inHeaders: http.IncomingHttpHeaders = {}, client?: ClientLink): Promise<void> {
     let parsed: CwRequest;
     try {
       parsed = JSON.parse(rawBody);
@@ -574,7 +622,7 @@ export class KrsProxyServer {
 
     const rawContextBreakdown = extractRawContextBreakdown(parsed);
     const version = this.context.extension.packageJSON.version || "0.0.0";
-    const dispatch: DispatchOpts = { notice, fallback, credential, forcedImage, inHeaders, rawContextBreakdown };
+    const dispatch: DispatchOpts = { notice, fallback, credential, forcedImage, inHeaders, rawContextBreakdown, client };
     if (provider.protocol === "kiro") {
       await this.dispatchKiro(res, request, convId, kiroModel, provider, version, dispatch);
     } else if (provider.protocol === "gemini") {
@@ -680,6 +728,7 @@ export class KrsProxyServer {
       onAuthRejected: this.authRetry(provider, version, opts.inHeaders),
       headersFor: this.headersFor(provider, version, opts.inHeaders),
       fallback: opts.fallback,
+      client: opts.client,
       meta: { provider, credential: opts.credential, kiroModel: baseModelId(kiroModel), upstreamModel, convId, startedAt: Date.now(), rawContextBreakdown: opts.rawContextBreakdown },
     };
   }
@@ -923,7 +972,13 @@ export class KrsProxyServer {
     let url = targetUrl;
     let notice = opts.notice;
     // 剥图重发独立于普通重试次数：它不是"上游抖了"，而是我们发错了内容，理应有一次纠正机会。
+    // 学习两阶段：拒图只记嫌疑，2xx 才落盘；重发失败 / 取消则撤销，避免视觉模型被一张坏图永久剥图。
     let imageRetryUsed = false;
+    const dismissImageSuspect = (): void => {
+      if (imageRetryUsed && opts.fallback) {
+        dismissTextOnly(opts.fallback.kiroModel);
+      }
+    };
     // 同理，401 后强刷登录再发一次也不占重试配额（每把凭证一次）。
     const authRetried = new Set<string>();
     let headers = initialHeaders;
@@ -954,6 +1009,24 @@ export class KrsProxyServer {
         error: err.slice(0, 200),
         conversationId: meta.convId,
       });
+    };
+
+    /** 上一次尝试的上游状态（0 = 连接失败 / 被中止），客户端取消落账时用。 */
+    let lastStatus = 0;
+    const client = opts.client;
+    /** 客户端在我们发出任何字节之前就断开了（handleRequest 早挂的 res 'close' 标志；res.destroyed 双保险）。 */
+    const clientGone = (): boolean => !!client?.closed || res.destroyed;
+    /**
+     * 客户端在上游响应头到达前取消（Kiro 点「停止」）：放弃——不再发起 / 重试上游请求，也不把这次放弃算成
+     * 凭证失败（不 markFailure）。已经发出过上游请求时记一条「客户端取消」（与泵 done() 的口径一致，
+     * 状态取上一次上游给的），一次都没发出过则不落账。响应头之后的取消不走这里，由泵的 res 'close' 处理。
+     */
+    const abandonForClient = (where: string, sent: boolean): void => {
+      debug(`client cancelled before upstream headers (${where}); giving up conv=${convId} attempt-status=${lastStatus}`);
+      dismissImageSuspect();
+      if (sent) {
+        recordFailure(lastStatus, "客户端取消");
+      }
     };
 
     /**
@@ -990,18 +1063,40 @@ export class KrsProxyServer {
       }
     };
 
+    let sentAny = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // 客户端已断开就到此为止：不发、不重试（含剥图 / 401 刷新 / 换 key 那几种不占配额的重发）。
+      if (clientGone()) {
+        abandonForClient(sentAny ? "before retry" : "before first attempt", sentAny);
+        return;
+      }
       if (attempt > 1) {
         const backoff = Math.min(300 * (attempt - 1), 1500);
         info(`↻ 自动重试 ${attempt}/${maxAttempts} (${backoff}ms后) conv=${convId} 原因=${lastReason}`);
         await new Promise((r) => setTimeout(r, backoff));
+        if (clientGone()) {
+          abandonForClient("during backoff", true);
+          return;
+        }
       }
 
-      // 1) 发起上游请求（连接失败可重试）
+      // 1) 发起上游请求（连接失败可重试）。在途期间客户端断开 → 立刻中止这条上游请求；
+      //    钩子只在响应头到达前挂着（拿到响应头就摘掉），响应头之后的取消仍由泵的 res 'close' → body.destroy() 处理。
       let upstream;
+      const inflight = new AbortController();
+      if (client) {
+        client.onClose = () => inflight.abort();
+      }
+      sentAny = true;
       try {
-        upstream = await requestUpstream("POST", url, headers, bodyStr);
+        upstream = await requestUpstream("POST", url, headers, bodyStr, undefined, inflight.signal);
       } catch (e) {
+        lastStatus = 0;
+        if (clientGone()) {
+          // 是我们自己中止的（或客户端恰好刚走）：不是链路 / key 的问题，不进冷却、不重试
+          abandonForClient("in flight", true);
+          return;
+        }
         lastReason = "连接失败: " + (e as Error).message;
         error("upstream fetch failed:", (e as Error).message);
         // 网络错误是链路问题不是 key 问题：短冷却但不换 key（换了大概率一样）
@@ -1009,7 +1104,16 @@ export class KrsProxyServer {
         if (attempt < maxAttempts) {
           continue;
         }
+        dismissImageSuspect();
         recordFailure(0, "连接失败: " + (e as Error).message);
+        if (res.headersSent) {
+          // 流内错误零输出重试之后再连不上：响应头已是 event-stream，错误只能走帧（与非 2xx 终态同形）
+          writeEvent(res, { assistantResponseEvent: { content: "❌ 无法连接中转站：" + (e as Error).message, modelId } });
+          writeEvent(res, stopReasonEvent("END_TURN"));
+          res.write(encodeException("InternalServerException", { message: "无法连接中转站：" + (e as Error).message }));
+          res.end();
+          return;
+        }
         res.writeHead(502, {
           "Content-Type": "application/json",
           "x-amzn-errortype": "InternalServerException",
@@ -1021,7 +1125,12 @@ export class KrsProxyServer {
           })
         );
         return;
+      } finally {
+        if (client) {
+          client.onClose = undefined;
+        }
       }
+      lastStatus = upstream.statusCode;
 
       // 2) 非 2xx：5xx/429 可重试；"不支持图片"的 4xx 剥图重发一次；凭证类错误换 key；其余(4xx)直接透传给客户端
       if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
@@ -1036,7 +1145,7 @@ export class KrsProxyServer {
         ) {
           imageRetryUsed = true;
           const fb = opts.fallback;
-          await markTextOnly(fb.kiroModel);
+          suspectTextOnly(fb.kiroModel);
           const rebuilt = await opts.onImageRejection();
           if (rebuilt) {
             bodyStr = rebuilt;
@@ -1045,6 +1154,7 @@ export class KrsProxyServer {
             attempt--; // 不占用普通重试配额
             continue;
           }
+          dismissTextOnly(fb.kiroModel);
         }
 
         // 401 先给当前凭证一次"强刷 token 再试"的机会（OAuth 类）；刷不了再走下面的换 key / 报错
@@ -1076,6 +1186,7 @@ export class KrsProxyServer {
           lastReason = `上游 ${upstream.statusCode}`;
           continue;
         }
+        dismissImageSuspect();
         recordFailure(upstream.statusCode, errText);
         this.beginEventStream(res);
         writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
@@ -1104,13 +1215,68 @@ export class KrsProxyServer {
       }
 
       // 3) 2xx：正常流式回传。一旦开始流就不再重试、不再换 key（避免重复内容）。
+      //    客户端在响应头到达前就走了：泵里的 res 'close' 监听挂不上（事件已经发过），这里直接掐断上游、
+      //    不读流、不记成功——上游刚开始生成，此刻掐断能省下剩余输出；账本记「客户端取消」与泵同口径。
+      if (clientGone()) {
+        try {
+          upstream.body.destroy();
+        } catch {
+          /* ignore */
+        }
+        abandonForClient("2xx headers arrived", true);
+        return;
+      }
       markSuccess(provider, meta.credential);
+      if (imageRetryUsed && opts.fallback) {
+        await confirmTextOnly(opts.fallback.kiroModel);
+      }
       this.beginEventStream(res);
       if (wire === "kiro") {
         await this.pumpKiroPassthrough(res, upstream.body, convId, modelId, notice, meta, upstream.statusCode);
-      } else {
-        await this.pumpStream(res, wire, upstream.body, convId, modelId, notice, meta, upstream.statusCode);
+        return;
       }
+      const outcome = await this.pumpStream(res, wire, upstream.body, convId, modelId, notice, meta, upstream.statusCode);
+      const se = outcome.retryStreamError;
+      if (!se) {
+        return;
+      }
+
+      // 4) 上游 2xx 之后在流里报错（{"error":…} / type:"error" / response.failed）且尚未向客户端吐出任何正文 / 思考 / 工具：
+      //    走与非 2xx 相同的判定——按错误分类冷却这把 key、凭证问题换 key、5xx / 429 按 maxRetries 重试，都不行则以
+      //    非 2xx 相同的终态收尾。已吐字的流内错误不到这里：泵自己收尾（❌ 文案 + stopReason）并记失败，不重试。
+      const seStatus = streamErrorStatus(se);
+      const seText = streamErrorText(se);
+      error(`upstream stream error before any output (as ${seStatus}):`, seText.slice(0, 300));
+      const verdict = markFailure(provider, meta.credential, seStatus, seText);
+      if (verdict.rotate && (await rotateCredential(`凭证${verdict.kind === "quota" ? "额度不足" : verdict.kind === "auth" ? "鉴权失败" : "无权限"}`))) {
+        attempt--;
+        continue;
+      }
+      if (pool && verdict.kind === "ratelimit" && (await rotateCredential("凭证被限流"))) {
+        attempt--;
+        continue;
+      }
+      if ((seStatus >= 500 || seStatus === 429) && attempt < maxAttempts) {
+        lastReason = `上游流内错误（按 ${seStatus}）`;
+        continue;
+      }
+      dismissImageSuspect();
+      recordFailure(upstream.statusCode, "上游流内错误: " + seText);
+      if (!outcome.metaWritten) {
+        writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
+      }
+      let hint = upstreamErrorHint(seStatus, seText, provider, wire);
+      if (pool && poolStatus(provider).cooling === poolStatus(provider).configured) {
+        hint = poolExhaustedHint(provider) + (hint ? `\n\n${hint}` : "");
+      } else if (pool && triedCreds.size > 1) {
+        hint = `已尝试 ${triedCreds.size} 把凭证均失败。` + (hint ? " " + hint : "");
+      }
+      writeEvent(res, {
+        assistantResponseEvent: { content: `❌ 上游在流中返回错误：${seText.slice(0, 800)}${hint ? `\n\n💡 ${hint}` : ""}`, modelId },
+      });
+      writeEvent(res, stopReasonEvent("END_TURN"));
+      res.write(encodeException("InternalServerException", { message: "Upstream stream error" }));
+      res.end();
       return;
     }
   }
@@ -1120,6 +1286,10 @@ export class KrsProxyServer {
    *
    * 两个协议共用这一套泵：转换器都实现 StreamConverter（processLine/flush/usage），
    * 按行喂进去、把返回的 CwEvent 写出去。协议差异全部收在转换器里。
+   *
+   * 返回值：上游在流里报错（转换器 `streamError`）而我们还没向客户端吐出任何正文 / 思考 / 工具时，泵**不收尾**
+   * （不 flush、不 `res.end()`、不落账），把错误交回 streamWithRetry 按非 2xx 的口径判定换 key / 重试 / 终态；
+   * 其余情况泵自己收尾并落账，返回空对象。
    */
   private pumpStream(
     res: http.ServerResponse,
@@ -1130,8 +1300,8 @@ export class KrsProxyServer {
     notice: string | undefined,
     meta: UsageMeta,
     statusCode: number
-  ): Promise<void> {
-    return new Promise<void>((resolve) => {
+  ): Promise<PumpOutcome> {
+    return new Promise<PumpOutcome>((resolve) => {
       const showUsage = getShowTokenUsage();
       const protocol: Protocol = protocolOfWire(wire);
       // 提示要紧跟在 messageMetadataEvent 之后、正文之前，这样用户第一眼就知道图片被忽略了。
@@ -1154,6 +1324,10 @@ export class KrsProxyServer {
       /** 第一个正文/思考字节到达的时刻（记账里的首 token 延迟）。 */
       let firstTokenAt: number | undefined;
       let streamError: string | undefined;
+      /** 已向客户端写出过正文 / 思考 / 工具（含剥图提示）——之后的流内错误不能再重试（已发出的内容撤不回）。 */
+      let wroteContent = false;
+      /** 已写出 messageMetadataEvent（零输出终态时不重复补）。 */
+      let metaWritten = false;
       // debug 开着时把上游原始 SSE 行攒下来（截断到 64KB），流末连同"思考 / 正文各多少字"一起打进日志。
       // 排查"思考里是正文"、"回复重复"一类问题时，这是唯一能看清上游到底发了什么的地方。
       const rawCapture: string[] | undefined = isDebug() ? [] : undefined;
@@ -1167,6 +1341,14 @@ export class KrsProxyServer {
         }
         finished = true;
         res.removeListener("close", onClientClose);
+        // 流内错误帧 + 零输出 + 客户端仍在：不收尾、不落账，交回重试循环（换 key / 重试 / 终态都由它定，见 streamWithRetry 第 4 步）。
+        // 单纯的 socket 中断（没有上游明确的错误帧）不走这里，维持既有「尽力收尾、记流中断」。
+        const early = converter.streamError;
+        if (early && !wroteContent && !clientClosed && !res.writableEnded) {
+          debug(`stream error before any output; handing back to retry loop conv=${convId}`, early);
+          resolve({ retryStreamError: early, metaWritten });
+          return;
+        }
         try {
           if (!clientClosed && !res.writableEnded) {
             for (const ev of converter.flush()) {
@@ -1238,6 +1420,13 @@ export class KrsProxyServer {
         // 算了钱的），只是标成非 ok；流内报错同理。
         // 口径与 Kiro 直通一致（usageStore.ts）：inputTokens 只算未命中缓存，缓存读/写单列——
         // 不能拿 meteringUsage()：它为避免页脚双计把 OpenAI / Responses / Gemini 的缓存清零了。
+        // 上游在 2xx 流里塞的错误帧（已吐字所以没重试）：账本记失败、按错误文本给这把凭证冷却——
+        // 否则「200 + 流内配额错误」会被记成成功，配额耗尽的 key 还会被会话粘住继续用。
+        const se = converter.streamError;
+        if (se) {
+          streamError = "上游流内错误: " + streamErrorText(se).slice(0, 160);
+          markFailure(meta.provider, meta.credential, streamErrorStatus(se), streamErrorText(se));
+        }
         const u = converter.ledgerUsage();
         const now = Date.now();
         const cb = meta.rawContextBreakdown ? allocateContextTokens(meta.rawContextBreakdown, u.inputTokens) : undefined;
@@ -1261,7 +1450,7 @@ export class KrsProxyServer {
           error: streamError || (clientClosed ? "客户端取消" : undefined),
           conversationId: meta.convId,
         });
-        resolve();
+        resolve({});
       };
 
       const onClientClose = () => {
@@ -1293,8 +1482,14 @@ export class KrsProxyServer {
             if (clientClosed) {
               return;
             }
-            if (firstTokenAt === undefined && (ev.assistantResponseEvent || ev.reasoningContentEvent || ev.toolUseEvent)) {
-              firstTokenAt = Date.now();
+            if (ev.assistantResponseEvent || ev.reasoningContentEvent || ev.toolUseEvent) {
+              wroteContent = true;
+              if (firstTokenAt === undefined) {
+                firstTokenAt = Date.now();
+              }
+            }
+            if (ev.messageMetadataEvent) {
+              metaWritten = true;
             }
             if (ev.assistantResponseEvent) {
               contentChars += ev.assistantResponseEvent.content.length;
@@ -1305,6 +1500,7 @@ export class KrsProxyServer {
             if (pendingNotice && ev.messageMetadataEvent) {
               writeEvent(res, { assistantResponseEvent: { content: pendingNotice, modelId } });
               pendingNotice = undefined;
+              wroteContent = true;
             }
           }
         }

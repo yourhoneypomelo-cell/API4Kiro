@@ -14,9 +14,10 @@
  * 在读取时自动合成为 provider 条目，不迁移不写回，保证旧配置零丢失、可回滚。
  */
 
-import { cfg, normalizeUrl, updateSetting } from "./config";
+import { CONFIG_NS, cfg, normalizeUrl, readUserLevelArray, updateSetting } from "./config";
+import { warn } from "./log";
 import { getToken, hasToken } from "./oauth/tokenStore";
-import { getVendor } from "./oauth/vendors";
+import { ANTHROPIC_URLS, ANTIGRAVITY_URLS, CODEX_URLS, KIMI_URLS, KIRO_URLS, VendorSpec, XAI_URLS, getVendor } from "./oauth/vendors";
 import { CatalogProvider, catalogProvider, catalogProviders } from "./modelCatalog";
 
 /**
@@ -130,6 +131,12 @@ export interface ProviderConfig {
   auth?: AuthKind;
   /** auth=oauth 时的厂商 id（kimi / codex / xai / antigravity / anthropic），决定登录流程、请求头与内置模型目录。 */
   oauthVendor?: string;
+  /**
+   * 仅 auth=oauth：放行用户自填的宿主。缺省 false——登录类 provider 的 token 只发往厂商规格地址
+   * （见 allowedOAuthHosts），baseUrl 被改到别处时不发 token、provider 不可用。为 true 时该 baseUrl 的宿主
+   * 也进允许集（用户明确要经自建中转转发）。只能在用户设置里写，面板不提供入口。
+   */
+  allowCustomHost?: boolean;
   /** 该 provider 的模型 ID 映射（Kiro 选中 id → 上游真实 id）。 */
   modelMapping?: Record<string, string>;
   /** 兜底模型（映射未命中时用）。 */
@@ -510,6 +517,7 @@ function coerce(raw: unknown, index: number): ProviderConfig | undefined {
     exactBase: r.exactBase === true ? true : undefined,
     auth,
     oauthVendor: auth === "oauth" && typeof r.oauthVendor === "string" && r.oauthVendor.trim() ? r.oauthVendor.trim() : undefined,
+    allowCustomHost: auth === "oauth" && r.allowCustomHost === true ? true : undefined,
     modelMapping,
     defaultModel: typeof r.defaultModel === "string" ? r.defaultModel.trim() : undefined,
     presetId: typeof r.presetId === "string" ? r.presetId : undefined,
@@ -711,13 +719,33 @@ function migrateFromLegacy(): ProviderConfig[] {
   return out;
 }
 
-/** 读注册表。空则回退到旧配置合成（读时迁移，不写回）。 */
+/**
+ * 读注册表。空则回退到旧配置合成（读时迁移，不写回）。
+ *
+ * 只取用户级值：工作区 / 工作区文件夹层的 providers 一律忽略（仓库不能决定 Key 与 token 发往哪里），
+ * 出现时记一条 warn；工作区值消失后再出现会再记一次。见 config.readUserLevelArray。
+ */
 export function getProviders(): ProviderConfig[] {
-  const raw = cfg().get<unknown[]>(STORE_KEY, []);
-  if (Array.isArray(raw) && raw.length > 0) {
+  const { value: raw, shadowed } = readUserLevelArray(STORE_KEY);
+  noteWorkspaceShadow(shadowed);
+  if (raw.length > 0) {
     return raw.map(coerce).filter((p): p is ProviderConfig => !!p);
   }
   return migrateFromLegacy();
+}
+
+let workspaceShadowWarned = false;
+
+function noteWorkspaceShadow(shadowed: boolean): void {
+  if (!shadowed) {
+    workspaceShadowWarned = false;
+    return;
+  }
+  if (workspaceShadowWarned) {
+    return;
+  }
+  workspaceShadowWarned = true;
+  warn(`工作区级 ${CONFIG_NS}.${STORE_KEY} 已被忽略：该项只在用户设置里生效（scope: machine），本次按用户级值读取`);
 }
 
 /** 写整张注册表。写前把 c1 镜像回 apiKey，两处永远一致。 */
@@ -737,6 +765,156 @@ export function isOAuthProvider(p: Pick<ProviderConfig, "auth">): boolean {
   return p.auth === "oauth";
 }
 
+// ---------------------------------------------------------------------------------------
+// OAuth token 只发往厂商规格地址
+//
+// 登录类 provider 的 baseUrl 存在 settings 里，而 token 存在钥匙串里按 provider id 取——两者原本没有绑定：
+// 谁能改 settings（旧版工作台会把仓库 .vscode/settings.json 合并进来）就能让 token 发去任意主机。
+// 这里把「允许把 token 发往哪些宿主」从**运行时**的 VendorSpec 派生（spec.baseUrl 与厂商表里其它会带 token
+// 请求的地址），不硬编码域名：_setVendorUrlsForTest 把规格指到 127.0.0.1 时允许集随之变化，测试套件不用改。
+// 只校验 provider.baseUrl（四条 dispatch 与 /models 都从它拼 URL）；Kiro 直通按 token 的 region 用
+// apiBaseFor 定域、地址来自钥匙串而非 settings，不在校验范围内。key 类 provider 不受影响。
+// ---------------------------------------------------------------------------------------
+
+/** URL 的 scheme 与 host（hostname[:port]，小写）；不是 http(s) 地址返回 undefined。 */
+function parseOrigin(url: string): { scheme: "http" | "https"; host: string } | undefined {
+  const m = /^(https?):\/\/([^/?#\s]+)/i.exec(String(url || "").trim());
+  if (!m) {
+    return undefined;
+  }
+  // 去掉 userinfo；host 里的端口保留（127.0.0.1:19871 与 127.0.0.1:19872 是两个宿主）
+  const host = m[2].replace(/^[^@]*@/, "").toLowerCase();
+  return host ? { scheme: m[1].toLowerCase() as "http" | "https", host } : undefined;
+}
+
+/**
+ * 厂商表里会带 access token 去请求的地址（当前运行时的值）。Kiro 的模板含 `{region}`，匹配时当一个域名段。
+ * 刷新 / 授权端点不在其中——那里发的是 refresh token / 授权码，与 provider.baseUrl 无关。
+ */
+function vendorRequestUrls(vendorId: string): string[] {
+  switch (vendorId) {
+    case "kimi":
+      return [KIMI_URLS.api];
+    case "codex":
+      return [CODEX_URLS.api];
+    case "xai":
+      return [XAI_URLS.api];
+    case "antigravity":
+      return [ANTIGRAVITY_URLS.api, ANTIGRAVITY_URLS.daily];
+    case "anthropic":
+      return [ANTHROPIC_URLS.api];
+    case "kiro":
+      return [KIRO_URLS.api, KIRO_URLS.runtime, KIRO_URLS.q];
+    default:
+      return [];
+  }
+}
+
+/**
+ * 该 OAuth 厂商的 token 允许发往的宿主集合（`hostname[:port]`，小写；Kiro 的 `runtime.{region}.kiro.dev` 保留
+ * `{region}` 占位）。由运行时 spec.baseUrl 与厂商表派生；`allowCustomHost` 为 true 时 provider 自己的 baseUrl
+ * 宿主也在其中。规格未知返回空集。纯函数，无副作用。
+ */
+export function allowedOAuthHosts(
+  spec: Pick<VendorSpec, "id" | "baseUrl"> | undefined,
+  provider?: Pick<ProviderConfig, "baseUrl" | "allowCustomHost">
+): Set<string> {
+  const out = new Set<string>();
+  if (spec) {
+    for (const url of [spec.baseUrl, ...vendorRequestUrls(spec.id)]) {
+      const o = parseOrigin(url);
+      if (o) {
+        out.add(o.host);
+      }
+    }
+  }
+  if (provider?.allowCustomHost === true) {
+    const o = parseOrigin(provider.baseUrl);
+    if (o) {
+      out.add(o.host);
+    }
+  }
+  return out;
+}
+
+/** host 是否命中集合里的某一项（`{region}` 占位匹配一个 `[a-z0-9-]+` 域名段，其余逐字）。 */
+export function oauthHostMatches(hosts: Iterable<string>, host: string): boolean {
+  const h = String(host || "").toLowerCase();
+  if (!h) {
+    return false;
+  }
+  for (const pat of hosts) {
+    if (pat === h) {
+      return true;
+    }
+    if (pat.includes("{region}")) {
+      const re = new RegExp("^" + pat.split("{region}").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[a-z0-9-]+") + "$");
+      if (re.test(h)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * 该 provider 的 baseUrl（或指定 url）是否允许作为其 OAuth token 的发送目标。
+ * key 类恒 true；`allowCustomHost` 为 true 恒 true；否则宿主必须在 allowedOAuthHosts 里，且不得从规格的
+ * https 降级为 http（规格本身是 http 时——测试把厂商指到本机——不限制）。规格未知一律 false。
+ */
+export function isOAuthHostAllowed(
+  p: Pick<ProviderConfig, "auth" | "oauthVendor" | "baseUrl" | "allowCustomHost">,
+  url: string = p.baseUrl
+): boolean {
+  if (!isOAuthProvider(p)) {
+    return true;
+  }
+  if (p.allowCustomHost === true) {
+    return true;
+  }
+  const spec = getVendor(p.oauthVendor);
+  const target = parseOrigin(url);
+  if (!spec || !target) {
+    return false;
+  }
+  if (target.scheme === "http" && parseOrigin(spec.baseUrl)?.scheme !== "http") {
+    return false;
+  }
+  return oauthHostMatches(allowedOAuthHosts(spec, p), target.host);
+}
+
+/** 拒绝原因（面板状态 / 引导文案 / 抛错用）；允许时返回 undefined。不含任何凭据。 */
+export function oauthHostRejection(p: Pick<ProviderConfig, "name" | "auth" | "oauthVendor" | "baseUrl" | "allowCustomHost">): string | undefined {
+  if (isOAuthHostAllowed(p)) {
+    return undefined;
+  }
+  const spec = getVendor(p.oauthVendor);
+  const vendorName = spec?.name || p.oauthVendor || "未知厂商";
+  const specHost = spec ? parseOrigin(spec.baseUrl)?.host || spec.baseUrl : "—";
+  const host = parseOrigin(p.baseUrl)?.host || p.baseUrl || "(空)";
+  return `地址 ${host} 不是「${vendorName}」的规格地址（${specHost}），已拒绝向它发送登录凭据；确需经自建中转转发，请在用户设置里给该 provider 加 allowCustomHost: true`;
+}
+
+/** 每个 provider 对同一个被拒地址只记一条 warn；地址换了或恢复正常后再出问题会再记。 */
+const hostRejectionLogged = new Map<string, string>();
+
+/**
+ * 请求前的宿主门：允许返回 undefined；拒绝时记一条 warn（不含 token）并返回原因。
+ * ensureAccessToken（取 token 前）与 authHeaders（造头前）都经过这里，任何一条路径都发不出 token。
+ */
+export function checkOAuthHost(p: ProviderConfig): string | undefined {
+  const reason = oauthHostRejection(p);
+  if (!reason) {
+    hostRejectionLogged.delete(p.id);
+    return undefined;
+  }
+  if (hostRejectionLogged.get(p.id) !== p.baseUrl) {
+    hostRejectionLogged.set(p.id, p.baseUrl);
+    warn(`[${p.name}] ${reason}`);
+  }
+  return reason;
+}
+
 /** 某把凭证是否配置齐全：key 类有 key；oauth 类在 token 仓里有 token。 */
 export function isCredentialConfigured(p: ProviderConfig, c: Credential): boolean {
   return isOAuthProvider(p) ? hasToken(tokenKeyOf(p.id, c.id)) : !!c.apiKey;
@@ -747,9 +925,16 @@ export function configuredCredentials(p: ProviderConfig): Credential[] {
   return credentialsOf(p).filter((c) => c.enabled && isCredentialConfigured(p, c));
 }
 
-/** 配置完整才算「可用」：有地址，且至少一把凭证配置齐全（key 类有 key / oauth 类已登录）。 */
+/**
+ * 配置完整才算「可用」：有地址，且至少一把凭证配置齐全（key 类有 key / oauth 类已登录）；
+ * oauth 类还要求地址是厂商规格宿主（或显式 allowCustomHost），否则不进路由、不进模型列表
+ * （被拒时经 checkOAuthHost 记一条 warn，同一地址不重复）。
+ */
 export function isProviderUsable(p: ProviderConfig): boolean {
   if (!p.baseUrl) {
+    return false;
+  }
+  if (isOAuthProvider(p) && checkOAuthHost(p)) {
     return false;
   }
   return configuredCredentials(p).length > 0;
@@ -761,6 +946,10 @@ export function providerMissing(p: ProviderConfig): string | undefined {
     return "已停用";
   }
   if (isOAuthProvider(p)) {
+    const rejected = oauthHostRejection(p);
+    if (rejected) {
+      return rejected;
+    }
     return configuredCredentials(p).length > 0 ? undefined : "未登录";
   }
   const hasKey = configuredCredentials(p).length > 0;
@@ -1006,6 +1195,10 @@ export function resolveRootUrl(p: ProviderConfig, apiPath: string): string {
 export function authHeaders(p: ProviderConfig, stream = false, cred?: Credential): Record<string, string> {
   const c = cred || credentialsOf(p)[0];
   if (isOAuthProvider(p)) {
+    // 地址不是厂商规格宿主 → 不造任何带 token 的头（上层 isProviderUsable / ensureAccessToken 已先拦，这里是最后一道）
+    if (checkOAuthHost(p)) {
+      return {};
+    }
     const spec = getVendor(p.oauthVendor);
     const tok = getToken(tokenKeyOf(p.id, c.id));
     return spec && tok ? spec.headers(tok, stream) : {};

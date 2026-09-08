@@ -27,10 +27,13 @@ import { encodeReasoningSignature } from "./responsesTranslate";
 import {
   CapturedUsage,
   StreamConverter,
+  StreamError,
   contextUsagePercentFloat,
   emptyUsage,
+  isTruncatedToolInput,
   splitCachedInput,
   stopReasonEvent,
+  streamErrorNotice,
   toCwStopReason,
 } from "./streamShared";
 
@@ -113,8 +116,13 @@ export class ResponsesStreamConverter implements StreamConverter {
   /** 是否收到过正文 delta；没收到时才用 output_item.done(message) 里的整段文本兜底。 */
   private sawTextDelta = false;
   private pendingContextPct: number | null = null;
-  private errorText = "";
+  /** 顶层 error / response.failed / 整包 resp.error；flush 时给用户一条 ❌ 文案，泵据此记失败 / 冷却凭证。 */
+  public streamError: StreamError | undefined;
+  /** ❌ 文案只发一次（flush 幂等）。 */
+  private sentErrorNotice = false;
   private incompleteReason = "";
+  /** 有 function_call 的 arguments 没收全（非空却解析不了）→ flush 以 MAX_TOKENS 收尾、该 toolUse 标 stop:false。 */
+  private truncatedTool = false;
 
   public usage: CapturedUsage = emptyUsage();
   public sawToolUse = false;
@@ -167,7 +175,7 @@ export class ResponsesStreamConverter implements StreamConverter {
       const err = ev.error || ev.response?.error;
       const msg = ev.message || err?.message || "";
       const code = ev.code || err?.code || "";
-      this.errorText = msg && code ? `${code}: ${msg}` : msg || code || "response failed";
+      this.streamError = { message: msg && code ? `${code}: ${msg}` : msg || code || "response failed", type: code || undefined };
       return out;
     }
 
@@ -299,6 +307,7 @@ export class ResponsesStreamConverter implements StreamConverter {
     return c;
   }
 
+  /** 发一个函数调用。参数没收全的照常发出但标 stop:false 并记 truncatedTool（见 openaiStream.emitToolCalls 的说明）。 */
   private emitCall(key: string): CwEvent[] {
     const c = this.calls.get(key);
     if (!c || c.emitted || !c.name) {
@@ -306,12 +315,17 @@ export class ResponsesStreamConverter implements StreamConverter {
     }
     c.emitted = true;
     this.sawToolUse = true;
+    const truncated = isTruncatedToolInput(c.args);
+    if (truncated) {
+      this.truncatedTool = true;
+    }
     return [
       {
         toolUseEvent: {
           toolUseId: c.callId || key,
           name: c.name,
           input: validJsonOrEmpty(c.args),
+          ...(truncated ? { stop: false } : {}),
         },
       },
     ];
@@ -346,7 +360,7 @@ export class ResponsesStreamConverter implements StreamConverter {
           this.sawSseEvent = true;
           this.meta(out);
           if (resp.error) {
-            this.errorText = resp.error.message || resp.error.code || "response failed";
+            this.streamError = { message: resp.error.message || resp.error.code || "response failed", type: resp.error.code || undefined };
           }
           for (const item of resp.output || []) {
             if (item.type === "message") {
@@ -383,14 +397,9 @@ export class ResponsesStreamConverter implements StreamConverter {
       out.push(...this.emitCall(key));
     }
 
-    if (this.errorText) {
-      out.push({
-        assistantResponseEvent: {
-          content: `\n\n❌ 上游在流中返回错误：${this.errorText.slice(0, 800)}`,
-          modelId: this.modelId,
-        },
-      });
-      this.errorText = "";
+    if (this.streamError && !this.sentErrorNotice) {
+      this.sentErrorNotice = true;
+      out.push(streamErrorNotice(this.streamError, this.modelId));
     }
     const truncated = this.incompleteReason === "max_output_tokens";
     if (truncated) {
@@ -418,8 +427,8 @@ export class ResponsesStreamConverter implements StreamConverter {
         },
       });
     }
-    // 结束原因必发（见 streamShared.toCwStopReason 的说明）
-    out.push(stopReasonEvent(toCwStopReason(truncated ? "max_tokens" : "stop", this.sawToolUse)));
+    // 结束原因必发（见 streamShared.toCwStopReason 的说明）。上游 incomplete(max_output_tokens) 或有函数参数没收全 → MAX_TOKENS。
+    out.push(stopReasonEvent(toCwStopReason(truncated || this.truncatedTool ? "max_tokens" : "stop", this.sawToolUse)));
     return out;
   }
 

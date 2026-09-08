@@ -2,12 +2,15 @@ import { CwEvent } from "./cwTypes";
 import {
   CapturedUsage,
   StreamConverter,
+  StreamError,
   buildMeteringEvents,
   contextUsagePercentFloat,
   emptyUsage,
+  isTruncatedToolInput,
   resolveOutputTokens,
   splitCachedInput,
   stopReasonEvent,
+  streamErrorNotice,
   toCwStopReason,
 } from "./streamShared";
 import {
@@ -97,9 +100,17 @@ export class OpenaiStreamConverter implements StreamConverter {
 
   private toolCalls = new Map<number, PendingToolCall>();
   private pendingContextPct: number | null = null;
-  private errorText = "";
+  /** 流内 `{"error":…}` 帧；flush 时给用户一条 ❌ 文案，泵据此记失败 / 冷却凭证。 */
+  public streamError: StreamError | undefined;
+  /** ❌ 文案只发一次（flush 幂等）。 */
+  private sentErrorNotice = false;
   /** 上游 finish_reason（stop / length / tool_calls …），flush 时翻成 Kiro 枚举发出。 */
   private finishReason: string | undefined;
+  /**
+   * 有工具的 arguments 没收全（非空却解析不了）。flush 以 MAX_TOKENS 收尾并给该 toolUse 标 stop:false，
+   * Kiro 走原生 OutputTruncatedError（工具不执行、模型收到「拆小再试」）而不是拿 {} 去撞 schema 校验。
+   */
+  private truncatedTool = false;
 
   /**
    * 「思考里其实是一份完整回答」（见 thinkingPolicy.ts「三」）。流式过程中发出去的思考收不回，
@@ -181,7 +192,11 @@ export class OpenaiStreamConverter implements StreamConverter {
 
     if (chunk.error) {
       const msg = chunk.error.message || JSON.stringify(chunk.error);
-      this.errorText = String(msg);
+      // code 可能是数字（429 / 500）也可能是串（insufficient_quota / rate_limit_exceeded）：数字当状态码，串并入分类文本。
+      const code = chunk.error.code;
+      const numeric = typeof code === "number" ? code : typeof code === "string" && /^\d{3}$/.test(code) ? Number(code) : undefined;
+      const typeText = [chunk.error.type, typeof code === "string" && !/^\d{3}$/.test(code) ? code : ""].filter(Boolean).join(" ");
+      this.streamError = { message: String(msg), type: typeText || undefined, status: numeric };
       return out;
     }
 
@@ -392,7 +407,11 @@ export class OpenaiStreamConverter implements StreamConverter {
     return [{ reasoningContentEvent: { signature: SYNTHETIC_REASONING_SIGNATURE } }];
   }
 
-  /** Emit every accumulated tool call exactly once. */
+  /**
+   * Emit every accumulated tool call exactly once.
+   * 参数没收全的调用照常发出（Kiro 历史里要有这次调用的痕迹，模型才拿得到 OutputTruncatedError 的拆分指导），
+   * 但标 stop:false 并记 truncatedTool → flush 发 MAX_TOKENS；input 仍降级为 {}（即便 Kiro 侧防线失效也过不了 schema）。
+   */
   private emitToolCalls(): CwEvent[] {
     const out: CwEvent[] = [];
     const indices = [...this.toolCalls.keys()].sort((a, b) => a - b);
@@ -403,11 +422,16 @@ export class OpenaiStreamConverter implements StreamConverter {
       }
       tc.emitted = true;
       this.sawToolUse = true;
+      const truncated = isTruncatedToolInput(tc.args);
+      if (truncated) {
+        this.truncatedTool = true;
+      }
       out.push({
         toolUseEvent: {
           toolUseId: tc.id || `call_${this.conversationId}_${idx}`,
           name: tc.name,
           input: validJsonOrEmpty(tc.args),
+          ...(truncated ? { stop: false } : {}),
         },
       });
     }
@@ -500,14 +524,9 @@ export class OpenaiStreamConverter implements StreamConverter {
 
     out.push(...this.emitToolCalls());
 
-    if (this.errorText) {
-      out.push({
-        assistantResponseEvent: {
-          content: `\n\n❌ 上游在流中返回错误：${this.errorText.slice(0, 800)}`,
-          modelId: this.modelId,
-        },
-      });
-      this.errorText = "";
+    if (this.streamError && !this.sentErrorNotice) {
+      this.sentErrorNotice = true;
+      out.push(streamErrorNotice(this.streamError, this.modelId));
     }
 
     if (this.pendingContextPct !== null) {
@@ -529,8 +548,8 @@ export class OpenaiStreamConverter implements StreamConverter {
         },
       });
     }
-    // 结束原因必发（见 streamShared.toCwStopReason 的说明）
-    out.push(stopReasonEvent(toCwStopReason(this.finishReason, this.sawToolUse)));
+    // 结束原因必发（见 streamShared.toCwStopReason 的说明）。有工具参数没收全 → 视同 finish_reason=length 截断。
+    out.push(stopReasonEvent(toCwStopReason(this.truncatedTool ? "length" : this.finishReason, this.sawToolUse)));
 
     // 闸门已经处理掉的（丢了复读 / 提升成正文）不再当异常提示；放行了但整段仍像回答的才提示
     if (
@@ -633,7 +652,8 @@ function normalizeContent(c: OpenaiDelta["content"]): string {
  * Kiro expects tool input as a JSON object string. Streamed `arguments`
  * fragments can end up empty or truncated when a gateway cuts the stream, so an
  * unparseable payload degrades to `{}` rather than propagating broken JSON into
- * the agent loop.
+ * the agent loop. 截断本身另由 isTruncatedToolInput 判定并以 stop:false + MAX_TOKENS 告知 Kiro
+ * （工具不执行）；这里的 {} 只是第二道保险——万一 Kiro 侧仍去执行，空对象过不了必填字段的 schema 校验。
  */
 function validJsonOrEmpty(args: string): string {
   const s = (args || "").trim();

@@ -36,6 +36,7 @@ docs/**
 .gemini/**
 .github/**
 CONTRIBUTING.md
+SECURITY.md
 assets/icon-source.svg
 AGENTS.md
 CLAUDE.md

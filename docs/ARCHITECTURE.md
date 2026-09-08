@@ -41,15 +41,16 @@ flowchart LR
   UI <--> AGENT
 ```
 
-- 扩展在本机回环地址起两个 HTTP 服务：**KRS**（运行时，默认 19810）承接 Kiro 的对话请求；**CPS**（控制面，默认 19811）承接模型列表、测活、用量查询。
+- 扩展在本机回环地址起两个 HTTP 服务：**KRS**（运行时，默认 19810）承接 Kiro 的对话请求；**CPS**（控制面，默认 19811）承接模型列表、测活、用量查询。本地服务只接受本机非浏览器客户端的请求（`requestGuard.ts` 校验 `Host` 为回环地址、无浏览器来源头 `Origin` / `Sec-Fetch-Site`、TCP 远端为回环，不符一律 403 且不带 CORS 头），网页无法借用你的凭据调用；Kiro 自身走 aws-sdk 的 Node HTTP 客户端，不受影响。
 - 启用代理时，扩展把 Kiro 的 `codewhisperer.config.krsEndpoints / cpsEndpoints / endpoints` 指向本地端口，并把原值备份到 `globalState`；关闭代理时复原。
 - `package.json` 声明 `extensionDependencies: ["kiro.kiroAgent"]`，让 Kiro 工作台把本扩展与 kiro-agent 放进**同一个扩展宿主进程**——这是「通道 A」静默刷新能读到 kiro-agent 内部钩子的前提。
+- 代理开关与含凭据 / 端点的设置项（`enabled`、`providers`、`apiKey`、`baseUrl`、`officialBaseUrl`、`officialApiKey`、`openaiBaseUrl`、`openaiApiKey`、`usagePath`）声明 `scope: machine`：工作台解析工作区 `.vscode/settings.json` 时直接跳过它们，只有用户设置生效，也不参与 Settings Sync；读取 `providers` 时扩展再用 `inspect()` 只取用户级值（纵深防御，工作区值出现时记一条 warn）。`capabilities.untrustedWorkspaces.supported: false`——受限模式（未信任）工作区下扩展不激活。
 
 ## 一次对话请求
 
 1. Kiro 以 AWS eventstream 二进制帧向 KRS 发送 CodeWhisperer 请求（`cwTypes`），`eventstream.ts` 解码。
 2. 若这是 Kiro 每轮附带的 simple-task **意图分类**请求且 `interceptIntentClassifier` 开启，`intentClassifier.ts` 本地应答，不打上游。
-3. `modelStore` 按请求中的模型 ID 查路由表，找到拥有该模型的 provider；`credentialPool` 按该 provider 的策略（主备 / 均衡）挑一把可用凭证；OAuth 类凭证由 `oauth/index.ts` 在发送前换取新鲜 access token。
+3. `modelStore` 按请求中的模型 ID 查路由表，找到拥有该模型的 provider；`credentialPool` 按该 provider 的策略（主备 / 均衡）挑一把可用凭证；OAuth 类凭证由 `oauth/index.ts` 在发送前换取新鲜 access token——前提是该 provider 的 `baseUrl` 宿主在厂商规格的允许集内（`providers.ts#allowedOAuthHosts`，由运行时 VendorSpec 派生；用户可用 `allowCustomHost: true` 放行自建中转），否则 token 不交出、provider 不进路由、面板与回复说明原因。
 4. `imagePolicy` 检查目标模型是否在纯文本名单中，必要时剥离图片（含历史消息）。
 5. 按 provider 协议译码：`translate.ts`（Anthropic）/ `openaiTranslate.ts`（Chat）/ `responsesTranslate.ts`（Responses）/ `geminiTranslate.ts`（Gemini）。思考档位由 `effort.ts` 与 `thinkingPolicy.ts` 决定字段形态；工具 schema 由 `schemaUtil.ts` 内联 `$ref`。
 6. `upstream.ts` 发起流式请求；对应的 `*Stream.ts` 把上游 SSE / 类型化事件翻回 CW 事件，经 `streamShared.ts` 合成 thinking / 文本 / 工具调用，`eventstream.ts` 编码回写给 Kiro。
@@ -63,6 +64,7 @@ flowchart LR
 | `extension.ts` | 激活 / 停用、命令、配置监听；providers 变化时先走通道 A，失败才提示重载 | config, endpoints, portBinder, servers, sidebar, selectorStyle, stores |
 | `endpoints.ts` | Kiro 端点设置的备份 / 重定向 / 复原 | vscode globalState |
 | `portBinder.ts` / `proxyIdentity.ts` | 多窗口共用端口：先到者为主实例，后到者探测端口发现是同类实例即待机；升级后旧实例被识别并让位 | net |
+| `requestGuard.ts` | 两个本地服务的请求来源守卫：Host 回环、无 `Origin`、`Sec-Fetch-Site` 缺失或 `none`、远端回环才放行，否则 403（text/plain，无 CORS 头，限频记日志） | log |
 | `krsServer.ts` | 运行时反代与意图分类本地应答 | 协议模块, credentialPool, usageStore, contextParser, turnLedger, imagePolicy |
 | `cpsServer.ts` | 模型列表广播（把推理 / 图片能力与上下文窗口编码进模型 description，供选择器徽章与弹层读取）、测活、用量查询 | providers, modelStore, usageStore |
 | `providers.ts` / `credentialPool.ts` | 注册表、路由、凭证调度 | oauth/tokenStore, config |
@@ -119,7 +121,7 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 
 ## 多窗口
 
-多个 Kiro 窗口共用同一对端口。启动时 `portBinder` 尝试绑定；端口已被占用时用 `proxyIdentity` 握手——对方是同类实例则本窗口待机（所有窗口的请求都由主实例服务），主实例退出后待机者接管。握手比对扩展标识与版本，升级后旧实例会被识别并让位。
+多个 Kiro 窗口共用同一对端口。启动时 `portBinder` 尝试绑定；端口已被占用时用 `proxyIdentity` 握手——对方是同类实例则本窗口待机（所有窗口的请求都由主实例服务），主实例退出后待机者接管。握手比对扩展标识与版本，升级后旧实例会被识别并让位。握手两个方向都带 HMAC-SHA256 签名：密钥是同用户所有窗口共享的 `globalStorage/identity.key`（`identityKey.ts`，首个窗口独占创建），让位请求须回传服务端一次性 nonce 并签名，签名绑定端口角色（KRS / CPS 互不通用），校验不过则 403 且端口不放（4.13.53 起的主实例拒绝一切无签名让位）；新窗口探测到自报版本低于 4.13.53 的旧主实例时仍按旧协议让它让位，保证升级路径。
 
 ## 已知限制
 

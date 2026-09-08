@@ -651,10 +651,17 @@ export function providerForModel(modelId: string): ProviderConfig | undefined {
     const mid = m.id.toLowerCase();
     return mid === id || mid === base;
   };
-  // 先查勾选后的合并列表（正常路径）。
-  const hit = mergedCache.find(match);
-  if (hit) {
-    return getProvider(hit.providerId);
+  // 先查勾选后的合并列表（正常路径）。合并表只在 fetchAllModels 末尾整体替换，面板刚停用一个 provider 到
+  // 下一次全量拉取完成之间它是旧的——这里复查 owner 仍启用，已停用的视为未命中（同名模型在别家也勾了就
+  // 顺延到别家，否则落到下面按启用 provider 重算 / 调用方兜底），不把请求发给刚停用的 provider（4.13.53）。
+  for (const hit of mergedCache) {
+    if (!match(hit)) {
+      continue;
+    }
+    const owner = getProvider(hit.providerId);
+    if (owner?.enabled) {
+      return owner;
+    }
   }
   // 再查各 provider 的原始列表：用户在模型页取消了某模型的勾选，但 Kiro 里已开的
   // 会话仍会带这个 id 发请求——它该继续发到原来的上游，而不是掉到兜底 provider。

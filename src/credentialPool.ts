@@ -56,11 +56,28 @@ export function shouldRotate(kind: FailureKind): boolean {
 }
 
 /**
- * 把上游状态码 + 错误体归到一类。429 里带额度/余额字样的（New API 系中转用 429 表示欠费）算 quota。
+ * 403 / 429 里带额度 / 余额字样即算欠费（New API 系中转用 429 / 403 表示欠费）：这两个状态码本身就说明
+ * 是凭证层面的拒绝，单个词也可信。
+ */
+const QUOTAISH_RE = /quota|balance|insufficient|余额|额度|credit|billing|payment|exceeded your current|out of credits|extra usage/;
+
+/**
+ * 其它 4xx（主要是 400）里只认**完整的欠费 / 计费短语**：Anthropic 官方把欠费放在 400
+ * （`Your credit balance is too low to access the Anthropic API`），OpenAI 兼容网关也有把
+ * `insufficient_quota` / `Payment Required` 塞进 400 的；但 400 绝大多数是参数错，`quota field invalid`
+ * 这种带单个词的不能当欠费——否则一次参数错会把整池 key 烧一遍（Dq2）。
+ */
+const BILLING_PHRASE_RE =
+  /credit balance|insufficient[ _](?:balance|credits?|funds|quota|user[ _]quota)|balance (?:is )?(?:too low|insufficient|not enough|exhausted)|(?:not enough|no|out of|exhausted|ran out of) (?:credits?|balance|quota)|credits? (?:are |is |have been |has been )?(?:exhausted|depleted|used up)|quota (?:has been |is )?exceeded|exceeded your (?:current )?quota|payment[ _]required|billing (?:issue|problem|error|failed|hard limit|limit reached|details|account)|plans? (?:&|and) billing|top[ -]?up your|please recharge|余额不足|额度不足|额度已用[完尽]|欠费|请充值|余额已用[完尽]|账户余额/;
+
+/**
+ * 把上游状态码 + 错误体归到一类。
+ *  - 402 → quota；403 / 429 带额度字样（QUOTAISH_RE）→ quota；
+ *  - 其它 4xx 带完整欠费短语（BILLING_PHRASE_RE）→ quota；否则 other。
  */
 export function classifyFailure(status: number, body: string): FailureKind {
   const b = (body || "").toLowerCase();
-  const quotaish = /quota|balance|insufficient|余额|额度|credit|billing|payment|exceeded your current|out of credits|extra usage/.test(b);
+  const quotaish = QUOTAISH_RE.test(b);
   if (status === 0) {
     return "network";
   }
@@ -78,6 +95,9 @@ export function classifyFailure(status: number, body: string): FailureKind {
   }
   if (status >= 500) {
     return "upstream";
+  }
+  if (status >= 400 && BILLING_PHRASE_RE.test(b)) {
+    return "quota";
   }
   return "other";
 }

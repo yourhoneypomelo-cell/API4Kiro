@@ -2,11 +2,14 @@ import { CwEvent } from "./cwTypes";
 import {
   CapturedUsage,
   StreamConverter,
+  StreamError,
   buildMeteringEvents,
   contextUsagePercentFloat,
   emptyUsage,
+  isTruncatedToolInput,
   resolveOutputTokens,
   stopReasonEvent,
+  streamErrorNotice,
   toCwStopReason,
 } from "./streamShared";
 
@@ -28,6 +31,8 @@ interface AnthropicSseEvent {
     stop_reason?: string | null;
   };
   usage?: Record<string, unknown>;
+  /** `type:"error"` 事件（overloaded_error / rate_limit_error / api_error …）：上游在 200 流里报错。 */
+  error?: { type?: string; message?: string };
 }
 
 /**
@@ -76,6 +81,15 @@ export class AnthropicStreamConverter implements StreamConverter {
   private upstreamStopReason: string | undefined;
   /** 是否已发过 metadataEvent.tokenUsage；没发过而流里又有用量时 flush 兜底补一帧。 */
   private sentTokenUsage = false;
+  /**
+   * 有工具的参数没收全（input_json 非空却解析不了：流在参数中途被切 / 上游 max_tokens 落在参数里）。
+   * flush 时以 MAX_TOKENS 收尾，让 Kiro 走原生 OutputTruncatedError（工具不执行）而不是把半截参数当完成执行。
+   */
+  private truncatedTool = false;
+  /** 上游 `type:"error"` 事件；flush 时给用户一条 ❌ 文案，泵据此记失败 / 冷却凭证。 */
+  public streamError: StreamError | undefined;
+  /** ❌ 文案只发一次（flush 幂等）。 */
+  private sentErrorNotice = false;
 
   constructor(conversationId: string, modelId: string, opts?: { trace?: boolean }) {
     this.conversationId = conversationId;
@@ -136,6 +150,19 @@ export class AnthropicStreamConverter implements StreamConverter {
 
   private handleEvent(ev: AnthropicSseEvent): CwEvent[] {
     const out: CwEvent[] = [];
+
+    if (ev.type === "error") {
+      // Anthropic 在 200 流里报错的形态：{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}。
+      // 以前没有这个分支，事件被当未知类型静默丢掉：用户只看到已吐的半截正文，账本还记成功。
+      this.mark("err");
+      const etype = ev.error?.type || "";
+      const emsg = ev.error?.message || "";
+      this.streamError = {
+        message: etype && emsg ? `${etype}: ${emsg}` : emsg || etype || "error",
+        type: etype || undefined,
+      };
+      return out;
+    }
 
     if (ev.type === "message_start") {
       this.mark("ms");
@@ -222,14 +249,7 @@ export class AnthropicStreamConverter implements StreamConverter {
         this.curSignature = "";
       }
       if (this.inToolUse) {
-        this.sawToolUse = true;
-        out.push({
-          toolUseEvent: {
-            toolUseId: this.currentToolId,
-            name: this.currentToolName,
-            input: this.currentToolInput || "{}",
-          },
-        });
+        out.push(this.toolUseEvent());
         this.inToolUse = false;
         this.currentToolId = "";
         this.currentToolName = "";
@@ -268,6 +288,29 @@ export class AnthropicStreamConverter implements StreamConverter {
     }
 
     return out;
+  }
+
+  /**
+   * 把当前 tool_use 块发出去。参数原样透传（空 → {}）：Kiro 侧用 partial-JSON 解析进历史，半截参数也能修补成
+   * 「模型试图调用什么」的痕迹，比抹成 {} 更利于模型按 OutputTruncatedError 的指导拆小重试。
+   * 参数没收全时标 `stop:false` 并记 truncatedTool：前者让 Kiro 判「末尾工具未收到 stop」、后者让 flush 发 MAX_TOKENS，
+   * 两个信号任一成立 Kiro 都不执行该工具；正常收全的工具不带 stop 字段（writeEvent 默认 stop:true），事件序列零变化。
+   */
+  private toolUseEvent(): CwEvent {
+    this.sawToolUse = true;
+    const truncated = isTruncatedToolInput(this.currentToolInput);
+    if (truncated) {
+      this.truncatedTool = true;
+      this.mark("!tool_truncated");
+    }
+    return {
+      toolUseEvent: {
+        toolUseId: this.currentToolId,
+        name: this.currentToolName,
+        input: this.currentToolInput || "{}",
+        ...(truncated ? { stop: false } : {}),
+      },
+    };
   }
 
   /** 嵌套形 tokenUsage 帧（Kiro 要求 uncachedInputTokens > 0 || outputTokens > 0 才收）。无用量时为空。 */
@@ -312,19 +355,16 @@ export class AnthropicStreamConverter implements StreamConverter {
     }
   }
 
-  /** Emit any trailing events (unterminated tool call, context usage bar, metering). */
+  /** Emit any trailing events (unterminated tool call, stream error notice, context usage bar, metering). */
   flush(): CwEvent[] {
     const out: CwEvent[] = [];
     if (this.inToolUse) {
-      this.sawToolUse = true;
-      out.push({
-        toolUseEvent: {
-          toolUseId: this.currentToolId,
-          name: this.currentToolName,
-          input: this.currentToolInput || "{}",
-        },
-      });
+      out.push(this.toolUseEvent());
       this.inToolUse = false;
+    }
+    if (this.streamError && !this.sentErrorNotice) {
+      this.sentErrorNotice = true;
+      out.push(streamErrorNotice(this.streamError, this.modelId));
     }
     if (this.pendingContextPct !== null) {
       out.push({ contextUsageEvent: { contextUsagePercentage: this.pendingContextPct } });
@@ -334,8 +374,8 @@ export class AnthropicStreamConverter implements StreamConverter {
     if (!this.sentTokenUsage) {
       out.push(...this.tokenUsageEvent());
     }
-    // 结束原因必发（见 streamShared.toCwStopReason 的说明）
-    out.push(stopReasonEvent(toCwStopReason(this.upstreamStopReason, this.sawToolUse)));
+    // 结束原因必发（见 streamShared.toCwStopReason 的说明）。有工具参数没收全 → 视同 max_tokens 截断。
+    out.push(stopReasonEvent(toCwStopReason(this.truncatedTool ? "max_tokens" : this.upstreamStopReason, this.sawToolUse)));
     // 页脚用量不在这里发：整轮累计由 krsServer 在轮末统一结算（turnLedger.ts）。
     return out;
   }

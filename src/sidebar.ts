@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { readdirSync } from "fs";
 import { isEnabled, updateSetting } from "./config";
-import { GITHUB_URL, checkForUpdate } from "./updateChecker";
+import { GITHUB_URL, getUpdateState, installLatestFromGitHub, onUpdateStateChanged } from "./updateChecker";
 import {
   PRESETS,
   PRIMARY_CREDENTIAL_ID,
@@ -189,6 +189,8 @@ const ICONS = {
   ),
   /** 导入：箭头落进托盘（Lucide download）。 */
   import: svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>'),
+  /** 头部「检查更新」：云 + 向下箭头（Feather download-cloud）——从远端（GitHub Release）取回并安装。 */
+  cloudDown: svg('<path d="M20.9 18.1A5 5 0 0 0 18 9h-1.3A8 8 0 1 0 3 16.3"/><path d="M12 12v9"/><path d="m8 17 4 4 4-4"/>'),
   /** 加号：池底部「再登录一个账号 / 再加一把 Key」的方形小按钮（Lucide plus，线条加粗到 2.4 免得 15px 下发虚）。 */
   plus: svg('<path d="M5 12h14"/><path d="M12 5v14"/>', 2.4),
   /**
@@ -267,6 +269,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
       })
     );
+    // 更新状态（启动静默查到新版 / 检查更新进行中 / 已装好待重载）→ 头部「检查更新」图标的小圆点与转圈
+    context.subscriptions.push(onUpdateStateChanged(() => this.postUpdateState()));
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -426,9 +430,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           this.toast("error", "这把 Key 已经在池里了");
           break;
         }
-        const cred = addCredential(p, { apiKey: key, label: typeof msg.label === "string" ? msg.label : undefined });
+        addCredential(p, { apiKey: key, label: typeof msg.label === "string" ? msg.label : undefined });
         await this.persist(list, `已加入「${p.name}」的 key 池（${credentialsOf(p).length} 把）`, true);
-        this.post({ type: "credentialAdded", id, credentialId: cred.id });
         break;
       }
 
@@ -977,8 +980,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
 
       case "checkUpdate":
-        // 设置页「检查更新」：手动查 GitHub 最新 Release，结果用面板 toast 反馈
-        await checkForUpdate(this.context, { manual: true, toast: (k, m) => this.toast(k, m) });
+        // 头部图标与设置页「检查更新」共用：查 GitHub 最新 Release → 有新版就下载 vsix 资产、校验、安装、提示重载；
+        // 已最新 / 失败 / 取消都由 updateChecker 自己给通知，这里只处理「正在进行中」的重复点击 toast
+        await installLatestFromGitHub(this.context, { toast: (k, m) => this.toast(k, m) });
         break;
 
       case "copyText": {
@@ -1356,7 +1360,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.postState();
     this.postUsage();
     this.postPrompts();
+    this.postUpdateState();
     void this.refresh(true);
+  }
+
+  /** 头部「检查更新」图标的状态：有新版 → 小圆点 + title；busy → 转圈并拒绝重复点击；装好待重载 → 提示文案。 */
+  private postUpdateState(): void {
+    this.post({ type: "updateState", ...getUpdateState() });
   }
 
   /** 只推派生数据（模型清单/计数），全走缓存、不发任何 HTTP。 */
@@ -1630,8 +1640,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private html(webview: vscode.Webview): string {
     const nonce = getNonce();
     const version = String(this.context.extension.packageJSON.version || "");
-    // GitHub Octicon mark（单色，随主题 currentColor）
-    const ghSvg = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" style="vertical-align:-2px;margin-right:5px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>';
+    // GitHub Octicon mark（单色，随主题 currentColor）：头部入口按钮与设置页「关于」卡共用，尺寸由各自 CSS 定
+    const ghSvg = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>';
     // img-src 只给 webview 自己的资源域：厂商图标 / 头像线稿以 CSS mask-image 引用 assets/**.svg
     const csp = `default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';`;
     const assetUri = (sub: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "assets", sub)).toString();
@@ -1696,6 +1706,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     .badge .bi .lbl { display:none !important; } /* ③ 再其次压缩提供商&模型文字只留logo和数字 */
     .hdr .badge.badge-on { padding:1px 4px; }
   }
+  /* 顶栏左侧两枚图标入口：GitHub 项目主页 / 检查更新。无边框、随主题色，悬停亮成荧光紫并带光晕（与面板其它图标按钮同一套调子）；
+     窄栏只缩到 20px，不隐藏（P13：窄栏优先收缩为 logo）。 */
+  .hdr .hlinks { display:inline-flex; align-items:center; gap:4px; flex:none; }
+  .hdr .hbtn { position:relative; display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; padding:0; border-radius:7px; border:1px solid transparent; background:transparent; color:var(--muted); cursor:pointer; transition:color .15s, border-color .15s, box-shadow .15s, background .15s; }
+  .hdr .hbtn svg { width:17px; height:17px; display:block; }
+  .hdr .hbtn:hover, .hdr .hbtn:focus-visible { color:rgb(var(--accent-edge)); border-color:rgba(var(--accent-rgb),.55); background:rgba(var(--accent-rgb),.10); box-shadow:0 0 10px rgba(var(--accent-rgb),.45), inset 0 0 6px rgba(var(--accent-rgb),.12); outline:none; }
+  .hdr .hbtn:active { transform:translateY(1px); }
+  .hdr .hbtn .spin { display:none; margin:0; width:13px; height:13px; border-width:2px; }
+  .hdr .hbtn .upd-dot { display:none; position:absolute; top:1px; right:1px; width:7px; height:7px; border-radius:50%; background:var(--accent); box-shadow:0 0 6px rgba(var(--accent-rgb),.95), 0 0 0 1.5px var(--card2); }
+  .hdr .hbtn.has-update .upd-dot { display:block; }
+  .hdr .hbtn.has-update { color:rgb(var(--accent-edge)); }
+  .hdr .hbtn.busy { cursor:progress; color:var(--accent); border-color:rgba(var(--accent-rgb),.35); }
+  .hdr .hbtn.busy svg { display:none; }
+  .hdr .hbtn.busy .spin { display:inline-block; }
+  .hdr .hbtn.busy .upd-dot { display:none; }
+  .hdr .hbtn[disabled] { pointer-events:none; }
+  @container (max-width: 230px) {
+    .hdr .hbtn { width:20px; height:20px; }
+    .hdr .hbtn svg { width:15px; height:15px; }
+    .hdr .hlinks { gap:2px; }
+  }
+  /* 设置页「关于」卡按钮里的 GitHub 标：与文字同行 */
+  #ghRepo svg { width:13px; height:13px; margin-right:5px; vertical-align:-2px; }
   .prov { border: 1px solid var(--border); border-radius: 9px; margin-bottom: 8px; overflow: hidden; border-left: 3px solid var(--border); background: var(--card2); }
   .prov.on { border-left-color: var(--green); }
   .prow { display: flex; align-items: center; gap: 9px; padding: 9px 10px; cursor: pointer; }
@@ -2236,12 +2269,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   .hv { font-size:17px; font-weight:700; font-variant-numeric:tabular-nums; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .hs { font-size:10px; color:var(--muted); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-  .trend { display:flex; align-items:flex-end; gap:3px; height:44px; padding:2px 0; }
-  .trend .bar2 { flex:1; min-width:3px; background:rgba(var(--accent-rgb),.35); border-radius:2px 2px 0 0; position:relative; transition:background .15s; }
-  .trend .bar2:hover { background:var(--accent); }
-  .trend .bar2.today { background:rgba(var(--accent-rgb),.7); }
-  .trend .empty2 { flex:1; text-align:center; color:var(--muted); font-size:11px; align-self:center; }
-
   .card.uprov-card { overflow:hidden; padding:0; }
   .card.uprov-card .cardhead { margin:0; padding:10px 12px; background:linear-gradient(180deg, rgba(var(--accent-rgb),.15) 0%, rgba(var(--accent-rgb),.04) 100%); border-bottom:1px solid rgba(var(--accent-rgb),.25); box-shadow:inset 0 1px 0 rgba(255,255,255,.05); }
   .card.uprov-card .cardhead h3 { font-size:13px; font-weight:700; color:rgb(var(--accent-edge)); text-shadow:0 0 8px rgba(var(--accent-rgb),.4); }
@@ -2607,9 +2634,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   .kpedit { display:flex; gap:6px; padding:6px 8px 8px 30px; align-items:center; border-bottom:1px dashed var(--border); background:rgba(var(--accent-rgb),.05); }
   .kpedit .keywrap { flex:1 1 auto; min-width:0; }
   .kpedit input.klabel { flex:0 0 96px; min-width:0; }
-  /* 行副标题里的池标记 */
-  .lrow .poolpill { display:inline-flex; align-items:center; gap:3px; font-size:10px; padding:0 6px; border-radius:999px; border:1px solid rgba(var(--accent-rgb),.45); color:rgb(var(--accent-edge)); margin-left:6px; flex:none; vertical-align:middle; }
-  .lrow .poolpill.cool { border-color:rgba(210,153,34,.5); color:var(--yellow); }
 
   /* 模型页 */
   .msearch { width:100%; margin-bottom:10px; }
@@ -2829,6 +2853,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 <body>
   <div class="cardhead hdr" style="margin-bottom:10px;">
     <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto;overflow:hidden;">
+      <div class="hlinks">
+        <button class="hbtn" id="hdrGh" type="button" title="GitHub 项目主页" aria-label="GitHub 项目主页">${ghSvg}</button>
+        <button class="hbtn hbtn-upd" id="hdrUpd" type="button" title="检查更新（从 GitHub 下载并安装最新版）" aria-label="检查更新">${ICONS.cloudDown}<span class="spin"></span><span class="upd-dot"></span></button>
+      </div>
       <h3 class="title-text" style="font-size:15px;white-space:nowrap;">API4Kiro</h3>
       <span class="badge" id="statusBadge" title="">--</span>
     </div>
@@ -3104,7 +3132,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         <button class="btn btn-ghost" id="ghRepo" style="flex:1;">${ghSvg}GitHub 项目主页</button>
         <button class="btn btn-ghost" id="checkUpdate" style="flex:1;">检查更新</button>
       </div>
-      <div class="hint">开源于 GitHub。点「检查更新」比对仓库最新 Release，有新版会提示你去 Release 页下载 .vsix。</div>
+      <div class="hint">开源于 GitHub。「检查更新」会比对仓库最新 Release，有新版就直接下载 .vsix 并安装，装好后提示重新加载窗口；面板左上角的两枚图标是同样的入口。</div>
     </div>
   </div>
 
@@ -5646,7 +5674,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       e.textContent = '还是空的 —— Kiro 的模型选择器目前没有任何模型。点上方「添加模型」加入。';
       sel.appendChild(e);
     }
-    const tabModelsEl = $('tabModelsCnt'); if (tabModelsEl) tabModelsEl.textContent = enabledTotal ? String(enabledTotal) : '';
     renderBadge();
     fitTabs();
     const sum = $('modelSummary');
@@ -5743,8 +5770,39 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   $('showAdd').addEventListener('click', openSelectModal);
   $('log').addEventListener('click', () => vscode.postMessage({ type: 'openLog' }));
   $('catRefresh').addEventListener('click', () => vscode.postMessage({ type: 'refreshCatalog' }));
-  $('ghRepo') && $('ghRepo').addEventListener('click', () => vscode.postMessage({ type: 'openExternal', url: ${JSON.stringify(GITHUB_URL)} }));
-  $('checkUpdate') && $('checkUpdate').addEventListener('click', () => vscode.postMessage({ type: 'checkUpdate' }));
+  // GitHub 入口（头部图标 + 设置页按钮）与「检查更新」（头部图标 + 设置页按钮）：两处各共用同一条宿主消息
+  const openGitHub = () => vscode.postMessage({ type: 'openExternal', url: ${JSON.stringify(GITHUB_URL)} });
+  $('ghRepo') && $('ghRepo').addEventListener('click', openGitHub);
+  $('hdrGh') && $('hdrGh').addEventListener('click', openGitHub);
+  // 点了先本地进入 busy（转圈、禁点），宿主随后推 updateState 接管；宿主没回也 15 秒自动复位，不会一直卡在转圈
+  let updBusyTimer = 0;
+  const setUpdateBusy = (on) => {
+    const h = $('hdrUpd'), s = $('checkUpdate');
+    if (h) { h.classList.toggle('busy', !!on); h.disabled = !!on; }
+    if (s) { s.disabled = !!on; s.textContent = on ? '检查中…' : '检查更新'; }
+    if (updBusyTimer) { clearTimeout(updBusyTimer); updBusyTimer = 0; }
+    if (on) updBusyTimer = setTimeout(() => setUpdateBusy(false), 15000);
+  };
+  const requestUpdate = () => { setUpdateBusy(true); vscode.postMessage({ type: 'checkUpdate' }); };
+  $('checkUpdate') && $('checkUpdate').addEventListener('click', requestUpdate);
+  $('hdrUpd') && $('hdrUpd').addEventListener('click', requestUpdate);
+  // 宿主推来的更新状态：有新版 → 右上角小圆点 + title 改成版本号；已装好待重载 → 同样亮点、文案换；busy → 转圈
+  function applyUpdateState(m) {
+    const h = $('hdrUpd');
+    if (!h) return;
+    setUpdateBusy(!!m.busy);
+    const latest = m.latest ? String(m.latest).replace(/^v/i, '') : '';
+    const installed = m.installed ? String(m.installed).replace(/^v/i, '') : '';
+    const pending = !!installed && !m.hasUpdate;
+    h.classList.toggle('has-update', !!m.hasUpdate || pending);
+    const t = m.busy ? '正在检查更新…'
+      : pending ? ('已安装 v' + installed + '，重新加载窗口后生效')
+      : m.hasUpdate ? ('有新版本 v' + latest + '，点击更新') + (m.current ? '（当前 v' + m.current + '）' : '')
+      : '检查更新（从 GitHub 下载并安装最新版）' + (m.current ? ' · 当前 v' + m.current : '');
+    h.title = t; h.setAttribute('aria-label', t);
+    const s = $('checkUpdate');
+    if (s && !m.busy) s.textContent = m.hasUpdate ? ('更新到 v' + latest) : '检查更新';
+  }
 
   // ---------- 用量页 ----------
   // 紧凑 token 数：对齐 cc-switch formatTokensShort 的中文量纲（万 / 亿）
@@ -6529,23 +6587,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     $('hOut').textContent = tokShort(s.outputTokens); $('hOut').title = fmt(s.outputTokens) + ' tokens（含思考）';
     $('hOutSub').textContent = s.avgFirstTokenMs != null ? ('首 token ' + ms(s.avgFirstTokenMs)) : '';
 
-    // 趋势
-    const tw = $('trend'); tw.innerHTML = '';
-    const trend = m.trend || [];
-    show($('trendCard'), m.range !== 'today');
-    if (trend.length) {
-      const max = Math.max(1, ...trend.map((d) => d.tokens));
-      const today = new Date(); today.setHours(0,0,0,0);
-      for (const d of trend) {
-        const bar = document.createElement('div'); bar.className = 'bar2' + (d.day === today.getTime() ? ' today' : '');
-        bar.style.height = Math.max(2, Math.round(d.tokens / max * 40)) + 'px';
-        const dd = new Date(d.day); bar.title = (dd.getMonth()+1) + '/' + dd.getDate() + ' · ' + fmt(d.tokens) + ' tokens · ' + fmt(d.requests) + ' 次';
-        tw.appendChild(bar);
-      }
-      $('trendSub').textContent = trend.length + ' 天';
-    } else {
-      tw.innerHTML = '<div class="empty2">暂无数据</div>'; $('trendSub').textContent = '';
-    }
+    // 趋势已由上面第 3 步 renderTrendCurve 画进 #trendCard / #uCurveSvg（4.13.40 起曲线卡，「今天」也有 10 分钟槽序列）。
+    // 旧柱状图的 #trend / #trendSub 早已不在模板里，这里不能再碰它们。
 
     // 按渠道（级联到模型）
     const pw = $('uProviders'); pw.innerHTML = '';
@@ -6610,7 +6653,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   function renderPrompts() {
     const wrap = $('prompts'); wrap.innerHTML = '';
     const active = prompts.find((p) => p.enabled);
-    const tabPromptEl = $('tabPromptCnt'); if (tabPromptEl) tabPromptEl.textContent = active ? '1' : '';
     fitTabs();
     const sum = $('promptSummary');
     sum.innerHTML = '共 <b>' + prompts.length + '</b> 个提示词 · ' + (active ? '已启用: <b>' + esc(active.name) + '</b>' : '未启用任何提示词');
@@ -6695,8 +6737,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
   $('showAddPrompt').addEventListener('click', () => openPromptModal(null));
 
+  // 每条宿主消息各自 try/catch：某一条的渲染异常只记一条带消息类型的 console.error（不吞、不静默），
+  // 不影响其它消息与后续刷新。4.13.40–4.13.52 的 renderUsage TypeError 就是以未捕获异常的形式把
+  // 「按渠道明细 / 最近请求」两卡整段跳过的。
   window.addEventListener('message', (ev) => {
     const m = ev.data;
+    try {
+      handleHostMessage(m);
+    } catch (err) {
+      console.error('[API4Kiro] webview 处理宿主消息失败 type=' + (m && m.type), err);
+    }
+  });
+  function handleHostMessage(m) {
     if (m.type === 'state') {
       $('enable').checked = !!m.enabled;
       proxyEnabled = !!m.enabled;
@@ -6705,7 +6757,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         elbl.textContent = m.enabled ? '已开启' : '开启代理';
         elbl.classList.toggle('on', !!m.enabled);
       }
-      const active = (m.providers || []).filter((p) => p.enabled && p.usable).length;
 
       lastProviders = m.providers || [];
       selectedModel = m.selectedModel || '';
@@ -6720,7 +6771,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         const fresh = lastProviders.find((x) => x.id === editModal.p.id);
         if (fresh) { editModal.p = fresh; editModal.pool.render(fresh); }
       }
-      const tabProvEl = $('tabProvCnt'); if (tabProvEl) tabProvEl.textContent = active ? String(active) : '';
       fitTabs();
 
       $('ports').textContent = 'KRS ' + m.krsPort + ' / CPS ' + m.cpsPort;
@@ -6759,8 +6809,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
     } else if (m.type === 'toast') {
       toast(m.level, m.message);
+    } else if (m.type === 'updateState') {
+      applyUpdateState(m);
     }
-  });
+  }
 
   vscode.postMessage({ type: 'ready' });
 </script>

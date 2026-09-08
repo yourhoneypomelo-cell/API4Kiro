@@ -6,6 +6,7 @@ import { getModelListStyle, isEnabled } from "./config";
 import { getActiveProviders, getProvider, kiroModelIds, providerIconId } from "./providers";
 import { debug, error, info } from "./log";
 import { serveIdentity } from "./proxyIdentity";
+import { applyGuard } from "./requestGuard";
 import {
   fetchRelayModels,
   groupModelsByEffort,
@@ -343,10 +344,17 @@ export class CpsProxyServer {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    // 来源守卫（4.13.53 起，requestGuard.ts）：只放行本机非浏览器客户端，其余 403。放在身份端点与模型列表分派之前——
+    // 一个 <img src> 式裸 GET 此前就能触发对全部启用 provider 的带 Key 拉取（路径含 availablemodels 即分派）。
+    if (!applyGuard(req, res, "CPS")) {
+      return;
+    }
+
     const url = req.url || "/";
     const path = url.split("?")[0];
 
-    if (serveIdentity(url, res, "cps")) {
+    // 头里有让位签名（4.13.53 起），身份握手要看它。
+    if (serveIdentity(url, res, "cps", req.headers)) {
       return;
     }
 

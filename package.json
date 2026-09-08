@@ -2,7 +2,7 @@
   "name": "api2kiro-dual",
   "displayName": "API4Kiro",
   "description": "把多家 API 聚合接入 Kiro：厂商账号登录（Kimi / Codex / xAI / Antigravity / Anthropic / Kiro 官方多账号）、第三方 Key、自定义端点（Anthropic Messages / Chat Completions / Responses / Gemini 四种格式）；按模型自动路由、模型测活、用量统计、提示词注入。",
-  "version": "4.13.52",
+  "version": "4.13.54",
   "publisher": "api2kiro-dual",
   "license": "MIT",
   "icon": "assets/icon.png",
@@ -28,6 +28,12 @@
     "*"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "本扩展读取 API Key 与账号凭据并改写 Kiro 端点设置，只在受信任的工作区运行。"
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -91,11 +97,13 @@
         "api2kiroDual.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "启用代理。默认关闭：本扩展与原版 API2Kiro 共用 codewhisperer.config.*Endpoints，同一时间只能有一个生效。启用本扩展前请先关闭原版（原版设置里把 api2kiro.enabled 设为 false）。"
+          "scope": "machine",
+          "description": "启用代理。默认关闭：本扩展与原版 API2Kiro 共用 codewhisperer.config.*Endpoints，同一时间只能有一个生效。启用本扩展前请先在扩展视图里禁用或卸载原版（仅把 api2kiro.enabled 设为 false 不够，原版关闭状态下激活仍会清掉本扩展的端点）。禁用或卸载本扩展前请先关闭此开关，否则 Kiro 会保留指向已停止本地服务的端点。"
         },
         "api2kiroDual.providers": {
           "type": "array",
           "default": [],
+          "scope": "machine",
           "description": "Provider 注册表：多个上游接入点（第三方中转 / 官方 Key / 任意 Anthropic|OpenAI 兼容端点）。所有启用且配置完整的 provider，其模型合并进 Kiro 模型选择器，按模型 ID 自动路由。一般在侧边栏面板里增删改，无需手动编辑。为空时会自动从旧版双通道配置（baseUrl/openaiBaseUrl 等）迁移读取。",
           "items": {
             "type": "object",
@@ -158,6 +166,10 @@
               "exactBase": {
                 "type": "boolean",
                 "description": "baseUrl 是精确前缀（直接拼 /chat/completions、/messages），不再自动补 /v1。models.dev 预设自动为 true"
+              },
+              "allowCustomHost": {
+                "type": "boolean",
+                "description": "仅 auth=oauth：登录类 provider 默认只向厂商规格地址（登录时写入的 baseUrl 所在主机，如 api.anthropic.com / chatgpt.com）发送账号 token；baseUrl 被改到其它主机时不发 token、该 provider 不可用并在面板提示。确需经自建中转转发时把本项设为 true 放行（只在用户设置里生效，工作区设置不能覆盖）。缺省 false。key 类 provider 不受本项影响。"
               },
               "icon": {
                 "type": "string",
@@ -257,21 +269,25 @@
         "api2kiroDual.baseUrl": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "【Anthropic 通道 · 深度兼容】中转站地址。例如 https://your-relay.com/v1 或 https://your-relay.com（会自动补 /v1）。"
         },
         "api2kiroDual.apiKey": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "【Anthropic 通道 · 深度兼容】中转站 API Key（形如 sk-xxxx）。"
         },
         "api2kiroDual.officialBaseUrl": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "【Anthropic 通道 · 官方直通】地址，例如 https://api.anthropic.com。必填：留空则不发出任何请求。仅 mode=anthropic 时生效。"
         },
         "api2kiroDual.officialApiKey": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "【Anthropic 通道 · 官方直通】API Key。仅 mode=anthropic 时生效。"
         },
         "api2kiroDual.officialModelMapping": {
@@ -292,11 +308,13 @@
         "api2kiroDual.openaiBaseUrl": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "【OpenAI 通道】地址。例如 https://api.openai.com/v1、https://your-relay.com/v1，或 https://your-relay.com（会自动补 /v1）。留空则不发出任何请求。"
         },
         "api2kiroDual.openaiApiKey": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "【OpenAI 通道】API Key。以 Authorization: Bearer 发送。"
         },
         "api2kiroDual.openaiModelMapping": {
@@ -462,12 +480,13 @@
         "api2kiroDual.usagePath": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "留空（推荐）：使用 kiro2cc-proxy 面板接口 /api/user/usage 拉取真实用量。若中转站是 OpenAI/New-API 风格，可填其额度接口路径（如 /v1/dashboard/billing/subscription）走计费查询。"
         },
         "api2kiroDual.debug": {
           "type": "boolean",
           "default": false,
-          "description": "把请求/响应写入调试日志文件（Key 会脱敏）。"
+          "description": "排障用，默认关。开启后会把每次上游请求的完整请求正文（系统提示、整段对话与编辑器上下文、工具 schema）和上游响应流片段写进「API4Kiro」输出通道；已知形态的 API Key / token / Bearer 会自动打码，但正文内容不会。日志由 Kiro 落在其日志目录的输出通道文件里（logs/<会话>/window*/exthost/output_logging_*/*-API4Kiro.log，随会话轮转）。仅排障时开启，用完请关闭。"
         },
         "api2kiroDual.showTokenUsage": {
           "type": "boolean",

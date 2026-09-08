@@ -48,7 +48,9 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 # 3. Kiro 内 Ctrl/Cmd+Shift+P → Developer: Reload Window
 ```
 
-> 装过原版 API2Kiro 的用户：两者共用 Kiro 的 `codewhisperer.config.*Endpoints`，同一时间只能有一个生效。先在原版设置里把 `api2kiro.enabled` 设为 `false`，再启用本扩展。端口已错开（本扩展 19810 / 19811，原版 19800 / 19801），两者可以同时安装。
+> 装过原版 API2Kiro 的用户：两者共用 Kiro 的 `codewhisperer.config.*Endpoints`，同一时间只能有一个生效。请在扩展视图里**禁用或卸载**原版，再启用本扩展——仅把原版的 `api2kiro.enabled` 设为 `false` 不够：原版在关闭状态下每次激活仍会清掉本扩展写入的端点（对称问题：本扩展 4.13.53 起只清自己写的端点，不再碰原版或手写的）。端口已错开（本扩展 19810 / 19811，原版 19800 / 19801）。
+>
+> 禁用或卸载本扩展前，请先在「设置」页关闭「启用代理」，否则 Kiro 会保留指向已停止本地服务的端点；若已经停用，重新启用本扩展后关闭代理，或手动删除 `settings.json` 里 `codewhisperer.config.endpoints` / `krsEndpoints` / `cpsEndpoints` 三键即可。
 
 三步接入：
 
@@ -71,6 +73,8 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 
 每个渠道可单独设置：协议与子模式（`anthropic` 的 kiro 深度兼容 / official 直通；`openai` 的 chat / responses）、精确前缀 `exactBase`、模型 ID 映射 `modelMapping`、能力覆盖 `modelOverrides`（图片 / 推理）、白名单 `enabledModels`、兜底模型、Logo。面板里还能对草稿渠道**测延迟 / 拉取模型 / 测活**（并发 3，可达但报错的用黄色标出）。
 
+> **凭据去向受控**：代理开关与含 Key / 端点的设置项（`enabled`、`providers`、`apiKey`、`baseUrl`、`officialBaseUrl`、`officialApiKey`、`openaiBaseUrl`、`openaiApiKey`、`usagePath`）只在**用户设置**里生效，仓库里的 `.vscode/settings.json` 不能覆盖它们，也不参与 Settings Sync。OAuth 渠道的账号 token 默认只发往厂商规格地址（登录时写入的 `baseUrl` 所在主机，如 `api.anthropic.com`、`chatgpt.com`、`runtime.<region>.kiro.dev`）；`baseUrl` 被改到别的主机时不发 token、该渠道显示为不可用并说明原因。确需经自建中转转发，在用户设置里给该渠道加 `"allowCustomHost": true`。本扩展不支持受限模式（未信任）工作区——信任工作区后才会激活。
+
 ## 侧边栏面板
 
 | 页面 | 说明 |
@@ -79,6 +83,8 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 | **模型** | 各渠道模型勾选进 Kiro、能力覆盖（图片 / 推理）、拖拽排序；改动经「通道 A」静默刷新 Kiro 选择器 |
 | **用量** | 趋势图（Token / 请求两个维度；「今天」按 10 分钟粒度显示消耗尖峰，7 / 30 天按天）、Sankey 流向图（Token 物理守恒，门高与流宽严格按数值）、按渠道 / 模型汇总、缓存命中率 |
 | **设置** | 启用代理、路由 / 思考 / 重试 / 显示选项、提示词库（单条启用，作为 system 注入）、「关于」卡（版本、GitHub 项目主页、检查更新） |
+
+面板标题「API4Kiro」左侧有两枚常驻图标：GitHub 标直达本项目主页；云朵下载标即「检查更新」——比对本仓库最新 Release，有新版就把 Release 里的 `api2kiro-dual-<版本>.vsix` 下载到扩展存储目录、校验（zip 结构、大小、包内 `package.json` 的 name / version）后调用 Kiro 的「从 VSIX 安装」命令装好，再提示重新加载窗口；已是最新会直接告知，下载 / 校验 / 安装任一失败都会给出原因并附「打开 Release 页」按钮（安装包已下载时保留在本地供手动安装）。启动时的静默检查（24 小时一次）发现新版会在该图标右上角亮一个小圆点，通知里也带「立即更新」。下载只走 `github.com` 与 GitHub 资产域，不带任何凭据。
 
 ## 多渠道路由与 Key 池
 
@@ -114,7 +120,9 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 - **纯文本模型剥图**（`textOnlyModels`）：Kiro 的附件按钮不按模型能力禁用，发往不支持图片的模型时自动剥离图片（包括历史消息里的，否则一张图会让整个对话永久 400）；某模型因图片被上游拒绝时会被自动记住。
 - **意图分类本地拦截**（`interceptIntentClassifier`）：Kiro 每轮的 simple-task 分类请求在本地应答，省一次上游调用。
 - **多窗口**：多个 Kiro 窗口共用同一对端口，先启动的窗口作主实例服务所有窗口；扩展升级后旧实例会被识别并让位。
-- **调试日志**（`debug`）：请求 / 响应写入日志文件，Key 自动脱敏；命令面板 **API4Kiro: 打开调试日志** 直达。
+- **本地服务只接受本机非浏览器客户端的请求**（校验 Host 与浏览器来源头 `Origin` / `Sec-Fetch-Site`，不符一律 403 且不带 CORS 头），网页无法借用你的凭据调用；Kiro 自身的请求不受影响。
+- **端点只清自己写的**：关闭代理或关闭状态下激活时，只复原本扩展写入的 `codewhisperer.config.*Endpoints`（按写入记录或「指向本扩展端口」判断），原版 API2Kiro 或手写的端点原样保留；窗口关闭 / 停用扩展时不复原端点（其它窗口仍在用），所以**禁用或卸载前请先关闭代理**。
+- **调试日志**（`debug`，默认关）：开启后把每次上游请求的**完整请求正文**（系统提示、整段对话与编辑器代码上下文、工具 schema）和上游响应流片段写进「API4Kiro」输出通道，由 Kiro 落在其日志目录（`logs/<会话>/window*/exthost/output_logging_*/*-API4Kiro.log`，随会话轮转）。已知形态的 API Key / token / Bearer 会自动打码，**正文里的其它内容不会**；单行超过 64 KiB 截断；开启时输出通道会先打一条提醒。仅排障时开启、用完关闭；命令面板 **API4Kiro: 打开调试日志** 直达。
 
 ## Kiro 前端补丁（重要）
 
@@ -163,9 +171,11 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 | `api2kiroDual.showTokenUsage` | `true` | 每轮页脚标注 token |
 | `api2kiroDual.textOnlyModels` | `[]` | 不支持图片的模型（自动学习） |
 | `api2kiroDual.interceptIntentClassifier` | `true` | 本地拦截意图分类请求 |
-| `api2kiroDual.debug` | `false` | 写调试日志（Key 脱敏） |
+| `api2kiroDual.debug` | `false` | 写调试日志：含完整请求正文（对话、代码上下文、工具 schema）与响应流，只有已知形态的 Key / token 打码；排障后关闭 |
 
 `codewhisperer.config.*Endpoints` 三项由扩展自动管理（把 Kiro 的请求重定向到本地代理），请勿手动编辑。
+
+含凭据与端点的设置项声明为 `scope: machine`：只在用户设置里生效，工作区设置不覆盖、不随 Settings Sync 同步；OAuth 渠道默认只向厂商地址发送凭据，自定义中转需在渠道条目里显式写 `"allowCustomHost": true`。
 
 ## 项目结构
 
@@ -179,7 +189,7 @@ mindmap
       endpoints.ts 端点重定向与复原
       portBinder.ts 端口所有权
       proxyIdentity.ts 实例身份握手
-      updateChecker.ts Release 更新检查
+      updateChecker.ts Release 更新检查与自更新
       config.ts 设置读取与旧配置迁移
     本地代理
       krsServer.ts 运行时反代 19810
@@ -254,7 +264,8 @@ API4Kiro/
 │   ├── endpoints.ts            Kiro codewhisperer.config.*Endpoints 的备份 / 重定向 / 复原
 │   ├── portBinder.ts           多窗口固定端口所有权：让位 / 接管
 │   ├── proxyIdentity.ts        本地代理身份握手（识别同类实例与升级后的旧实例）
-│   ├── updateChecker.ts        GitHub Release 更新检查（启动静默 24h 节流 / 手动）
+│   ├── requestGuard.ts         本地服务请求来源守卫：只放行本机非浏览器客户端（Host 回环、无 Origin / Sec-Fetch-Site）
+│   ├── updateChecker.ts        GitHub Release 更新检查与自更新（启动静默 24h 节流；手动：下载 vsix → 校验 → installExtension → 提示重载）
 │   │
 │   ├── krsServer.ts            运行时反代：Kiro 请求 → 路由 → 译码 → 上游 → 流式回写 CW 事件；重试、剥图
 │   ├── cpsServer.ts            控制面：模型列表广播（含能力 / 窗口 description）、测活、用量查询
@@ -300,7 +311,7 @@ API4Kiro/
 │   ├── selectorStyle.ts        Kiro 模型选择器样式、Context Usage 弹层、模型刷新钩子的补丁与复原
 │   ├── promptStore.ts          提示词库（单条启用，注入 system）
 │   ├── openBrowser.ts          系统浏览器打开链接（绕开 Kiro 的二次确认）
-│   └── log.ts                  输出通道与调试日志文件（Key 脱敏）
+│   └── log.ts                  输出通道与调试日志（已知形态 Key / token 脱敏、单行 64 KiB 截断、debug 开启提醒）
 │
 ├── assets/
 │   ├── icon.png / icon.svg     扩展图标 / 活动栏单色图标
@@ -383,6 +394,8 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 本项目与 Kiro / Amazon、Anthropic、OpenAI、Google、xAI、Moonshot 等任何厂商均无关联、亦未获其背书；文中出现的商标与产品名归各自所有者。
 
 本扩展会修改 Kiro 安装目录内 kiro-agent 的三个前端文件（见[「Kiro 前端补丁」](#kiro-前端补丁重要)），补丁可逆但属于对第三方软件的运行时修改；Kiro 升级后的兼容性无法事先保证。使用前请确认你理解并接受这一点。
+
+开启 `api2kiroDual.debug` 后，本机日志会包含你与模型的完整对话、编辑器里的代码上下文与工具 schema，只有已知形态的 API Key / token 会自动打码；日志文件由 Kiro 保存在本机日志目录、随会话轮转，其权限与保留期由操作系统和 Kiro 决定。请只在排障时开启、用完关闭，对外分享日志前自行检查内容。
 
 通过本扩展接入的各家 API、账号与中转服务，其服务条款、配额与计费由你与对应服务方之间的协议约束。作者及仓库维护者不对因使用、修改、分发或依赖本项目而产生的任何直接或间接损失、账号封禁、额度消耗、数据丢失、法律风险或第三方索赔负责。
 

@@ -19,7 +19,7 @@
 
 import { CwEvent } from "./cwTypes";
 import { encodeGeminiSignature } from "./geminiTranslate";
-import { CapturedUsage, StreamConverter, contextUsagePercentFloat, emptyUsage, splitCachedInput, stopReasonEvent, toCwStopReason } from "./streamShared";
+import { CapturedUsage, StreamConverter, StreamError, contextUsagePercentFloat, emptyUsage, splitCachedInput, stopReasonEvent, streamErrorNotice, toCwStopReason } from "./streamShared";
 
 interface GPart {
   text?: string;
@@ -58,7 +58,12 @@ export class GeminiStreamConverter implements StreamConverter {
   private callSignature = "";
   private anySignature = "";
   private finishReason = "";
-  private errorText = "";
+  /** 流内 `{"error":…}` 帧；flush 时给用户一条 ❌ 文案，泵据此记失败 / 冷却凭证。 */
+  public streamError: StreamError | undefined;
+  /** promptFeedback.blockReason 的提示（内容策略拦截，不是凭证的错，只提示不记失败）。 */
+  private blockedText = "";
+  /** ❌ 文案只发一次（flush 幂等）。 */
+  private sentErrorNotice = false;
   private pendingContextPct: number | null = null;
 
   public usage: CapturedUsage = emptyUsage();
@@ -106,12 +111,16 @@ export class GeminiStreamConverter implements StreamConverter {
     const chunk = raw.response && typeof raw.response === "object" ? raw.response : raw;
     if (chunk.error) {
       const e = chunk.error;
-      this.errorText = [e.code ? String(e.code) : "", e.status || "", e.message || ""].filter(Boolean).join(" ") || "upstream error";
+      this.streamError = {
+        message: [e.code ? String(e.code) : "", e.status || "", e.message || ""].filter(Boolean).join(" ") || "upstream error",
+        type: e.status || undefined,
+        status: typeof e.code === "number" ? e.code : undefined,
+      };
       return out;
     }
     this.meta(out);
     if (chunk.promptFeedback?.blockReason) {
-      this.errorText = `prompt blocked: ${chunk.promptFeedback.blockReason}${chunk.promptFeedback.blockReasonMessage ? " - " + chunk.promptFeedback.blockReasonMessage : ""}`;
+      this.blockedText = `prompt blocked: ${chunk.promptFeedback.blockReason}${chunk.promptFeedback.blockReasonMessage ? " - " + chunk.promptFeedback.blockReasonMessage : ""}`;
     }
     const cand = chunk.candidates?.[0];
     for (const part of cand?.content?.parts || []) {
@@ -189,9 +198,12 @@ export class GeminiStreamConverter implements StreamConverter {
       out.push({ reasoningContentEvent: { signature: encodeGeminiSignature(sig) } });
     }
 
-    if (this.errorText) {
-      out.push({ assistantResponseEvent: { content: `\n\n❌ 上游在流中返回错误：${this.errorText.slice(0, 800)}`, modelId: this.modelId } });
-      this.errorText = "";
+    if (this.streamError && !this.sentErrorNotice) {
+      this.sentErrorNotice = true;
+      out.push(streamErrorNotice(this.streamError, this.modelId));
+    } else if (this.blockedText) {
+      out.push({ assistantResponseEvent: { content: `\n\n❌ 上游在流中返回错误：${this.blockedText.slice(0, 800)}`, modelId: this.modelId } });
+      this.blockedText = "";
     } else if (this.finishReason === "MAX_TOKENS") {
       out.push({ assistantResponseEvent: { content: "\n\n⚠️ 输出达到 maxOutputTokens 上限被截断。", modelId: this.modelId } });
     } else if (this.finishReason && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(this.finishReason) && !this.sawToolUse) {

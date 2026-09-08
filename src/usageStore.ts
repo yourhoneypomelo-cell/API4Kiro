@@ -107,6 +107,12 @@ const MAX_RECORDS = 2000;
 const RETAIN_DAYS = 30;
 /** 小时桶保留 400 天，再久的按年份没人看，且防止无界。 */
 const BUCKET_RETAIN_MS = 400 * DAY;
+/**
+ * 多天趋势轴最多生成的天数（桶保留期的两倍）。「全部」范围的 from 取自账本最早的桶，所以一致的账本最多 ~401 天、
+ * 永远碰不到这条线；能碰到的只有显式越界的 Range（如 from=0）或没被 prune 的过期桶——这时只保留最近这么多天，
+ * 而不是从 1970 年起逐日补零（曾在扩展宿主同步生成 2 万个空点、卡住数秒）。
+ */
+const MAX_TREND_DAYS = 800;
 /** 写入防抖：工具循环里连发几十次，攒 800ms 一次落盘。 */
 const FLUSH_DEBOUNCE_MS = 800;
 
@@ -355,6 +361,27 @@ function startOfLocalDay(ts: number): number {
   return d.getTime();
 }
 
+/** 账本里最早的一笔（桶起点或明细 ts 的最小值）；空账本为 undefined。 */
+function earliestLedgerTs(): number | undefined {
+  let min: number | undefined;
+  for (const b of buckets.values()) {
+    if (min === undefined || b.hour < min) {
+      min = b.hour;
+    }
+  }
+  for (const r of records) {
+    if (min === undefined || r.ts < min) {
+      min = r.ts;
+    }
+  }
+  return min;
+}
+
+/**
+ * 预设 → 绝对范围。「全部」不再是 from=0：它从账本最早那笔所在的本地日 0 点起（空账本则从今天 0 点起），
+ * 且不晚于今天 0 点。from=0 曾让多天趋势轴从 1970 年起逐日补零、在宿主同步跑数秒；范围起点由数据决定后，
+ * 桶 / 明细一个不漏（桶起点 ≥ 当天 0 点、明细 ts ≥ 桶起点），趋势轴长度只与真实数据跨度有关。
+ */
 export function resolveRange(preset: RangePreset, now = Date.now()): Range {
   switch (preset) {
     case "today":
@@ -363,8 +390,11 @@ export function resolveRange(preset: RangePreset, now = Date.now()): Range {
       return { from: startOfLocalDay(now - 6 * DAY), to: now };
     case "30d":
       return { from: startOfLocalDay(now - 29 * DAY), to: now };
-    default:
-      return { from: 0, to: now };
+    default: {
+      const today = startOfLocalDay(now);
+      const earliest = earliestLedgerTs();
+      return { from: earliest === undefined ? today : Math.min(startOfLocalDay(earliest), today), to: now };
+    }
   }
 }
 
@@ -551,6 +581,8 @@ export interface TimeSeriesPoint {
  * 几乎不会被裁。不生成尚未到来的槽——否则曲线会贴零线拖到当天末尾。
  * 当 range 为 7d/14d/30d 时，按每天（0点~今天，共7/14/30个自然日）连续补全，同样不越过 range.to；
  * 彻底解决当天或数据稀疏时只有单个孤立点、没有连线与渐变面积的问题。
+ * 当 range 为 all 时，轴从首个有数据的日子起到今天（`resolveRange("all")` 的 from 已是账本最早一笔所在日），
+ * 不生成前导空桶，且总天数不超过 MAX_TREND_DAYS。
  */
 const TREND_SLOT_MS = 10 * 60_000;
 
@@ -584,11 +616,41 @@ export function getTimeSeriesTrend(rangePreset: RangePreset, range: Range): Time
     return points;
   }
 
-  const buckets = bucketsIn(range);
+  // 多天连续自然日时间轴。每个桶的本地日只算一次（此前是 天数 × 桶数 次 Date 构造：「全部」from=0 时 2 万天 × 两千桶 ≈ 6 秒）。
+  const byDay = new Map<number, HourBucket[]>();
+  let firstDataDay: number | undefined;
+  for (const b of bucketsIn(range)) {
+    const day = startOfLocalDay(b.hour);
+    const list = byDay.get(day);
+    if (list) {
+      list.push(b);
+    } else {
+      byDay.set(day, [b]);
+    }
+    if (firstDataDay === undefined || day < firstDataDay) {
+      firstDataDay = day;
+    }
+  }
 
-  // 多天连续自然日时间轴
-  const numDays = rangePreset === "7d" ? 7 : rangePreset === "30d" ? 30 : Math.max(1, Math.ceil((range.to - range.from) / DAY));
-  const startDay = startOfLocalDay(range.from);
+  let startDay = startOfLocalDay(range.from);
+  let numDays: number;
+  if (rangePreset === "7d" || rangePreset === "30d") {
+    numDays = rangePreset === "7d" ? 7 : 30;
+  } else {
+    // 「全部」：轴从范围起点与首个有数据的日子中较晚者开始（不生成前导空桶），至多 MAX_TREND_DAYS 天、只保留最近的
+    const endDay = startOfLocalDay(range.to);
+    if (firstDataDay !== undefined && firstDataDay > startDay) {
+      startDay = firstDataDay;
+    }
+    if (startDay > endDay) {
+      startDay = endDay;
+    }
+    numDays = Math.max(1, Math.round((endDay - startDay) / DAY) + 1);
+    if (numDays > MAX_TREND_DAYS) {
+      startDay = endDay - (MAX_TREND_DAYS - 1) * DAY;
+      numDays = MAX_TREND_DAYS;
+    }
+  }
 
   for (let d = 0; d < numDays; d++) {
     const curDayTs = startDay + d * DAY;
@@ -600,14 +662,12 @@ export function getTimeSeriesTrend(rangePreset: RangePreset, range: Range): Time
     const modelTokens: Record<string, number> = {};
     const modelRequests: Record<string, number> = {};
 
-    for (const b of buckets) {
-      if (startOfLocalDay(b.hour) === curDayTs) {
-        const t = b.inputTokens + b.outputTokens + b.cacheReadTokens + b.cacheWriteTokens;
-        tokens += t;
-        requests += b.requests;
-        modelTokens[b.model] = (modelTokens[b.model] || 0) + t;
-        modelRequests[b.model] = (modelRequests[b.model] || 0) + b.requests;
-      }
+    for (const b of byDay.get(curDayTs) || []) {
+      const t = b.inputTokens + b.outputTokens + b.cacheReadTokens + b.cacheWriteTokens;
+      tokens += t;
+      requests += b.requests;
+      modelTokens[b.model] = (modelTokens[b.model] || 0) + t;
+      modelRequests[b.model] = (modelRequests[b.model] || 0) + b.requests;
     }
     points.push({ ts: curDayTs, label, tokens, requests, modelTokens, modelRequests });
   }
@@ -649,6 +709,8 @@ export interface UsageAnalyticsStats {
 export interface SankeyData {
   nodes: Array<{ id: string; name: string; layer: number; color?: string }>;
   links: Array<{ source: string; target: string; tokens: number; requests: number }>;
+  /** 范围内的明细已被裁掉一部分，图改由小时桶聚合（少凭证层）；UI 可据此提示，本字段只增不改既有结构。 */
+  detailTruncated: boolean;
 }
 
 export interface ModelUsageRatio {
@@ -835,6 +897,23 @@ export interface ContextBreakdownStats {
   toolsPct: number;
   rulesPct: number;
   currentPct: number;
+  /** 范围内的明细已被 2000 条 / 30 天上限裁掉一部分，本结果改由小时桶聚合而来（UI 可据此提示）。 */
+  detailTruncated: boolean;
+}
+
+/**
+ * 范围内的明细是否完整：桶里的请求数是记账时同步累加的，只有明细会被裁（条数 / 天数上限），
+ * 所以「桶请求数 > 范围内明细条数」就是明细缺了。桑基与上下文卡以前「有明细就只用明细」，
+ * 明细被裁后 30d / 全部 范围静默少报（探针：3000 条 / 45 天账本 30d 少 16.9%、全部少 33.2%），
+ * 与走桶的总览卡对不上；现在明细不完整时整段改走桶（与总览卡同源，四项之和逐字相等）。
+ * 不做「明细段 + 桶段」拼接：桶没有凭证维度，拼接会让凭证层与渠道层的流量不守恒。
+ */
+function detailTruncatedIn(range: Range, detailCount: number): boolean {
+  let bucketRequests = 0;
+  for (const b of bucketsIn(range)) {
+    bucketRequests += b.requests;
+  }
+  return bucketRequests > detailCount;
 }
 
 export function getContextBreakdownStats(range: Range): ContextBreakdownStats {
@@ -845,7 +924,8 @@ export function getContextBreakdownStats(range: Range): ContextBreakdownStats {
   let currentInputTokens = 0;
 
   const filtered = records.filter((r) => r.ts >= range.from && r.ts <= range.to);
-  if (filtered.length > 0) {
+  const detailTruncated = detailTruncatedIn(range, filtered.length);
+  if (filtered.length > 0 && !detailTruncated) {
     for (const r of filtered) {
       if (r.contextBreakdown) {
         filesTokens += r.contextBreakdown.filesTokens || 0;
@@ -888,11 +968,13 @@ export function getContextBreakdownStats(range: Range): ContextBreakdownStats {
     toolsPct: total > 0 ? (toolsTokens / total) * 100 : 0,
     rulesPct: total > 0 ? (rulesTokens / total) * 100 : 0,
     currentPct: total > 0 ? (currentInputTokens / total) * 100 : 0,
+    detailTruncated,
   };
 }
 
 export function getSankeyData(range: Range): SankeyData {
   const filteredRecords = records.filter((r) => r.ts >= range.from && r.ts <= range.to);
+  const detailTruncated = detailTruncatedIn(range, filteredRecords.length);
 
   const nodeMap = new Map<string, { id: string; name: string; layer: number; color?: string }>();
   const linkMap = new Map<string, { source: string; target: string; tokens: number; requests: number }>();
@@ -914,7 +996,7 @@ export function getSankeyData(range: Range): SankeyData {
     cur.requests += requests;
   };
 
-  if (filteredRecords.length > 0) {
+  if (filteredRecords.length > 0 && !detailTruncated) {
     for (const r of filteredRecords) {
       const pId = `p:${r.providerId}`;
       const pName = r.providerName || r.providerId;
@@ -965,7 +1047,8 @@ export function getSankeyData(range: Range): SankeyData {
       }
     }
   } else {
-    // 降级使用 buckets（明细已被裁掉时）：拓扑少凭证层——渠道 → 模型 → 状态 → Token 门
+    // 降级使用 buckets（范围内明细为空或被裁掉一部分时）：拓扑少凭证层——渠道 → 模型 → 状态 → Token 门；
+    // 与总览卡同一组桶，Token 门之和 === summarize(range).totalTokens
     for (const b of bucketsIn(range)) {
       const pId = `p:${b.providerId}`;
       const pName = b.providerName || b.providerId;
@@ -1028,6 +1111,7 @@ export function getSankeyData(range: Range): SankeyData {
   return {
     nodes: [...nodeMap.values()],
     links: [...linkMap.values()],
+    detailTruncated,
   };
 }
 

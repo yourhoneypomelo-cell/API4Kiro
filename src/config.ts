@@ -47,6 +47,44 @@ function readBool(key: string, def: boolean): boolean {
   return cfg().get<boolean>(key, def);
 }
 
+/** `inspect()` 的分层视图里本函数用到的几层（真实 API 还有 profile / remote / language 层，这里不需要）。 */
+interface LayeredValue {
+  defaultValue?: unknown;
+  globalValue?: unknown;
+  workspaceValue?: unknown;
+  workspaceFolderValue?: unknown;
+}
+
+/**
+ * 读「只在用户设置生效」的数组配置（含凭据 / 端点的 providers）：工作区 / 工作区文件夹层若有值一律忽略，
+ * 只取用户级（Global）值，没有则取默认值。
+ *
+ * package.json 已把这些项声明为 `scope: machine`，工作台解析工作区文件时本就跳过它们（Kiro 1.0.437
+ * `dq=[4,5,6,7]` 不含 MACHINE）；这里是纵深防御——旧版工作台或任何把工作区值送达扩展的路径都不会让
+ * 仓库里的 `.vscode/settings.json` 决定凭据发往哪里。`inspect` 不可用（桩 / 异常）时退回合并读取，
+ * 与改动前逐字相同。返回 `shadowed` 让调用方决定是否记一条日志（本模块不引入 log，避免 config ↔ log 环）。
+ */
+export function readUserLevelArray(key: string): { value: unknown[]; shadowed: boolean } {
+  const c = cfg();
+  const merged = c.get<unknown[]>(key, []);
+  const mergedArr = Array.isArray(merged) ? merged : [];
+  let insp: LayeredValue | undefined;
+  try {
+    insp = typeof c.inspect === "function" ? (c.inspect<unknown>(key) as LayeredValue | undefined) : undefined;
+  } catch {
+    insp = undefined;
+  }
+  if (!insp) {
+    return { value: mergedArr, shadowed: false };
+  }
+  const shadowed = insp.workspaceValue !== undefined || insp.workspaceFolderValue !== undefined;
+  if (!shadowed) {
+    return { value: mergedArr, shadowed: false };
+  }
+  const own = insp.globalValue !== undefined ? insp.globalValue : insp.defaultValue;
+  return { value: Array.isArray(own) ? own : [], shadowed: true };
+}
+
 /**
  * 写入配置:优先写 VS Code 全局设置(端点重定向等依赖它);写入抛错
  * (settings.json 不可写/损坏/受限模式)时退回插件本地存储(globalState)兜底,

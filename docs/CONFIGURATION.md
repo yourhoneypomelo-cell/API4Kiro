@@ -1,6 +1,6 @@
 # 配置项参考
 
-> 本文由 `node scripts/gen-config-doc.js` 从 `package.json` 生成（版本 4.13.52），请勿手改；改设置项后重新生成。
+> 本文由 `node scripts/gen-config-doc.js` 从 `package.json` 生成（版本 4.13.54），请勿手改；改设置项后重新生成。
 
 共 41 项：`api2kiroDual.*` 38 项 + 由扩展自动管理的 Kiro 内部端点 3 项。所有设置都在 VS Code / Kiro 的 settings.json 里生效；渠道相关的项一般在侧边栏面板里维护，无需手填。
 
@@ -8,7 +8,7 @@
 
 | 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `api2kiroDual.enabled` | `boolean` | `false` | 启用代理。默认关闭：本扩展与原版 API2Kiro 共用 codewhisperer.config.*Endpoints，同一时间只能有一个生效。启用本扩展前请先关闭原版（原版设置里把 api2kiro.enabled 设为 false）。 |
+| `api2kiroDual.enabled` | `boolean` | `false` | 启用代理。默认关闭：本扩展与原版 API2Kiro 共用 codewhisperer.config.*Endpoints，同一时间只能有一个生效。启用本扩展前请先在扩展视图里禁用或卸载原版（仅把 api2kiro.enabled 设为 false 不够，原版关闭状态下激活仍会清掉本扩展的端点）。禁用或卸载本扩展前请先关闭此开关，否则 Kiro 会保留指向已停止本地服务的端点。 |
 | `api2kiroDual.providers` | `array` | `[]` | Provider 注册表：多个上游接入点（第三方中转 / 官方 Key / 任意 Anthropic\|OpenAI 兼容端点）。所有启用且配置完整的 provider，其模型合并进 Kiro 模型选择器，按模型 ID 自动路由。一般在侧边栏面板里增删改，无需手动编辑。为空时会自动从旧版双通道配置（baseUrl/openaiBaseUrl 等）迁移读取。 |
 | `api2kiroDual.routing` | `string` | `merge` | 双协议路由策略。merge=两个通道同时生效，模型列表取并集，按 Kiro 选中的模型 ID 自动路由到拥有该模型的通道（ID 同时存在于两侧时优先 Anthropic 通道）；anthropicOnly=只用 Anthropic 通道（等同原版行为）；openaiOnly=所有请求走 OpenAI 通道。切换后需重载窗口。<br>取值：`merge` = 两通道并存，按模型自动路由（推荐）；`anthropicOnly` = 只用 Anthropic 通道；`openaiOnly` = 只用 OpenAI 通道 |
 | `api2kiroDual.mode` | `string` | `kiro` | Anthropic 通道的子模式。kiro=深度兼容（走 kiro2cc-proxy 类中转站，保留 Kiro 私有字段 / effort / thinking 与计费显示）；anthropic=官方 Anthropic 直通（翻成纯 Anthropic /v1/messages，不注入私有字段、不显示计费）。切换后需重载窗口。<br>取值：`kiro`；`anthropic` |
@@ -43,7 +43,7 @@
 | `api2kiroDual.autoRetry` | `boolean` | `true` | 上游流中断自动重试。仅在「尚未吐出任何回复内容」时透明重发；已开始输出正文/思考后中断则不重试（避免重复内容）。 |
 | `api2kiroDual.maxRetries` | `number` | `2` | 自动重试的最大重试次数（不含首次尝试，范围 0-5）。 |
 | `api2kiroDual.usagePath` | `string` | `""` | 留空（推荐）：使用 kiro2cc-proxy 面板接口 /api/user/usage 拉取真实用量。若中转站是 OpenAI/New-API 风格，可填其额度接口路径（如 /v1/dashboard/billing/subscription）走计费查询。 |
-| `api2kiroDual.debug` | `boolean` | `false` | 把请求/响应写入调试日志文件（Key 会脱敏）。 |
+| `api2kiroDual.debug` | `boolean` | `false` | 排障用，默认关。开启后会把每次上游请求的完整请求正文（系统提示、整段对话与编辑器上下文、工具 schema）和上游响应流片段写进「API4Kiro」输出通道；已知形态的 API Key / token / Bearer 会自动打码，但正文内容不会。日志由 Kiro 落在其日志目录的输出通道文件里（logs/<会话>/window*/exthost/output_logging_*/*-API4Kiro.log，随会话轮转）。仅排障时开启，用完请关闭。 |
 | `api2kiroDual.showTokenUsage` | `boolean` | `true` | 在每轮回答的页脚（Elapsed time 那一行）标注本轮消耗的 token（Est. Input Tokens Used / Est. Output Tokens Used）。两个协议通道都支持。 |
 | `api2kiroDual.textOnlyModels` | `array` | `[]` | 已知不支持图片输入的模型 ID。发往这些模型的请求会自动剥离图片（包括对话历史里的，否则一张图会让整个对话永久 400），并在回复前提示。此外扩展会自动学习：某模型因图片被上游拒绝时会被记住，无需手填。Kiro 的附件按钮不按模型能力禁用，所以只能在代理层兜底。 |
 
@@ -68,6 +68,7 @@
 | `oauthVendor` | `string` | auth=oauth 时的厂商：kimi / codex / xai / antigravity / anthropic<br>取值：`kimi`；`codex`；`xai`；`antigravity`；`anthropic` |
 | `baseUrl` | `string` | — |
 | `exactBase` | `boolean` | baseUrl 是精确前缀（直接拼 /chat/completions、/messages），不再自动补 /v1。models.dev 预设自动为 true |
+| `allowCustomHost` | `boolean` | 仅 auth=oauth：登录类 provider 默认只向厂商规格地址（登录时写入的 baseUrl 所在主机，如 api.anthropic.com / chatgpt.com）发送账号 token；baseUrl 被改到其它主机时不发 token、该 provider 不可用并在面板提示。确需经自建中转转发时把本项设为 true 放行（只在用户设置里生效，工作区设置不能覆盖）。缺省 false。key 类 provider 不受本项影响。 |
 | `icon` | `string` | 手选 Logo：glyph:<名称>（面板「Logo」图库里挑的科技风线稿）。留空 = 自动（厂商官方 Logo / 首字母） |
 | `apiKey` | `string` | 首条凭证的 Key（与 credentials[0].apiKey 镜像，两处保持一致） |
 | `credentials` | `array` | key 池：同一渠道的多把凭证，对 Kiro 表现为一个条目。不写 = 只有 apiKey 那一把。首条固定 id=c1。key 类填 apiKey；oauth 类 apiKey 留空，token 在钥匙串按 <providerId>/<id> 存。 |

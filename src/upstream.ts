@@ -16,13 +16,17 @@ function agentFor(url: URL): typeof http | typeof https {
  * Issue a request to the upstream relay and resolve as soon as response headers
  * arrive (the body stream is returned for incremental reading). Rejects on
  * network error or timeout.
+ *
+ * `signal`（可选）：中止时 Node 会销毁在途的 ClientRequest 并以 AbortError 拒绝——KRS 用它在
+ * 「上游响应头到达前」这一窗口内把客户端取消传给上游；响应头到达后由调用方自己 `body.destroy()`。
  */
 export function requestUpstream(
   method: string,
   urlStr: string,
   headers: Record<string, string>,
   body?: string | Buffer,
-  timeoutMs = 1_800_000
+  timeoutMs = 1_800_000,
+  signal?: AbortSignal
 ): Promise<UpstreamResponse> {
   return new Promise((resolve, reject) => {
     let url: URL;
@@ -48,6 +52,7 @@ export function requestUpstream(
         path: url.pathname + url.search,
         headers: finalHeaders,
         timeout: timeoutMs,
+        signal,
       },
       (res) => {
         resolve({

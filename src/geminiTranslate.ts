@@ -17,8 +17,8 @@
  *  - 系统提示词 → systemInstruction{role:"user", parts:[{text}]}
  *  - 工具声明 → tools:[{functionDeclarations:[{name,description,parameters}]}]，参数 schema 要按 Gemini 的
  *    OpenAPI 子集清洗（去 $schema/additionalProperties/$ref…，联合类型摊平，枚举转字符串）
- *  - 思考档位 → generationConfig.thinkingConfig：Gemini 3 系用 thinkingLevel，Gemini 2.5 / Claude 用 thinkingBudget；
- *    一律 includeThoughts:true，否则思考过程不回传，Kiro 里看不到
+ *  - 思考档位 → generationConfig.thinkingConfig：Gemini 3 系用 thinkingLevel，Gemini 2.5 / Claude 用 thinkingBudget
+ *    （2.5 按子型号限幅，见 geminiLimits）；一律 includeThoughts:true，否则思考过程不回传，Kiro 里看不到
  *
  * 思考签名（thoughtSignature）：Gemini 3 会在 functionCall 部件上带签名，下一轮回放时**必须**原样放回同一个
  * functionCall 上，否则 400。我们把流里拿到的签名以 "a2k-gm:" 前缀存进 Kiro 历史的 reasoning signature
@@ -30,6 +30,8 @@
 import * as crypto from "crypto";
 import { AnthropicJsonSchema, CwAssistantResponseMessage, CwRequest, CwToolResult } from "./cwTypes";
 import { getMaxTokens } from "./config";
+import { clampGeminiThinkingBudget } from "./geminiLimits";
+import { debug } from "./log";
 import { ProviderConfig } from "./providers";
 import { EffortLevel, hasEffortVariant } from "./modelStore";
 import { activePromptText } from "./promptStore";
@@ -471,12 +473,18 @@ export function geminiThinkingConfig(model: string, family: GeminiFamily, effort
   if (family === "gemini25") {
     const budgets: Record<string, number> = { none: 0, low: 1024, medium: 8192, high: 24576, xhigh: 32768, max: 32768 };
     const b = budgets[effort] ?? 8192;
-    if (b <= 0) {
+    // 子型号的合法范围不同（Pro 128–32768 且不能关；Flash 0–24576；Flash-Lite 0 或 512–24576），越界上游 400：
+    // 按型号限幅——超上限取上限、不可关的 none 取最小值；不认识的型号原值放行（见 geminiLimits）。
+    const { budget, clamped, limits } = clampGeminiThinkingBudget(model, b);
+    if (clamped) {
+      debug("gemini thinkingBudget clamped", { model, effort, from: b, to: budget, limits });
+    }
+    if (budget <= 0) {
       cfg.thinkingBudget = 0;
       cfg.includeThoughts = false;
       return cfg;
     }
-    cfg.thinkingBudget = b;
+    cfg.thinkingBudget = budget;
     return cfg;
   }
   // gemini3：档位。Flash 系有 minimal/low/medium/high；Pro 系官方 API 只认 low/high（medium 会 400），
