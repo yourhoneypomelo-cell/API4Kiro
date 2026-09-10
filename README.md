@@ -384,7 +384,7 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 
 需要 Node.js 18 或更高版本（CI 使用 Node 22）。
 
-- **Antigravity 登录的 client secret 不在仓库里**（Google 会自动吊销出现在公开仓库的 `GOCSPX-` 密钥）。构建时通过环境变量 `A2K_ANTIGRAVITY_CLIENT_SECRET` 或仓库根目录的 `antigravity.secret` 文件（已 gitignore）注入；缺省时构建照常成功，只是 Antigravity 登录不可用。Release 里的 vsix 已内置，可直接使用。
+- **Antigravity 登录的 client secret 不在仓库里，也不进公开 Release。** Google 会自动吊销出现在公开仓库的 `GOCSPX-` 密钥。默认 `npm run package`（含 CI）不读 `antigravity.secret`，得到的 vsix 里 `client_secret` 为空串，Antigravity 登录不可用，其余功能不受影响。本机自用包若要带密钥：设 `A2K_EMBED_ANTIGRAVITY_SECRET=1` 再 `npm run package`（或设环境变量 `A2K_ANTIGRAVITY_CLIENT_SECRET`）。**带密钥的包禁止 `gh release upload`、禁止推进公开仓。**
 - 回归测试套件（约 1,700 项，覆盖译码、路由、Key 池、握手、补丁可逆性等）在作者本地维护，因其中包含 Kiro 编译产物的只读副本，未随公开仓发布；CI 只做类型检查与打包。
 
 ## 致谢

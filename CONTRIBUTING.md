@@ -14,7 +14,7 @@
   kiro --install-extension api2kiro-dual-<version>.vsix --force
   ```
 
-- Antigravity 登录用到的 client secret 不在仓库中，构建时按 [README「从源码构建」](README.md#从源码构建) 注入；没有它也能构建与运行其余功能
+- Antigravity 登录用到的 client secret 不在仓库中，也不进公开 Release。默认 `npm run package` 不注入；本机自用按 [README「从源码构建」](README.md#从源码构建) 显式注入。带密钥的包禁止 `gh release upload`、禁止提交。没有它也能构建与运行其余功能
 
 ## 提 Issue
 
@@ -35,4 +35,4 @@
 ## 版本与发布
 
 - 版本号在 `package.json`，遵循语义化版本
-- 推送 `v<version>` 标签会触发 CI 打包并挂到对应 GitHub Release
+- 推送 `v<version>` 标签会触发 CI 打包并挂到对应 GitHub Release。CI 包与 Release 资产均不得含 Antigravity client secret；不要用本机带密钥的 vsix `gh release upload --clobber` 覆盖。

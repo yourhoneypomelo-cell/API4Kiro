@@ -131,6 +131,6 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 - 只在 Kiro 内运行（依赖内置 `kiro.kiroAgent`），纯 VS Code 不激活。
 - 补丁针对 Kiro 1.0.411 / 1.0.437 的文件结构验证；Kiro 大改前端结构时补丁会因靶点不匹配而整体跳过（此时只是回到原生外观，功能不受影响），需要跟进新结构。
 - 卸载扩展后三处 Kiro 文件保持补丁态（无可见影响）；如需彻底出厂，先关闭代理再卸载，或重装 Kiro。
-- Antigravity（Google）登录的 client secret 不在公开仓库，从源码构建者需自备或通过 `A2K_ANTIGRAVITY_CLIENT_SECRET` 注入。
+- Antigravity（Google）登录的 client secret 不在公开仓库，也不进公开 Release。默认 `npm run package` 不注入；本机自用须 `A2K_EMBED_ANTIGRAVITY_SECRET=1` 或 `A2K_ANTIGRAVITY_CLIENT_SECRET`，带密钥的包不得上传。
 - 更新检查依赖 GitHub API 可达；匿名请求有速率限制，失败静默。
 - 回归测试套件包含 Kiro 编译产物的只读副本，未随公开仓发布。

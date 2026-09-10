@@ -5,15 +5,21 @@ const path = require("path");
 
 const watch = process.argv.includes("--watch");
 
-// Antigravity（Google Cloud Code）登录的 client secret：不进公开源码（Google 会扫 GitHub 自动吊销 GOCSPX），
-// 构建时从环境变量或本地 gitignore 的 antigravity.secret 注入；缺失则为空（从源码构建者需自备）。
+// Antigravity（Google Cloud Code）登录的 client secret：不进公开源码（Google 会扫 GitHub 自动吊销 GOCSPX）。
+// 默认 `npm run package` 不读 antigravity.secret，公开 Release / CI 必须得到空串。
+// 本机自用包才允许注入：环境变量 A2K_ANTIGRAVITY_CLIENT_SECRET，或
+// A2K_EMBED_ANTIGRAVITY_SECRET=1 时读本地 gitignore 的 antigravity.secret。
+// 带密钥的包禁止 `gh release upload`、禁止推进公开仓。缺失则为空（登录按现有代码不可用）。
 function readAntigravitySecret() {
   if (process.env.A2K_ANTIGRAVITY_CLIENT_SECRET) return process.env.A2K_ANTIGRAVITY_CLIENT_SECRET;
-  try {
-    return fs.readFileSync(path.join(__dirname, "antigravity.secret"), "utf8").trim();
-  } catch {
-    return "";
+  if (process.env.A2K_EMBED_ANTIGRAVITY_SECRET === "1") {
+    try {
+      return fs.readFileSync(path.join(__dirname, "antigravity.secret"), "utf8").trim();
+    } catch {
+      return "";
+    }
   }
+  return "";
 }
 
 const options = {

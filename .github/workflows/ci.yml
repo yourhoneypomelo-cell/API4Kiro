@@ -30,11 +30,31 @@ jobs:
 
       - name: Bundle & package VSIX
         env:
-          # Optional repo secret; without it the build still succeeds, Antigravity login is just disabled.
-          A2K_ANTIGRAVITY_CLIENT_SECRET: ${{ secrets.A2K_ANTIGRAVITY_CLIENT_SECRET }}
+          # Public Release / CI vsix must not embed Antigravity client secret.
+          # Do not set A2K_ANTIGRAVITY_CLIENT_SECRET (env or Actions secret).
           # `npm run package` calls `npx @vscode/vsce`; auto-confirm the one-off install in CI.
           npm_config_yes: "true"
         run: npm run package
+
+      - name: Public VSIX must not embed Antigravity client secret
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys, zipfile
+          vsix = glob.glob("*.vsix")
+          if len(vsix) != 1:
+              print("expected one vsix, got", vsix)
+              sys.exit(1)
+          real = re.compile(rb"GOCSPX-[A-Za-z0-9_-]{10,}")
+          hits = []
+          with zipfile.ZipFile(vsix[0]) as z:
+              for name in z.namelist():
+                  if real.search(z.read(name)):
+                      hits.append(name)
+          if hits:
+              print("real GOCSPX- value found in", hits)
+              sys.exit(1)
+          print("ok: no real GOCSPX- value in", vsix[0])
+          PY
 
       - uses: actions/upload-artifact@v7
         with:

@@ -159,7 +159,7 @@ flowchart LR
 1. **新增网络监听必须只绑回环，入口必须先过来源守卫，控制类接口必须带鉴权。** 参考：KRS / CPS 以 `server.listen(port, "127.0.0.1")` 绑定（`portBinder.ts`），入口第一行 `applyGuard(req, res, role)`（`requestGuard.ts`）；让位与身份探测用共享密钥 HMAC（`proxyIdentity.ts`）；OAuth 回调服务器绑 `127.0.0.1` 与 `::1`、校验随机 `state`、拿到结果即关闭（`oauth/core.ts` `openCallbackServer`）。不要引入 `0.0.0.0` 或省略 host 的 `listen`。
 2. **新增设置项若含凭据或端点，须声明 `scope: machine`，并在读取端只取用户级值。** 现有含凭据 / 端点的 `api2kiroDual.*` 项已如此声明（4.13.53），`providers` 的读取走 `config.ts` `readUserLevelArray`；新项照此办理。
 3. **新增对 Kiro 文件的修改必须可逆并带标记。** 遵守 `selectorStyle.ts` 的既有约束：`a2k` / `api4kiro` 标记、被替换原文随身携带（`a2k-orig:` base64）、`writeAtomic` 临时文件 + 原子改名且失败不退化为直写、三处经 `commitPlans` 全有或全无并可回滚、按结构匹配而不写死压缩名、新的渲染补丁只对 `__A2K_` 前缀条目生效；并在 PR 中写明验证过的 Kiro 版本（[CONTRIBUTING.md](../CONTRIBUTING.md)）。
-4. **不得在源码、测试夹具、文档里放任何密钥。** Antigravity client secret 的处理方式是唯一允许的模式：构建期注入、源码为空串（`esbuild.js`、`oauth/vendors.ts`）。测试数据用明显合成的值。
+4. **不得在源码、测试夹具、文档、公开 Release 或 CI vsix 里放任何密钥。** Antigravity client secret 的处理方式：源码为空串（`esbuild.js`、`oauth/vendors.ts`）；默认 `npm run package` 不读 `antigravity.secret`；只有 `A2K_EMBED_ANTIGRAVITY_SECRET=1` 或环境变量 `A2K_ANTIGRAVITY_CLIENT_SECRET` 才注入，且带密钥的包禁止 `gh release upload`、禁止推进公开仓。测试数据用明显合成的值。
 5. **日志只经 `log.ts` 的 `info` / `debug` / `warn` / `error` 输出**，不要直接 `console.log` 原始对象；请求头不记日志；新增可能携带密钥的字段名请补进 `SENSITIVE_KEY_RE`，新的 Key 形态请补进 `KEY_SHAPES`。
 6. **不把入站请求头原样转发给上游。** 唯一的例外是 Kiro 官方直通的镜像逻辑（`krsServer.ts` `kiroHeaders`）：它先用 `drop` 集合剔除 `authorization`、`cookie` 与逐跳头，再镜像其余头并换上所选凭证的 token；新增镜像逻辑至少要做到同样的剔除。
 7. **OAuth 类渠道发凭据前必须过宿主检查。** 新增厂商时把规格宿主写进 `VendorSpec.baseUrl`（`providers.ts` `allowedOAuthHosts` 由它派生），不要为某家厂商绕开 `ensureAccessToken` 里的检查。
@@ -168,4 +168,4 @@ flowchart LR
 
 相关文档：[SECURITY.md](../SECURITY.md) · [README](../README.md) · [架构概览](ARCHITECTURE.md) · [配置项参考](CONFIGURATION.md) · [参与贡献](../CONTRIBUTING.md) · [图标许可](../assets/ICON-LICENSE.md)
 
-最后更新：2026-09-08（对应 4.13.54）
+最后更新：2026-09-10（对应 4.13.57：公开 Release 不再内嵌 Antigravity client secret）
