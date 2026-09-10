@@ -15,11 +15,20 @@ const END = "/* api4kiro:group-header:end */";
 
 export type TargetStatus = "applied" | "removed" | "unchanged" | "unavailable";
 
+/** 4.13.55 可选组：聊天框「上下文」下拉（mermaid）与 setSessionConfigOption 宿主转发钩子（dist/extension.js）。 */
+export type CtxTargetKey = "ctxSelector" | "ctxHost";
+export type CtxExtras = Record<CtxTargetKey, TargetStatus>;
+
 export type StyleSyncResult = {
   status: TargetStatus;
   detail?: string;
   /** 三个靶点文件各自的结果：style.css / mermaid-*.js / kiro-agent dist/extension.js */
   targets: { style: TargetStatus; selectorScript: TargetStatus; backend: TargetStatus };
+  /**
+   * 可选组的结果（4.13.55）：靶点不命中只报 `unavailable`，不影响 `status` / `targets`——既有三处 + 弹层照常打；
+   * 该文件本轮写失败时随所属靶点一起报 `unavailable`。
+   */
+  extras: CtxExtras;
 };
 
 function styleFile(): string {
@@ -361,6 +370,78 @@ const CARD_CSS = `${START}
   margin: 0 0 10px !important;
   border-radius: 8px !important;
 }
+
+/* ==========================================================================
+   聊天框「上下文」下拉（4.13.55，R24）：EffortSelector 右侧的原生 <select>，外观复刻 Kiro 的 .effort-selector-trigger
+   （同边框 / 圆角 / 底色 / 字号 / hover），只命中 mermaid 补丁渲染出的 a2k-ctx-* 节点。select 去掉系统外观，
+   箭头由 wrap::after 画出；下拉展开的选项面板走 --vscode-dropdown-* 色。
+   ========================================================================== */
+.a2k-ctx-wrap {
+  position: relative !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: var(--spacing-xxs) !important;
+  border: 1px solid var(--vscode-contrastBorder) !important;
+  border-radius: var(--radius-md) !important;
+  padding: 0 0 0 var(--spacing-xs) !important;
+  background-color: var(--vscode-button-tertiaryBackground) !important;
+  color: inherit !important;
+  font-size: var(--text-sm) !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+  transition: background-color var(--kiro-transition) !important;
+}
+.a2k-ctx-wrap:hover {
+  background-color: var(--vscode-button-tertiaryHoverBackground, var(--vscode-button-background)) !important;
+}
+.a2k-ctx-label {
+  opacity: 0.7 !important;
+  white-space: nowrap !important;
+  pointer-events: none !important;
+}
+.a2k-ctx-select {
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  border: none !important;
+  outline: none !important;
+  background: transparent !important;
+  color: inherit !important;
+  font: inherit !important;
+  font-size: var(--text-sm) !important;
+  line-height: inherit !important;
+  padding: var(--spacing-xs) 16px var(--spacing-xs) 2px !important;
+  cursor: pointer !important;
+  min-width: 0 !important;
+  max-width: 120px !important;
+  text-overflow: ellipsis !important;
+}
+.a2k-ctx-select:disabled {
+  opacity: 0.5 !important;
+  cursor: not-allowed !important;
+}
+.a2k-ctx-select option,
+.a2k-ctx-select optgroup {
+  background: var(--vscode-dropdown-background) !important;
+  color: var(--vscode-dropdown-foreground) !important;
+}
+.a2k-ctx-select optgroup {
+  font-style: normal !important;
+  font-weight: 600 !important;
+  opacity: 0.75 !important;
+}
+.a2k-ctx-wrap::after {
+  content: "" !important;
+  position: absolute !important;
+  right: 6px !important;
+  top: 50% !important;
+  width: 5px !important;
+  height: 5px !important;
+  border-right: 1.5px solid currentColor !important;
+  border-bottom: 1.5px solid currentColor !important;
+  transform: translateY(-65%) rotate(45deg) !important;
+  pointer-events: none !important;
+  opacity: 0.75 !important;
+}
 ${END}`;
 
 const ORIG_JS_PATTERN =
@@ -440,8 +521,11 @@ type TargetResult = { status: TargetStatus; detail?: string };
  * 相等则本轮不碰该文件。`original` 同时是提交失败时的回滚依据（不依赖仓内出厂串，任何 Kiro 版本都能回到本轮读到的状态）。
  */
 type FilePlan = { file: string; original: string; next: string };
-/** 一个靶点的计划：`status` 是「全部写成功后」应报的状态；`files` 是该靶点涉及的文件（mermaid 可能多份）。 */
-type TargetPlan = { status: TargetStatus; detail?: string; files: FilePlan[] };
+/**
+ * 一个靶点的计划：`status` 是「全部写成功后」应报的状态；`files` 是该靶点涉及的文件（mermaid 可能多份）；
+ * `extras` 是该文件里可选组靶点（4.13.55）的状态。
+ */
+type TargetPlan = { status: TargetStatus; detail?: string; files: FilePlan[]; extras?: Partial<CtxExtras> };
 
 const ORIG_MENU_PATTERN =
   'children:b.jsx("div",{ref:c.setFloating,className:"chat-input-popup-menu",style:d,role:"listbox","data-keyboard-nav":l!=="mouse"||void 0,...h(),children:r.map((y,x)=>{const{description:k,name:E,value:T}=y';
@@ -790,12 +874,18 @@ async function planKiroAgentBackend(enabled: boolean): Promise<TargetPlan> {
     return { status: "unavailable", files: [] };
   }
   await sweepStaleTmp(file);
-  let content = restoreBackendHook(original);
-  if (enabled) content = applyBackendHook(content);
-  if (content !== original) return { status: enabled ? "applied" : "removed", files: [{ file, original, next: content }] };
+  let content = restoreCtxHostHook(restoreBackendHook(original));
+  if (enabled) {
+    content = applyBackendHook(content);
+    // 可选组的宿主钩子只在主钩子（通道 A）打上时才打：没有通道 A，聊天框改挡位也到不了 Kiro 的下一轮列表；
+    // 主钩子漂移时文件一字不写，targets.backend 仍按老口径报 unavailable。
+    if (/__kiroModelConfigProvider=t/.test(content)) content = applyCtxHostHook(content);
+  }
+  const extras = { ctxHost: ctxStatus(enabled, original.includes("__a2kSessionConfigOption"), content.includes("__a2kSessionConfigOption")) };
+  if (content !== original) return { status: enabled ? "applied" : "removed", files: [{ file, original, next: content }], extras };
   // 开启但结构锚点找不到、文件里也没有任何版本的钩子：Kiro 版本漂移，静默放行、不写文件。
-  if (enabled && !/__kiroModelConfigProvider=t/.test(content)) return { status: "unavailable", files: [] };
-  return { status: "unchanged", files: [] };
+  if (enabled && !/__kiroModelConfigProvider=t/.test(content)) return { status: "unavailable", files: [], extras };
+  return { status: "unchanged", files: [], extras };
 }
 
 /**
@@ -854,6 +944,156 @@ export async function triggerKiroModelRefresh(): Promise<boolean> {
   }
 }
 
+// ============================================================================
+// 上下文挡位（4.13.55，R24 目标 A6）：聊天框 EffortSelector 旁的 <select> + kiro-agent setSessionConfigOption 宿主转发钩子。
+// 两处都是「加法」：插入段用 /*a2k-ctx:start*/…/*a2k-ctx:end*/ 定界（还原 = 删段），调用处包一层 Fragment（还原 = 正则拆包）。
+// 作为可选组：任一锚点不命中只报 unavailable，不影响既有三处 + 弹层。
+// ============================================================================
+
+const CTX_START = "/*a2k-ctx:start*/";
+const CTX_END = "/*a2k-ctx:end*/";
+/** 注入到 mermaid 的组件函数名——出厂 bundle 里绝不出现，同时也是还原 / 测试 / 检查器的标记。 */
+const CTX_SEL_FN = "a2kCtxSel";
+/** 定界段（函数体 / 宿主钩子）；超过 maxSpan 视为误命中不删。 */
+const CTX_SEGMENT_RE = /\/\*a2k-ctx:start\*\/[\s\S]*?\/\*a2k-ctx:end\*\//g;
+const CTX_SEGMENT_MAX = 12000;
+
+/**
+ * A2kContextSelector：EffortSelector 右侧的「上下文」下拉。规范名 `b`（jsx 运行时）、`l0`（useSessionConfig）；函数名固定 a2kCtxSel。
+ * 数据全部来自 Kiro 自己的 useSessionConfig：category==="model" 的 select 里当前选项的 description（CPS 私有微格式
+ * `__A2K_MDL__|推理|图片|窗口|挡位表|末行`，第 5 位 = `候选,候选,…~来源~已知~解析值`）。不足 6 位（本扩展未运行 / 旧版 CPS /
+ * Kiro 官方列表）→ 返回 null，聊天框与出厂一致。选中项变化 → `setter("a2k:ctx","<modelId>|<tokens>")`：webview 现成的
+ * setSessionConfigOption 载体，宿主 zas 入口钩子转发到本扩展，agent 对未知 configId 无副作用（见 research §1.4）。
+ * <select> 不受控（defaultValue + key=模型:窗口）：用户选完立刻显示所选，通道 A 推回新列表后 key 变化重挂到真实生效值。
+ * 选项分两个 optgroup：「auto (解析来源)」只含解析值（选它 = 清除覆盖）、「manual」含其余挡位——显示文案只有数字，不占聊天栏宽度。
+ * 模板里不能出现独立单词 a / b / l0 之外的规范名用法（renderTemplate 按标识符边界替换，字符串里的单词也会被换）。
+ */
+const CTX_SEL_FN_TEMPLATE =
+  'function a2kCtxSel({disabled:t=!1}={}){const[cfg,setCfg]=l0();const row=(()=>{try{const q=(cfg||[]).find(z=>z&&z.category==="model");if(!q||q.type!=="select")return null;const F=(q.options||[]).flatMap(v=>v&&Array.isArray(v.options)?v.options:[v]);const z=F.find(v=>v&&v.value===q.currentValue);const p=typeof z?.description==="string"?z.description.split("|"):null;if(!p||p[0]!=="__A2K_MDL__"||p.length<6)return null;const c=String(p[4]).split("~");const cand=String(c[0]||"").split(",").map(Number).filter(v=>Number.isFinite(v)&&v>0);if(!cand.length)return null;const win=Number(p[3]);return{id:String(q.currentValue),win:win>0?win:cand[cand.length-1],cand,src:c[1]||"default",known:c[2]==="1",res:Number(c[3])||0,rsrc:c[4]||"default"}}catch(_e){return null}})();if(!row)return null;const K=v=>{if(!(v>0))return"?";const f=(x,u)=>(Number.isInteger(x)?String(x):x.toFixed(1))+u;if(v%1000!==0&&v%1024===0){const k=v/1024;return k>=1024?f(k/1024,"M"):f(k,"K")}const k=v/1000;return k>=1000?f(k/1000,"M"):f(k,"K")};const SRC={override:"your override",upstream:"upstream /models",vendor:"vendor catalog",catalog:"models.dev",default:row.known?"default":"unknown, default"};const tip="Context window: "+K(row.win)+" tokens ("+(SRC[row.src]||row.src)+"). Kiro summarizes at 80% and truncates at 95% of it. Choose smaller if the upstream rejects long inputs; the auto group follows the catalog again.";const opt=v=>b.jsx("option",{value:String(v),children:K(v)},v);const hasAuto=row.cand.includes(row.res);const list=hasAuto?[b.jsx("optgroup",{label:"auto ("+(SRC[row.rsrc]||row.rsrc)+")",children:opt(row.res)},"auto"),b.jsxs("optgroup",{label:"manual",children:row.cand.filter(v=>v!==row.res).map(opt)},"manual")]:row.cand.map(opt);return b.jsxs("span",{className:"a2k-ctx-wrap",title:tip,children:[b.jsx("span",{className:"a2k-ctx-label",children:"Ctx"}),b.jsxs("select",{className:"a2k-ctx-select",disabled:t,defaultValue:String(row.win),"aria-label":"Context window",onChange:ev=>{const v=Number(ev.target.value);v>0&&v!==row.win&&setCfg("a2k:ctx",row.id+"|"+v)},children:list},row.id+":"+row.win)]})}';
+const CTX_SEL_CANON = ["b", "l0"];
+
+/**
+ * EffortSelector 调用处（chat-input-bottom-row-left 里唯一一处 `<b>.jsx(<EffortSelector>,{disabled:<v>})`）：
+ * 出厂 → 包一层 Fragment 同时渲染 A2kContextSelector。规范名 `b`（jsx 运行时）、`a0e`（EffortSelector，1.0.437 压缩名；
+ * 1.0.411 为 e0e）、`M`（disabled 变量）。React Compiler 的 memo 槽只缓存这个元素，子组件仍按自己的 hook 状态重渲染。
+ */
+const CTX_CALL_ORIG_TEMPLATE = "b.jsx(a0e,{disabled:M})";
+const CTX_CALL_PATCHED_TEMPLATE = "b.jsxs(b.Fragment,{children:[b.jsx(a0e,{disabled:M}),b.jsx(a2kCtxSel,{disabled:M})]})";
+const CTX_CALL_CANON = ["b", "a0e", "M"];
+/** 任何压缩名下的补丁调用处 → 出厂：`<b>.jsxs(<b>.Fragment,{children:[<b>.jsx(<fn>,{disabled:<v>}),<b>.jsx(a2kCtxSel,{disabled:<v>})]})` → 第 2 组。 */
+const CTX_CALL_RESTORE_RE =
+  /(?<![\w$])([A-Za-z_$][\w$]*)\.jsxs\(\1\.Fragment,\{children:\[(\1\.jsx\([A-Za-z_$][\w$]*,\{disabled:([A-Za-z_$][\w$]*)\}\)),\1\.jsx\(a2kCtxSel,\{disabled:\3\}\)\]\}\)/g;
+/** `<tagger>(<fn>,"EffortSelector");`——Kiro 给组件打的 displayName 标签，全文恰好一处。函数插在标签之后。 */
+const CTX_EFFORT_TAG_RE = /(?<![\w$])([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),"EffortSelector"\);/g;
+
+/**
+ * 宿主 `setSessionConfigOption` 入口（1.0.437 压缩名 zas；1.0.411 为 fas）：`async function <fn>(<sessionId>,<configId>,<value>){`
+ * 体内唯一字面量 `executeCommand("kiro.agentModels.setLastSelectedModel",{modelId:<value>})`，其后有 `.setSessionConfigOption(`。
+ * 钩子插在 `{` 之后：configId 以 `a2k:` 开头时先交给 globalThis.__a2kSessionConfigOption(configId, value, sessionId)
+ * （本扩展 extension.ts 登记；同宿主共享 globalThis），然后照旧落到 agent。规范名 `t` / `e` / `r` = 三个参数。
+ */
+const CTX_HOST_HOOK_TEMPLATE =
+  '/*a2k-ctx:start*/try{typeof e=="string"&&e.startsWith("a2k:")&&typeof globalThis.__a2kSessionConfigOption=="function"&&globalThis.__a2kSessionConfigOption(e,r,t)}catch(_){}/*a2k-ctx:end*/';
+const CTX_HOST_CANON = ["t", "e", "r"];
+const CTX_HOST_LITERAL = 'executeCommand("kiro.agentModels.setLastSelectedModel",{modelId:';
+const CTX_HOST_HEAD_RE = /^async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{/;
+
+type EffortSelectorHit = { fn: string; tagger: string; tagEnd: number };
+type EffortCallHit = { start: number; end: number; text: string; jsx: string; disabled: string };
+type HostFnHit = { fn: string; params: [string, string, string]; bodyStart: number };
+
+/** EffortSelector 组件名 + 标签结束位置；标签必须全文恰好一处。 */
+function findEffortSelector(content: string): EffortSelectorHit | null {
+  const hits = [...content.matchAll(CTX_EFFORT_TAG_RE)];
+  if (hits.length !== 1) return null;
+  const m = hits[0];
+  return { fn: m[2], tagger: m[1], tagEnd: (m.index as number) + m[0].length };
+}
+
+/** `<b>.jsx(<fn>,{disabled:<v>})` 恰好一处，捕获 jsx 运行时名与 disabled 变量名。 */
+function findEffortSelectorCall(content: string, fn: string): EffortCallHit | null {
+  const rendered = renderTemplate(CTX_CALL_ORIG_TEMPLATE, ["a0e"], [fn]);
+  const { re, groups } = templateRegex(rendered, ["b", "M"]);
+  const hits = [...content.matchAll(re)];
+  if (hits.length !== 1) return null;
+  const m = hits[0];
+  const by = (c: string) => m[groups.indexOf(c) + 1];
+  return { start: m.index as number, end: (m.index as number) + m[0].length, text: m[0], jsx: by("b"), disabled: by("M") };
+}
+
+/**
+ * 宿主 setSessionConfigOption 函数：字面量唯一 → 向前找最近的 `async function <fn>(a,b,c){` 头（800 字符内、中间无嵌套 function），
+ * 字面量后紧跟 `<value 参数>})`，900 字符内出现 `.setSessionConfigOption(`。
+ */
+function findHostConfigOptionFn(content: string): HostFnHit | null {
+  const i = content.indexOf(CTX_HOST_LITERAL);
+  if (i < 0 || content.indexOf(CTX_HOST_LITERAL, i + 1) >= 0) return null;
+  const headStart = content.lastIndexOf("async function ", i);
+  if (headStart < 0 || i - headStart > 800) return null;
+  const head = CTX_HOST_HEAD_RE.exec(content.slice(headStart, Math.min(i, headStart + 160)));
+  if (!head) return null;
+  const bodyStart = headStart + head[0].length;
+  if (/(?<![\w$])function(?![\w$])/.test(content.slice(bodyStart, i))) return null;
+  if (!content.startsWith(`${head[4]}})`, i + CTX_HOST_LITERAL.length)) return null;
+  if (!content.slice(i, i + 900).includes(".setSessionConfigOption(")) return null;
+  return { fn: head[1], params: [head[2], head[3], head[4]], bodyStart };
+}
+
+/** 删掉所有定界段（函数体 / 宿主钩子；任何版本打的都一样），超长段视为误命中不动。 */
+function removeCtxSegments(content: string): string {
+  if (!content.includes(CTX_START)) return content;
+  return content.replace(CTX_SEGMENT_RE, (m) => (m.length <= CTX_SEGMENT_MAX ? "" : m));
+}
+
+/** mermaid：删定界函数段 + 调用处拆包（任何压缩名）。 */
+function restoreCtxSelector(content: string): string {
+  let out = removeCtxSegments(content);
+  if (out.includes(CTX_SEL_FN)) out = out.replace(CTX_CALL_RESTORE_RE, (_m, _jsx, inner: string) => inner);
+  return out;
+}
+
+/** 在出厂内容上打聊天框「上下文」下拉两处（组件函数 + 调用处）。三个锚点全部唯一命中且无撞名才打；否则 null（全有或全无）。 */
+function applyCtxSelector(content: string): string | null {
+  const sel = findEffortSelector(content);
+  if (!sel) return null;
+  const call = findEffortSelectorCall(content, sel.fn);
+  if (!call) return null;
+  const useSessionConfig = resolveTaggedName(content, "useSessionConfig");
+  if (!useSessionConfig) return null;
+  const fnActual = [call.jsx, useSessionConfig];
+  const callActual = [call.jsx, sel.fn, call.disabled];
+  if (namesCollide(CTX_SEL_FN_TEMPLATE, CTX_SEL_CANON, fnActual) || namesCollide(CTX_CALL_PATCHED_TEMPLATE, CTX_CALL_CANON, callActual)) return null;
+  const fnText = CTX_START + renderTemplate(CTX_SEL_FN_TEMPLATE, CTX_SEL_CANON, fnActual) + CTX_END;
+  const callText = renderTemplate(CTX_CALL_PATCHED_TEMPLATE, CTX_CALL_CANON, callActual);
+  // 两段互不重叠（函数插在 EffortSelector 标签之后，调用处在聊天输入组件里）；从后往前拼
+  const spans = [
+    { start: sel.tagEnd, end: sel.tagEnd, text: fnText },
+    { start: call.start, end: call.end, text: callText },
+  ].sort((x, y) => y.start - x.start);
+  let out = content;
+  for (const s of spans) out = out.slice(0, s.start) + s.text + out.slice(s.end);
+  return out;
+}
+
+/** dist/extension.js：删定界钩子段。 */
+function restoreCtxHostHook(content: string): string {
+  return removeCtxSegments(content);
+}
+
+/** 在出厂内容上打宿主转发钩子；锚点不唯一或参数名与模板局部撞名则原样返回。 */
+function applyCtxHostHook(content: string): string {
+  const hit = findHostConfigOptionFn(content);
+  if (!hit) return content;
+  if (namesCollide(CTX_HOST_HOOK_TEMPLATE, CTX_HOST_CANON, hit.params)) return content;
+  return content.slice(0, hit.bodyStart) + renderTemplate(CTX_HOST_HOOK_TEMPLATE, CTX_HOST_CANON, hit.params) + content.slice(hit.bodyStart);
+}
+
+/** 可选组一个靶点的状态：按「处理前 / 处理后是否带标记」推导（文件其它部分的改动不算在它头上）。 */
+function ctxStatus(enabled: boolean, before: boolean, after: boolean): TargetStatus {
+  if (enabled) return after ? (before ? "unchanged" : "applied") : "unavailable";
+  return before ? "removed" : "unchanged";
+}
+
 /** 选项行补丁各历史变体共有的尾巴：ORIG_JS_PATTERN 里 children: 之后原样保留的兜底分支。 */
 const JS_OPTION_TAIL = ORIG_JS_PATTERN.slice(ORIG_JS_PATTERN.indexOf('b.jsxs("div",{className:"chat-input-popup-option-content"'));
 /** 4.13.53 起标记门形态选项行的起始锚（出厂文件里绝不出现 `__A2K_GRP__`）。 */
@@ -892,6 +1132,8 @@ function restoreSelectorScript(content: string): string {
   // 6. 弹层调用处多传的 a2kUsage 属性（正则不带函数名，任何压缩名都覆盖）
   out = out.split(PATCHED_POPOVER_CALL_CODE).join(ORIG_POPOVER_CALL_PATTERN);
   out = out.replace(/,a2kUsage:n\}\)/g, "})");
+  // 7. 聊天框「上下文」下拉（4.13.55）：删定界函数段 + 调用处拆包
+  out = restoreCtxSelector(out);
   return out;
 }
 
@@ -933,11 +1175,13 @@ function applyPopover(content: string): string | null {
 function applySelectorScript(content: string): string {
   const selectorHit = [ORIG_JS_PATTERN, ORIG_MENU_PATTERN, ORIG_REF_PATTERN].every((s) => content.includes(s));
   if (!selectorHit) return content;
-  const out = content
+  let out = content
     .replace(ORIG_JS_PATTERN, PATCHED_JS_CODE)
     .replace(ORIG_MENU_PATTERN, PATCHED_MENU_CODE)
     .replace(ORIG_REF_PATTERN, PATCHED_REF_CODE);
-  return applyPopover(out) ?? out;
+  out = applyPopover(out) ?? out;
+  // 可选组（4.13.55）：聊天框「上下文」下拉——锚点不命中就不打，不影响上面几处
+  return applyCtxSelector(out) ?? out;
 }
 
 /** mermaid-*.js 的写入计划（只读盘、不写）。目录不存在 / 不可读（非 Kiro 宿主）→ unavailable 且无文件。 */
@@ -945,6 +1189,8 @@ async function planModelSelectorScript(enabled: boolean): Promise<TargetPlan> {
   const dir = jsDir();
   const files: FilePlan[] = [];
   let patchedPresent = false;
+  let ctxBefore = false;
+  let ctxAfter = false;
   try {
     for (const f of await fs.promises.readdir(dir)) {
       if (!f.endsWith(".js") || !f.startsWith("mermaid-")) continue;
@@ -957,14 +1203,17 @@ async function planModelSelectorScript(enabled: boolean): Promise<TargetPlan> {
       if (enabled) content = applySelectorScript(content);
       if (content !== original) files.push({ file: p, original, next: content });
       if (content.includes(PATCHED_JS_CODE)) patchedPresent = true;
+      if (original.includes(CTX_SEL_FN)) ctxBefore = true;
+      if (content.includes(CTX_SEL_FN)) ctxAfter = true;
     }
   } catch {
     return { status: "unavailable", files: [] };
   }
-  if (files.length > 0) return { status: enabled ? "applied" : "removed", files };
+  const extras = { ctxSelector: ctxStatus(enabled, ctxBefore, ctxAfter) };
+  if (files.length > 0) return { status: enabled ? "applied" : "removed", files, extras };
   // 开启却没有任何 mermaid 文件带补丁：靶点不命中（Kiro 版本漂移）
-  if (enabled && !patchedPresent) return { status: "unavailable", files: [] };
-  return { status: "unchanged", files: [] };
+  if (enabled && !patchedPresent) return { status: "unavailable", files: [], extras };
+  return { status: "unchanged", files: [], extras };
 }
 
 /**
@@ -1133,6 +1382,16 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
     selectorScript: committed.selectorScript.status,
     backend: committed.backend.status,
   };
+  // 可选组（4.13.55）：所属文件本轮写失败 / 被全有或全无中止（unavailable 且带 detail）→ 也报 unavailable；否则按计划推导的状态。
+  const extraOf = (plan: TargetPlan, res: TargetResult, key: CtxTargetKey): TargetStatus =>
+    res.status === "unavailable" && res.detail ? "unavailable" : plan.extras?.[key] ?? "unavailable";
+  const extras: CtxExtras = {
+    ctxSelector: extraOf(selectorScript, committed.selectorScript, "ctxSelector"),
+    ctxHost: extraOf(backend, committed.backend, "ctxHost"),
+  };
+  if (enabled && (extras.ctxSelector === "unavailable" || extras.ctxHost === "unavailable")) {
+    info(`context selector targets (optional group): selector=${extras.ctxSelector} host=${extras.ctxHost} — chat-input context dropdown falls back to the panel`);
+  }
   // 任一 Kiro 文件「本应写入却写失败」都上浮为 unavailable 并带 detail：尤其是还原路径，
   // 否则 mermaid / extension.js 没还原成功却报 removed，调用方无从提示用户。
   const writeErrors = [committed.selectorScript.detail, committed.backend.detail].filter((d): d is string => !!d);
@@ -1154,7 +1413,7 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
   } else {
     status = "unchanged";
   }
-  return detail ? { status, detail, targets } : { status, targets };
+  return detail ? { status, detail, targets, extras } : { status, targets, extras };
 }
 
 /** 仅供 tests/selector、scripts/check-selector-patch.js、probe-kiro.js 使用：暴露靶点模板、标记块与结构匹配器。 */
@@ -1181,6 +1440,25 @@ export const __selectorStyleInternals = {
     POPOVER_FACTORY_CANON,
     POPOVER_PATCH_CANON,
     BACKEND_CANON,
+    /** 4.13.55 可选组：聊天框「上下文」下拉 + 宿主转发钩子 */
+    findEffortSelector,
+    findEffortSelectorCall,
+    findHostConfigOptionFn,
+    applyCtxSelector,
+    restoreCtxSelector,
+    applyCtxHostHook,
+    restoreCtxHostHook,
+    removeCtxSegments,
+    CTX_START,
+    CTX_END,
+    CTX_SEL_FN,
+    CTX_SEGMENT_RE,
+    CTX_CALL_RESTORE_RE,
+    CTX_EFFORT_TAG_RE,
+    CTX_HOST_LITERAL,
+    CTX_SEL_CANON,
+    CTX_CALL_CANON,
+    CTX_HOST_CANON,
   },
   patterns: {
     ORIG_JS_PATTERN,
@@ -1197,6 +1475,11 @@ export const __selectorStyleInternals = {
     PATCHED_POPOVER_CALL_CODE,
     ORIG_QPE_PATTERN,
     PATCHED_QPE_PATTERN,
+    // 4.13.55 可选组（不以 ORIG_/PATCHED_ 命名：scripts/check-selector-patch.js 按该前缀自动配对逐字靶点，这组按结构定位）
+    CTX_SEL_FN_TEMPLATE,
+    CTX_CALL_ORIG_TEMPLATE,
+    CTX_CALL_PATCHED_TEMPLATE,
+    CTX_HOST_HOOK_TEMPLATE,
   },
   legacy: LEGACY_POPOVER_VARIANTS,
   legacySelector: LEGACY_SELECTOR_VARIANTS,

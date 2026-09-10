@@ -80,11 +80,11 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 | 页面 | 说明 |
 | --- | --- |
 | **提供商** | 渠道增删改、拖拽排序（支持滚轮与边缘自动滚动）、连接测试、Key 池管理、从 CC Switch 导入、Logo 图库 |
-| **模型** | 各渠道模型勾选进 Kiro、能力覆盖（图片 / 推理）、拖拽排序；改动经「通道 A」静默刷新 Kiro 选择器 |
-| **用量** | 趋势图（Token / 请求两个维度；「今天」按 10 分钟粒度显示消耗尖峰，7 / 30 天按天）、Sankey 流向图（Token 物理守恒，门高与流宽严格按数值）、按渠道 / 模型汇总、缓存命中率 |
-| **设置** | 启用代理、路由 / 思考 / 重试 / 显示选项、提示词库（单条启用，作为 system 注入）、「关于」卡（版本、GitHub 项目主页、检查更新） |
+| **模型** | 各渠道模型勾选进 Kiro、能力覆盖（图片 / 推理）、每行上下文挡位下拉、拖拽排序；改动经「通道 A」静默刷新 Kiro 选择器 |
+| **用量** | 趋势图（Token / 请求两个维度；「今天」按 10 分钟粒度显示消耗尖峰，标题为「今日」，曲线自 00:00 起满轴）、Sankey 流向图（Token 六层守恒：渠道 › 凭证 › 模型 › 状态 › Token 类型 › 上下文类别；非输入类各一直通；路径节点条可逐层显隐）、按渠道 / 模型汇总、缓存命中率 |
+| **设置** | 启用代理、路由 / 思考 / 重试 / 显示选项、提示词库（单条启用，作为 system 注入）、**MCP 服务器**（直管 Kiro 两份 `mcp.json`）、**子代理 / Agent**（直管 `~/.kiro/agents` 与工作区 `.kiro/agents`）、**上下文**（各模型挡位总览与一键重置）、「关于」卡（版本、GitHub 项目主页、检查更新） |
 
-面板标题「API4Kiro」左侧有两枚常驻图标：GitHub 标直达本项目主页；云朵下载标即「检查更新」——比对本仓库最新 Release，有新版就把 Release 里的 `api2kiro-dual-<版本>.vsix` 下载到扩展存储目录、校验（zip 结构、大小、包内 `package.json` 的 name / version）后调用 Kiro 的「从 VSIX 安装」命令装好，再提示重新加载窗口；已是最新会直接告知，下载 / 校验 / 安装任一失败都会给出原因并附「打开 Release 页」按钮（安装包已下载时保留在本地供手动安装）。启动时的静默检查（24 小时一次）发现新版会在该图标右上角亮一个小圆点，通知里也带「立即更新」。下载只走 `github.com` 与 GitHub 资产域，不带任何凭据。
+Kiro 视图标题栏最右侧有两枚命令图标（4.13.56）：**GitHub 标**直达本项目主页；其右侧的**云朵下载标**即「检查更新」。有新版时该图标切成「安装更新」。面板 webview 顶栏改为左侧「启用代理」开关、右侧提供商 / 模型计数胶囊。设置页「关于」卡的两个按钮保留，与标题栏命令共用同一处理——比对本仓库最新 Release，有新版就把 Release 里的 `api2kiro-dual-<版本>.vsix` 下载到扩展存储目录、校验（zip 结构、大小、包内 `package.json` 的 name / version）后调用 Kiro 的「从 VSIX 安装」命令装好，再提示重新加载窗口；已是最新会直接告知，下载 / 校验 / 安装任一失败都会给出原因并附「打开 Release 页」按钮（安装包已下载时保留在本地供手动安装）。启动时的静默检查（24 小时一次）发现新版会把标题栏切到「安装更新」，通知里也带「立即更新」。下载只走 `github.com` 与 GitHub 资产域，不带任何凭据。
 
 ## 多渠道路由与 Key 池
 
@@ -112,7 +112,11 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 
 - **每轮页脚**（`showTokenUsage`）：在 Kiro 回答页脚标注本轮消耗的 Est. Input / Output Tokens；工具循环里的多次请求会累计成一轮后再上报，避免 Kiro 重复聚合。
 - **本地账本**：每个请求的 token 由本扩展自己记账，不依赖中转站的用量接口；用量页的趋势、Sankey、汇总都来自这份账本。也可填 `usagePath` 走中转站的额度接口（kiro2cc-proxy 风格或 New-API 风格）。
-- **Context Usage 弹层**：Kiro 底栏的 Context Usage 悬停弹层显示**真实模型窗口**（来自模型目录的 `maxInputTokens`，例如 1M）与系统提示 / 历史 / 工具 / 附件等分项占用，不再是反推出来的假窗口。
+- **Context Usage 弹层**：Kiro 底栏的 Context Usage 悬停弹层显示**真实模型窗口**（来自 CPS 报给 Kiro 的 `tokenLimits.maxInputTokens`，例如 1M）与六类分项占用（Your prompts / Kiro responses / Session files / Built-in tools / MCP tools / Steering files），不再是反推出来的假窗口。
+- **上下文挡位**（4.13.55）：每个已勾选模型按渠道字段 / 厂商目录 / models.dev / 用户覆盖算出「已知最大 / 候选挡位 / 当前生效」。聊天框 Effort 右侧有「Ctx」下拉，面板模型页每行、设置页「上下文」卡是同一套数据；选小一档后 Kiro 按新窗口算 80% / 95% 压缩阈值。覆盖写在用户级设置 `api2kiroDual.contextWindowOverrides`。
+- **爆窗口压缩**（4.13.55）：上游因输入过长返回 400 / 413 / 422 时，本机代理回给 Kiro 官方溢出异常，触发 Kiro 自己的截断式摘要而不是红字 `Upstream 400`。
+- **Sankey 第 6 层**（4.13.57）：Token 维把输入再分到六类上下文；缓存读 / 缓存写 / 输出各一直通到最后一层。图下有路径节点条，可逐层显隐（至少保留两层）。
+- **MCP / 子代理**（4.13.57）：设置页直接读写 Kiro 的 `mcp.json` 与自定义 agent 文件（`~/.kiro/agents`、工作区 `.kiro/agents`），不另存副本；写前备份、原子替换，外部改动约 300 ms 回推到面板。
 
 ## 稳健性
 
@@ -131,8 +135,8 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 | 靶文件 | 作用 |
 | --- | --- |
 | `extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/style.css` | 模型选择器分组标题 / 卡片样式、弹层样式 |
-| `extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/assets/mermaid-*.js` | 模型选择器组头渲染、Context Usage 弹层 |
-| `extensions/kiro.kiro-agent/dist/extension.js` | 模型刷新钩子（「通道 A」静默刷新） |
+| `extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/assets/mermaid-*.js` | 模型选择器组头渲染、Context Usage 弹层、聊天框 Effort 旁「Ctx」下拉 |
+| `extensions/kiro.kiro-agent/dist/extension.js` | 模型刷新钩子（「通道 A」静默刷新）、`a2k:ctx` 挡位转发钩子 |
 
 设计约束：
 
@@ -233,13 +237,17 @@ mindmap
     模型
       modelStore.ts 聚合与路由表
       modelCatalog.ts models.dev 能力目录
+      contextWindow.ts 挡位解析
+      contextOverflow.ts 爆窗口判定
     用量
       usageStore.ts 账本 · 趋势 · Sankey
       turnLedger.ts 整轮累计
-      contextParser.ts 上下文分项
+      contextParser.ts 六桶上下文分项
     界面
       sidebar.ts Webview 四页
       selectorStyle.ts Kiro 补丁与复原
+      mcpConfig.ts MCP 直管
+      agentConfig.ts 子代理直管
       promptStore.ts 提示词库
       openBrowser.ts
       log.ts
@@ -302,13 +310,17 @@ API4Kiro/
 │   │
 │   ├── modelStore.ts           模型聚合与「模型 ID → provider」路由表；学到的模型名单
 │   ├── modelCatalog.ts         models.dev 模型能力目录缓存（图片 / 思考形态 / 上下文窗口）
+│   ├── contextWindow.ts        每模型上下文挡位：四来源解析、候选梯子、CPS description 往返
+│   ├── contextOverflow.ts      上游超长判定；回 Kiro ValidationException 触发被动压缩
 │   │
-│   ├── usageStore.ts           本地用量账本：趋势、Sankey、分项聚合
+│   ├── usageStore.ts           本地用量账本：趋势、Sankey（含第 6 层折叠）、分项聚合
 │   ├── turnLedger.ts           一轮对话（工具循环多请求）的用量累计与轮末上报
-│   ├── contextParser.ts        请求上下文成分解析：五类字符权重与 token 无损分配
+│   ├── contextParser.ts        请求上下文六桶解析与 token 无损分配
 │   │
 │   ├── sidebar.ts              侧边栏 Webview：提供商 / 模型 / 用量 / 设置四页与图表
-│   ├── selectorStyle.ts        Kiro 模型选择器样式、Context Usage 弹层、模型刷新钩子的补丁与复原
+│   ├── selectorStyle.ts        Kiro 模型选择器样式、Ctx 下拉、Context Usage 弹层、模型刷新钩子的补丁与复原
+│   ├── mcpConfig.ts            直管 Kiro 两份 mcp.json（列表 / 编辑 / 导入 / 监听）
+│   ├── agentConfig.ts          直管两级自定义 agent 文件（md / json）
 │   ├── promptStore.ts          提示词库（单条启用，注入 system）
 │   ├── openBrowser.ts          系统浏览器打开链接（绕开 Kiro 的二次确认）
 │   └── log.ts                  输出通道与调试日志（已知形态 Key / token 脱敏、单行 64 KiB 截断、debug 开启提醒）
@@ -333,7 +345,7 @@ API4Kiro/
 │
 ├── esbuild.js                  打包为单文件 dist/extension.js（含可选 client secret 注入）
 ├── tsconfig.json
-├── package.json                扩展清单：命令、视图、41 个配置项、extensionDependencies
+├── package.json                扩展清单：命令、视图、配置项（含 contextWindowOverrides）、extensionDependencies
 ├── .vscodeignore               vsix 只含 dist/、assets/、package.json、LICENSE、README
 ├── CONTRIBUTING.md
 ├── LICENSE                     MIT
@@ -355,7 +367,7 @@ API4Kiro/
 | 文档 | 内容 |
 | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统架构图、一次请求的完整流程、模块边界、Key 池状态机、Kiro 前端补丁机制与复原、多窗口协商、已知限制 |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 全部 41 个配置项：类型、默认值、取值与说明（`node scripts/gen-config-doc.js` 从 `package.json` 生成） |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 全部配置项：类型、默认值、取值与说明（`node scripts/gen-config-doc.js` 从 `package.json` 生成） |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 环境搭建、Issue / PR 约定、发布流程 |
 | [assets/ICON-LICENSE.md](assets/ICON-LICENSE.md) · [assets/providers/LICENSE.md](assets/providers/LICENSE.md) | 图标与第三方标识的来源与许可 |
 

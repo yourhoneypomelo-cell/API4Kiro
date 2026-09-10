@@ -1,21 +1,32 @@
 /**
  * Kiro 请求上下文成分解析器。
- * 从 CwRequest 中提取并分类统计各微观模块的字符权重，
- * 供后续按真实上游 inputTokens 进行无损物理分配。
+ * 按 Kiro Context Usage 弹层六桶（Your prompts / Kiro responses / Session files /
+ * Built-in tools / MCP tools / Steering files）提取字符权重，再按账单 inputTokens 无损分配。
  */
 
-import { CwRequest, CwUserInputMessage } from "./cwTypes";
+import { CwRequest, CwToolSpec, CwUserInputMessage } from "./cwTypes";
 import { activePromptText } from "./promptStore";
 
 export interface RawContextBreakdown {
-  filesChars: number;      // 关联工作区与当前打开的文件
-  historyChars: number;    // 多轮历史对话 (User, Assistant, Reasoning, ToolResults)
-  toolsChars: number;      // 工具定义 Schema
-  rulesChars: number;      // 系统指令、规则与提示词
-  currentChars: number;    // 当前轮用户输入
+  userPromptsChars: number;
+  kiroResponsesChars: number;
+  sessionFilesChars: number;
+  builtinToolsChars: number;
+  mcpToolsChars: number;
+  steeringChars: number;
 }
 
 export interface ContextBreakdown {
+  userPromptsTokens: number;
+  kiroResponsesTokens: number;
+  sessionFilesTokens: number;
+  builtinToolsTokens: number;
+  mcpToolsTokens: number;
+  steeringTokens: number;
+}
+
+/** 4.13.57 之前落账的五字段形状。 */
+export interface LegacyContextBreakdown {
   filesTokens: number;
   historyTokens: number;
   toolsTokens: number;
@@ -23,155 +34,245 @@ export interface ContextBreakdown {
   currentInputTokens: number;
 }
 
+export interface NormalizedBreakdown {
+  userPromptsTokens: number;
+  kiroResponsesTokens: number;
+  sessionFilesTokens: number;
+  builtinToolsTokens: number;
+  mcpToolsTokens: number;
+  steeringTokens: number;
+  legacyTokens: number;
+}
+
+export type AnyContextBreakdown = ContextBreakdown | LegacyContextBreakdown;
+
+const SIX_KEYS = [
+  "userPromptsTokens",
+  "kiroResponsesTokens",
+  "sessionFilesTokens",
+  "builtinToolsTokens",
+  "mcpToolsTokens",
+  "steeringTokens",
+] as const;
+
+function toolSpecName(t: CwToolSpec): string {
+  return String(t.toolSpecification?.name || t.name || "").toLowerCase();
+}
+
+export function isMcpToolName(name: string): boolean {
+  return name.toLowerCase().startsWith("mcp_");
+}
+
+function addToolResultChars(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (content != null) return JSON.stringify(content).length;
+  return 0;
+}
+
+function addAdditionalContextChars(ctx: CwUserInputMessage["userInputMessageContext"]): number {
+  let n = 0;
+  if (!ctx || !Array.isArray(ctx.additionalContext)) return 0;
+  for (const ac of ctx.additionalContext) {
+    if (ac.innerContext) n += ac.innerContext.length;
+    if (ac.description) n += ac.description.length;
+  }
+  return n;
+}
+
+function addSessionFileChars(ctx: CwUserInputMessage["userInputMessageContext"]): number {
+  let n = 0;
+  if (!ctx?.editorState) return 0;
+  if (ctx.editorState.document?.text) n += ctx.editorState.document.text.length;
+  if (Array.isArray(ctx.editorState.relevantDocuments)) {
+    for (const doc of ctx.editorState.relevantDocuments) {
+      if (doc?.text) n += doc.text.length;
+    }
+  }
+  return n;
+}
+
+function addToolResultListChars(ctx: CwUserInputMessage["userInputMessageContext"]): number {
+  let n = 0;
+  if (!ctx || !Array.isArray(ctx.toolResults)) return 0;
+  for (const tr of ctx.toolResults) n += addToolResultChars(tr.content);
+  return n;
+}
+
 /**
- * 从原始 CwRequest 中提取各上下文模块的纯字符数
+ * 从原始 CwRequest 中提取各上下文模块的纯字符数。
+ * Built-in / MCP 按 toolSpecification.name 是否以 mcp_ 开头判定（与 Kiro 弹层口径一致）。
  */
 export function extractRawContextBreakdown(req: CwRequest): RawContextBreakdown {
-  let filesChars = 0;
-  let historyChars = 0;
-  let toolsChars = 0;
-  let rulesChars = 0;
-  let currentChars = 0;
+  const raw: RawContextBreakdown = {
+    userPromptsChars: 0,
+    kiroResponsesChars: 0,
+    sessionFilesChars: 0,
+    builtinToolsChars: 0,
+    mcpToolsChars: 0,
+    steeringChars: 0,
+  };
 
   try {
     const state = req?.conversationState;
-    if (!state) {
-      return { filesChars: 0, historyChars: 0, toolsChars: 0, rulesChars: 0, currentChars: 0 };
-    }
+    if (!state) return raw;
 
-    // 1. 系统规则与提示词库
     const activePrompt = activePromptText();
-    if (activePrompt) {
-      rulesChars += activePrompt.length;
-    }
+    if (activePrompt) raw.steeringChars += activePrompt.length;
 
-    // 2. 多轮历史记录
     for (const h of state.history || []) {
       if (h.userInputMessage) {
-        historyChars += countUserMessageChars(h.userInputMessage);
+        const msg = h.userInputMessage;
+        if (msg.content) raw.userPromptsChars += msg.content.length;
+        raw.sessionFilesChars += addSessionFileChars(msg.userInputMessageContext);
+        raw.steeringChars += addAdditionalContextChars(msg.userInputMessageContext);
+        raw.kiroResponsesChars += addToolResultListChars(msg.userInputMessageContext);
       }
       if (h.assistantResponseMessage) {
         const arm = h.assistantResponseMessage;
-        if (arm.content) historyChars += arm.content.length;
+        if (arm.content) raw.kiroResponsesChars += arm.content.length;
         if (arm.reasoningContent) {
           if (typeof arm.reasoningContent === "string") {
-            historyChars += arm.reasoningContent.length;
+            raw.kiroResponsesChars += arm.reasoningContent.length;
           } else if (arm.reasoningContent.reasoningText?.text) {
-            historyChars += arm.reasoningContent.reasoningText.text.length;
+            raw.kiroResponsesChars += arm.reasoningContent.reasoningText.text.length;
           }
         }
         if (arm.toolUses) {
           for (const tu of arm.toolUses) {
-            historyChars += (tu.name || "").length;
-            if (tu.input) historyChars += JSON.stringify(tu.input).length;
+            raw.kiroResponsesChars += (tu.name || "").length;
+            if (tu.input) raw.kiroResponsesChars += JSON.stringify(tu.input).length;
           }
         }
       }
     }
 
-    // 3. 当前轮消息
     const currMsg = state.currentMessage?.userInputMessage;
     if (currMsg) {
-      // 当前用户输入文本
-      if (currMsg.content) {
-        currentChars += currMsg.content.length;
-      }
-
+      if (currMsg.content) raw.userPromptsChars += currMsg.content.length;
       const ctx = currMsg.userInputMessageContext;
       if (ctx) {
-        // 工作区文件
-        if (ctx.editorState) {
-          if (ctx.editorState.document?.text) {
-            filesChars += ctx.editorState.document.text.length;
-          }
-          if (Array.isArray(ctx.editorState.relevantDocuments)) {
-            for (const doc of ctx.editorState.relevantDocuments) {
-              if (doc?.text) filesChars += doc.text.length;
-            }
-          }
-        }
-
-        // 规则与扩展上下文
-        if (Array.isArray(ctx.additionalContext)) {
-          for (const ac of ctx.additionalContext) {
-            if (ac.innerContext) rulesChars += ac.innerContext.length;
-            if (ac.description) rulesChars += ac.description.length;
-          }
-        }
-
-        // 工具定义
+        raw.sessionFilesChars += addSessionFileChars(ctx);
+        raw.steeringChars += addAdditionalContextChars(ctx);
         if (Array.isArray(ctx.tools)) {
           for (const t of ctx.tools) {
-            toolsChars += JSON.stringify(t).length;
+            const n = JSON.stringify(t).length;
+            if (isMcpToolName(toolSpecName(t))) raw.mcpToolsChars += n;
+            else raw.builtinToolsChars += n;
           }
         }
-
-        // 当前轮如果是工具返回继续执行
-        if (Array.isArray(ctx.toolResults)) {
-          for (const tr of ctx.toolResults) {
-            if (typeof tr.content === "string") {
-              currentChars += tr.content.length;
-            } else if (tr.content != null) {
-              currentChars += JSON.stringify(tr.content).length;
-            }
-          }
-        }
+        raw.kiroResponsesChars += addToolResultListChars(ctx);
       }
     }
   } catch {
     // 忽略解析偶发异常，兜底返回零
   }
 
-  return { filesChars, historyChars, toolsChars, rulesChars, currentChars };
+  return raw;
 }
 
-function countUserMessageChars(msg: CwUserInputMessage): number {
-  let chars = 0;
-  if (msg.content) chars += msg.content.length;
-  const ctx = msg.userInputMessageContext;
-  if (ctx) {
-    if (ctx.editorState?.document?.text) chars += ctx.editorState.document.text.length;
-    if (Array.isArray(ctx.editorState?.relevantDocuments)) {
-      for (const d of ctx.editorState.relevantDocuments) if (d?.text) chars += d.text.length;
-    }
-    if (Array.isArray(ctx.additionalContext)) {
-      for (const ac of ctx.additionalContext) {
-        if (ac.innerContext) chars += ac.innerContext.length;
-      }
-    }
-    if (Array.isArray(ctx.toolResults)) {
-      for (const tr of ctx.toolResults) {
-        if (typeof tr.content === "string") chars += tr.content.length;
-        else if (tr.content) chars += JSON.stringify(tr.content).length;
-      }
-    }
-  }
-  return chars;
+function emptyBreakdown(): ContextBreakdown {
+  return {
+    userPromptsTokens: 0,
+    kiroResponsesTokens: 0,
+    sessionFilesTokens: 0,
+    builtinToolsTokens: 0,
+    mcpToolsTokens: 0,
+    steeringTokens: 0,
+  };
 }
 
 /**
- * 按照实际账单 inputTokens 严格无损分配到各微观类别（保证各项之和严格等于 inputTokens）
+ * 按照实际账单 inputTokens 严格无损分配到六桶（各项之和严格等于 inputTokens）。
+ * 余数归用户提示；总字符 0 → 全部归用户提示。
  */
 export function allocateContextTokens(raw: RawContextBreakdown, inputTokens: number): ContextBreakdown {
-  if (inputTokens <= 0) {
-    return { filesTokens: 0, historyTokens: 0, toolsTokens: 0, rulesTokens: 0, currentInputTokens: 0 };
-  }
+  if (inputTokens <= 0) return emptyBreakdown();
 
-  const totalChars = raw.filesChars + raw.historyChars + raw.toolsChars + raw.rulesChars + raw.currentChars;
+  const weights = [
+    raw.userPromptsChars,
+    raw.kiroResponsesChars,
+    raw.sessionFilesChars,
+    raw.builtinToolsChars,
+    raw.mcpToolsChars,
+    raw.steeringChars,
+  ];
+  const totalChars = weights.reduce((a, b) => a + b, 0);
   if (totalChars <= 0) {
-    // 若未能提取到具体字段，默认全部归为当前输入
-    return { filesTokens: 0, historyTokens: 0, toolsTokens: 0, rulesTokens: 0, currentInputTokens: inputTokens };
+    return { ...emptyBreakdown(), userPromptsTokens: inputTokens };
   }
 
-  // 比例分配，向下取整
-  const filesTokens = Math.floor((raw.filesChars / totalChars) * inputTokens);
-  const historyTokens = Math.floor((raw.historyChars / totalChars) * inputTokens);
-  const toolsTokens = Math.floor((raw.toolsChars / totalChars) * inputTokens);
-  const rulesTokens = Math.floor((raw.rulesChars / totalChars) * inputTokens);
+  const floors = weights.map((w) => Math.floor((w / totalChars) * inputTokens));
+  const allocated = floors.reduce((a, b) => a + b, 0);
+  floors[0] += Math.max(0, inputTokens - allocated);
 
-  // 余数归入最大一项或当前输入，确保各项之和 === inputTokens (物理绝对守恒)
-  const allocated = filesTokens + historyTokens + toolsTokens + rulesTokens;
-  const currentInputTokens = Math.max(0, inputTokens - allocated);
-
-  return { filesTokens, historyTokens, toolsTokens, rulesTokens, currentInputTokens };
+  return {
+    userPromptsTokens: floors[0],
+    kiroResponsesTokens: floors[1],
+    sessionFilesTokens: floors[2],
+    builtinToolsTokens: floors[3],
+    mcpToolsTokens: floors[4],
+    steeringTokens: floors[5],
+  };
 }
+
+export function isLegacyBreakdown(cb: unknown): cb is LegacyContextBreakdown {
+  if (!cb || typeof cb !== "object") return false;
+  const o = cb as Record<string, unknown>;
+  return typeof o.filesTokens === "number" && typeof o.userPromptsTokens !== "number";
+}
+
+export function isSixBreakdown(cb: unknown): cb is ContextBreakdown {
+  if (!cb || typeof cb !== "object") return false;
+  const o = cb as Record<string, unknown>;
+  return typeof o.userPromptsTokens === "number";
+}
+
+export function emptyNormalized(): NormalizedBreakdown {
+  return {
+    userPromptsTokens: 0,
+    kiroResponsesTokens: 0,
+    sessionFilesTokens: 0,
+    builtinToolsTokens: 0,
+    mcpToolsTokens: 0,
+    steeringTokens: 0,
+    legacyTokens: 0,
+  };
+}
+
+/** 旧五字段：files→sessionFiles、rules→steering，其余进 legacy（拆不开）。 */
+export function normalizeBreakdown(cb: unknown): NormalizedBreakdown {
+  const z = emptyNormalized();
+  if (!cb || typeof cb !== "object") return z;
+  if (isSixBreakdown(cb)) {
+    z.userPromptsTokens = cb.userPromptsTokens || 0;
+    z.kiroResponsesTokens = cb.kiroResponsesTokens || 0;
+    z.sessionFilesTokens = cb.sessionFilesTokens || 0;
+    z.builtinToolsTokens = cb.builtinToolsTokens || 0;
+    z.mcpToolsTokens = cb.mcpToolsTokens || 0;
+    z.steeringTokens = cb.steeringTokens || 0;
+    const extra = (cb as { legacyTokens?: number }).legacyTokens;
+    z.legacyTokens = typeof extra === "number" ? extra : 0;
+    return z;
+  }
+  if (isLegacyBreakdown(cb)) {
+    z.sessionFilesTokens = cb.filesTokens || 0;
+    z.steeringTokens = cb.rulesTokens || 0;
+    z.legacyTokens = (cb.historyTokens || 0) + (cb.toolsTokens || 0) + (cb.currentInputTokens || 0);
+    return z;
+  }
+  return z;
+}
+
+export function breakdownSum(n: NormalizedBreakdown): number {
+  return (
+    n.userPromptsTokens +
+    n.kiroResponsesTokens +
+    n.sessionFilesTokens +
+    n.builtinToolsTokens +
+    n.mcpToolsTokens +
+    n.steeringTokens +
+    n.legacyTokens
+  );
+}
+
+export { SIX_KEYS };

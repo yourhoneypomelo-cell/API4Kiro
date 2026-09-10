@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import { StringDecoder } from "string_decoder";
 import { CwRequest } from "./cwTypes";
 import { EVENT_STREAM_CONTENT_TYPE, EventStreamDecoder, encodeException } from "./eventstream";
+import { CONTEXT_OVERFLOW_USER_HINT, contextOverflowException, looksLikeContextOverflow } from "./contextOverflow";
 import { rememberKiroClientHeaders } from "./oauth/vendors";
 import { writeEvent } from "./cwEvents";
 import { AnthropicStreamConverter } from "./anthropicStream";
@@ -1190,7 +1191,9 @@ export class KrsProxyServer {
         recordFailure(upstream.statusCode, errText);
         this.beginEventStream(res);
         writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
-        let hint = upstreamErrorHint(upstream.statusCode, errText, provider, wire);
+        // 上下文超长（4.13.55）：异常帧改成 Kiro 认得的形状，让它自动压缩后重试（见 contextOverflow.ts 文件头）
+        const overflow = looksLikeContextOverflow(upstream.statusCode, errText);
+        let hint = overflow ? CONTEXT_OVERFLOW_USER_HINT : upstreamErrorHint(upstream.statusCode, errText, provider, wire);
         if (opts.forcedImage && looksLikeImageRejection(upstream.statusCode, errText)) {
           hint =
             `这个模型在「${provider.name}」的编辑弹窗里被手动设成了「支持图片」，但上游拒绝了图片输入。` +
@@ -1209,7 +1212,13 @@ export class KrsProxyServer {
           },
         });
         writeEvent(res, stopReasonEvent("END_TURN"));
-        res.write(encodeException("InternalServerException", { message: `Upstream ${upstream.statusCode}` }));
+        if (overflow) {
+          const ex = contextOverflowException(upstream.statusCode, errText);
+          info(`upstream ${upstream.statusCode} looks like context overflow → ValidationException/${ex.payload.reason} for Kiro auto-compaction`);
+          res.write(encodeException(ex.exceptionType, ex.payload));
+        } else {
+          res.write(encodeException("InternalServerException", { message: `Upstream ${upstream.statusCode}` }));
+        }
         res.end();
         return;
       }
@@ -1265,7 +1274,8 @@ export class KrsProxyServer {
       if (!outcome.metaWritten) {
         writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
       }
-      let hint = upstreamErrorHint(seStatus, seText, provider, wire);
+      const seOverflow = looksLikeContextOverflow(seStatus, seText);
+      let hint = seOverflow ? CONTEXT_OVERFLOW_USER_HINT : upstreamErrorHint(seStatus, seText, provider, wire);
       if (pool && poolStatus(provider).cooling === poolStatus(provider).configured) {
         hint = poolExhaustedHint(provider) + (hint ? `\n\n${hint}` : "");
       } else if (pool && triedCreds.size > 1) {
@@ -1275,7 +1285,13 @@ export class KrsProxyServer {
         assistantResponseEvent: { content: `❌ 上游在流中返回错误：${seText.slice(0, 800)}${hint ? `\n\n💡 ${hint}` : ""}`, modelId },
       });
       writeEvent(res, stopReasonEvent("END_TURN"));
-      res.write(encodeException("InternalServerException", { message: "Upstream stream error" }));
+      if (seOverflow) {
+        const ex = contextOverflowException(seStatus, seText);
+        info(`upstream stream error looks like context overflow → ValidationException/${ex.payload.reason} for Kiro auto-compaction`);
+        res.write(encodeException(ex.exceptionType, ex.payload));
+      } else {
+        res.write(encodeException("InternalServerException", { message: "Upstream stream error" }));
+      }
       res.end();
       return;
     }

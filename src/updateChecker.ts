@@ -2,12 +2,12 @@
  * GitHub Release 更新检查与自更新。本扩展不在应用市场发布，"和 GitHub 同步" = 查仓库最新 Release
  * （`api.github.com/repos/<owner>/<repo>/releases/latest`），tag 比当前 `package.json` 版本新就提示。
  * - 启动静默查（`checkForUpdate`）：24h 一次，同一个新版本只弹一次通知（globalState 记忆）；通知给「立即更新」。
- * - 手动「检查更新」（面板头部图标 / 设置页按钮，`installLatestFromGitHub`）：查最新 Release → 有新版就把 Release 里的
+ * - 手动「检查更新」（视图标题栏云朵标 / 设置页按钮，`installLatestFromGitHub`）：查最新 Release → 有新版就把 Release 里的
  *   `api2kiro-dual-<ver>.vsix` 资产下载到 `globalStorageUri/updates/`，校验（zip 头 + 大小 + 包内 package.json 的 name /
  *   version）后调 `workbench.extensions.installExtension` 安装，再提示重载窗口；已是最新 / 失败都给结果。
  * 网络只读、只对 GitHub 域（api.github.com / github.com / objects.githubusercontent.com / release-assets.githubusercontent.com）；
  * 不带任何凭证；离线 / 限流 / 无 Release 时静默查安静失败，手动查给出原因并留「打开 Release 页」兜底。
- * 面板头部「检查更新」图标的小圆点由 `UpdateState`（`getUpdateState` / `onUpdateStateChanged`）驱动。
+ * 标题栏「有新版」靠 `setContext(api2kiroDual.updateAvailable)` 在两条命令间切换；设置页按钮文案由 `UpdateState` 驱动。
  */
 import * as vscode from "vscode";
 import * as fs from "fs";
@@ -22,6 +22,8 @@ export const GITHUB_REPO = "API4Kiro";
 export const GITHUB_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`;
 export const GITHUB_RELEASES_URL = `${GITHUB_URL}/releases`;
 export const GITHUB_LATEST_RELEASE_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
+/** 标题栏 `view/title` 用来在「检查更新」/「有新版本」两条命令间切换的 context key。 */
+export const UPDATE_AVAILABLE_CONTEXT = "api2kiroDual.updateAvailable";
 /** 扩展内部 id（`package.json.name`）；Release 资产名与包内 package.json 都按它校验。 */
 export const EXTENSION_NAME = "api2kiro-dual";
 /** 单个 vsix 资产的大小上限（当前包不到 1 MB；超过它一定不是本扩展的包）。 */
@@ -271,8 +273,13 @@ export function onUpdateStateChanged(listener: (s: UpdateState) => void): vscode
   return { dispose: () => void stateListeners.delete(listener) };
 }
 
+function publishUpdateAvailable(hasUpdate: boolean): void {
+  void vscode.commands.executeCommand("setContext", UPDATE_AVAILABLE_CONTEXT, hasUpdate).then(undefined, () => undefined);
+}
+
 function setUpdateState(patch: Partial<UpdateState>): void {
   updateState = { ...updateState, ...patch };
+  publishUpdateAvailable(updateState.hasUpdate);
   const snapshot = getUpdateState();
   for (const l of Array.from(stateListeners)) {
     try {
@@ -287,6 +294,7 @@ function setUpdateState(patch: Partial<UpdateState>): void {
 export function _resetUpdateStateForTest(): void {
   updateState = { current: "", hasUpdate: false, busy: false };
   stateListeners.clear();
+  publishUpdateAvailable(false);
 }
 
 function currentVersionOf(context: vscode.ExtensionContext): string {

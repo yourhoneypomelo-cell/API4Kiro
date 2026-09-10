@@ -16,11 +16,14 @@ import {
   getProvider,
   isModelEnabled,
   isOAuthProvider,
+  kiroModelIds,
   overrideFor,
   resolveApiUrl,
   splitQualifiedModelId,
 } from "./providers";
 import { ModelCapability, lookupCapability, normalizeModelId } from "./modelCatalog";
+import { getContextWindowOverride } from "./config";
+import { ContextWindowInfo, resolveContextWindow } from "./contextWindow";
 import { VendorModel, getVendor } from "./oauth/vendors";
 import { ensureAccessToken, vendorModelsFor } from "./oauth";
 
@@ -160,6 +163,10 @@ export interface RelayModel {
   /** provider 的协议，路由据此决定 /messages 还是 /chat/completions。 */
   protocol: Protocol;
   contextWindow?: number;
+  /** 渠道 `/models` 条目自带的窗口字段（或 Kiro 官方 ListAvailableModels 的 maxInputTokens）；`contextWindow` 已混入目录兜底，这里只记上游原值（4.13.55 挡位来源用）。 */
+  upstreamContextWindow?: number;
+  /** OAuth 厂商内置目录声明的窗口（4.13.55 挡位来源用）。 */
+  vendorContextWindow?: number;
   description?: string;
   effortLevels?: string[];
   effortSchemaPath?: string;
@@ -187,6 +194,8 @@ export interface EffortGroup {
   protocol: Protocol;
   efforts: Set<string>;
   maxInputTokens?: number;
+  upstreamContextWindow?: number;
+  vendorContextWindow?: number;
   description?: string;
   nativeEffortLevels?: string[];
   effortSchemaPath?: string;
@@ -323,6 +332,7 @@ function normalizeModel(x: Record<string, unknown>, p: ProviderConfig): RelayMod
     providerId: p.id,
     protocol: p.protocol,
     contextWindow: cw || cap?.contextWindow,
+    upstreamContextWindow: cw || undefined,
     description: typeof x.description === "string" ? x.description : undefined,
     effortLevels: strArrayField(x, "effort_levels", "effortLevels"),
     effortSchemaPath: strField(x, "effort_schema_path", "effortSchemaPath"),
@@ -345,6 +355,7 @@ function vendorCatalog(p: ProviderConfig): RelayModel[] {
       providerId: p.id,
       protocol: p.protocol,
       contextWindow: m.contextWindow || cap?.contextWindow,
+      vendorContextWindow: m.contextWindow || undefined,
       maxOutputTokens: cap?.maxOutputTokens,
     };
   });
@@ -424,6 +435,7 @@ export async function fetchProviderModels(p: ProviderConfig, force = false): Pro
             protocol: p.protocol,
             description: m.description,
             contextWindow: m.contextWindow,
+            upstreamContextWindow: m.contextWindow || undefined,
             maxOutputTokens: m.maxOutputTokens,
             effortLevels: m.effortLevels,
             effortSchemaPath: m.effortSchemaPath,
@@ -718,6 +730,30 @@ export function contextWindowForModel(id: string): number | undefined {
   return lookupCapability(id)?.contextWindow;
 }
 
+/** 面板模型页每行「上下文」下拉的数据（4.13.55，R24）：按 CPS 同一套折叠 / 命名 / 解析规则算，保证与 Kiro 看到的一致。 */
+export interface ContextWindowRow {
+  /** Kiro 选择器里的模型 id（同名模型第二个渠道起带 `@providerId`），也是 contextWindowOverrides 的键。 */
+  kiroId: string;
+  baseId: string;
+  providerId: string;
+  info: ContextWindowInfo;
+}
+
+export function contextWindowRows(): ContextWindowRow[] {
+  const groups = groupModelsByEffort(mergedCache);
+  const order = new Map(getActiveProviders().map((p, i) => [p.id, i] as const));
+  groups.sort((a, b) => (order.get(a.providerId) ?? 1e9) - (order.get(b.providerId) ?? 1e9));
+  const kiroIds = kiroModelIds(groups.map((g) => ({ id: g.baseId, providerId: g.providerId })));
+  return groups.map((g, i) => {
+    const cap = lookupCapability(g.baseId);
+    const info = resolveContextWindow(
+      { upstream: g.upstreamContextWindow, vendor: g.vendorContextWindow, catalog: cap?.contextWindow },
+      getContextWindowOverride(kiroIds[i])
+    );
+    return { kiroId: kiroIds[i], baseId: g.baseId, providerId: g.providerId, info };
+  });
+}
+
 export function looksReasoningModel(modelId: string, providerId?: string): boolean {
   // 覆盖 > 目录 > 名字推断。
   const decided = resolveModelReasoning(modelId, providerId);
@@ -771,6 +807,12 @@ export function groupModelsByEffort(models: RelayModel[]): EffortGroup[] {
     }
     if (src.contextWindow && !g.maxInputTokens) {
       g.maxInputTokens = src.contextWindow;
+    }
+    if (src.upstreamContextWindow && !g.upstreamContextWindow) {
+      g.upstreamContextWindow = src.upstreamContextWindow;
+    }
+    if (src.vendorContextWindow && !g.vendorContextWindow) {
+      g.vendorContextWindow = src.vendorContextWindow;
     }
     return g;
   };

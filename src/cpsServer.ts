@@ -22,6 +22,8 @@ import {
 import { getEffortMode } from "./effort";
 import type { ModelCapability } from "./modelCatalog";
 import { FORCED_THINKING_EFFORTS, isForcedThinkingModel } from "./thinkingPolicy";
+import { getContextWindowOverride } from "./config";
+import { ContextWindowInfo, formatContextTable, resolveContextWindow } from "./contextWindow";
 
 /**
  * models.dev 目录的 reasoning_options → Kiro 选择器要展示的档位列表。
@@ -180,6 +182,8 @@ export class CpsProxyServer {
     // 同名模型在多个渠道都勾了：第一个渠道用原 id，其余带 @providerId（名字不变）
     const kiroIds = kiroModelIds(groups.map((g) => ({ id: g.baseId, providerId: g.providerId })));
 
+    // 每条模型的上下文挡位信息（4.13.55，R24）：与 models 同下标，供 description 第 5 位与 contextWindowsOf() 复用
+    const ctxInfos: ContextWindowInfo[] = [];
     const models: CpsModel[] = groups.map((g, gi) => {
       const provider = getProvider(g.providerId);
       const official = provider?.anthropicMode === "official";
@@ -189,6 +193,13 @@ export class CpsProxyServer {
       // 图片支持：用户覆盖 > 目录 > 保守认为支持（不误伤）。
       const imgDecided = resolveModelImage(g.baseId, g.providerId);
       const supportsImage = typeof imgDecided === "boolean" ? imgDecided : true;
+      // 上下文窗口：渠道字段 → 厂商目录 → models.dev（只认精确条目）→ 默认 200000；用户覆盖（键 = Kiro 里的模型 id）优先。
+      // Kiro 按 maxInputTokens 算百分比与 80% / 95% 阈值——这里报多少，Kiro 就在多少处压缩。
+      const ctx = resolveContextWindow(
+        { upstream: g.upstreamContextWindow, vendor: g.vendorContextWindow, catalog: cap?.contextWindow },
+        getContextWindowOverride(kiroIds[gi])
+      );
+      ctxInfos.push(ctx);
 
       const model: CpsModel = {
         modelId: kiroIds[gi],
@@ -204,7 +215,7 @@ export class CpsProxyServer {
         rateUnit: "Credit",
         supportedInputTypes: supportsImage ? ["TEXT", "IMAGE"] : ["TEXT"],
         tokenLimits: {
-          maxInputTokens: g.maxInputTokens || cap?.contextWindow || 200000,
+          maxInputTokens: ctx.effective,
           maxOutputTokens: g.maxOutputTokens || cap?.maxOutputTokens || 64000,
         },
       };
@@ -333,9 +344,10 @@ export class CpsProxyServer {
           g.protocol === "kiro" ||
           resolveModelReasoning(g.baseId, g.providerId)
         );
-        // 私有微格式 __A2K_MDL__|推理|图片|窗口|末行：选择器补丁读 p[1] / p[2]、末行靠 endsWith("|1")，
-        // 窗口插在第 3 位不影响它们；Context Usage 弹层补丁读 p[3] 显示真实总窗口（webview 拿不到 tokenLimits）。
-        m.description = `__A2K_MDL__|${hasReasoning ? 1 : 0}|${hasImage ? 1 : 0}|${m.tokenLimits.maxInputTokens}|${isLast ? 1 : 0}`;
+        // 私有微格式 __A2K_MDL__|推理|图片|窗口|挡位表|末行：选择器补丁读 p[1] / p[2]、末行靠 endsWith("|1")，
+        // Context Usage 弹层补丁读 p[3] 显示真实总窗口（webview 拿不到 tokenLimits）；第 5 位（4.13.55）是
+        // `候选,候选,…~来源~已知~解析值`，聊天框「上下文」下拉据此列挡位（见 contextWindow.formatContextTable）。
+        m.description = `__A2K_MDL__|${hasReasoning ? 1 : 0}|${hasImage ? 1 : 0}|${m.tokenLimits.maxInputTokens}|${formatContextTable(ctxInfos[i])}|${isLast ? 1 : 0}`;
         withHeaders.push(m);
       });
       result.models = withHeaders;

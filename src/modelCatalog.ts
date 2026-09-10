@@ -77,7 +77,31 @@ const TIMEOUT_MS = 12000;
 let ctx: vscode.ExtensionContext | undefined;
 let state: CatalogState = { byId: new Map(), providers: new Map(), fetchedAt: 0 };
 
-/** id 规范化：小写、去 provider 前缀（openai/…）、去 effort/思考后缀、去日期版本尾巴。 */
+/**
+ * 去掉 id 尾部的「变体标签」与版本尾巴（不动 provider 前缀）：
+ *  - `:free` / `:batch` / `:thinking` / `:8192` / `:0731` 这类 OpenRouter / nano-gpt 风格的冒号标签（4.13.55；
+ *    此前 `qwen3-coder:free` 查不到精确条目、落到 family 兜底命中无关模型）；
+ *  - `-none|-low|…|-thinking` 思考 / 努力档位后缀；
+ *  - `-20250514` / `-2025-05-14` / `:20250514` 日期版本。
+ */
+function stripVariantSuffixes(s: string): string {
+  // 冒号标签：目录里 207 条带它（:thinking 74 / :free 54 / :0 41 / :8192 …），标签前后是同一模型的变体；
+  // 可叠加（`claude-opus-4.6:thinking:low`）。ollama 风格的 `:30b` / `:120b` 是参数量、指向另一个模型，保留。
+  for (let i = 0; i < 3; i++) {
+    const m = /:([a-z0-9._-]+)$/i.exec(s);
+    if (!m || /^\d+b$/i.test(m[1])) {
+      break;
+    }
+    s = s.slice(0, m.index);
+  }
+  // 去掉常见思考/努力档位后缀
+  s = s.replace(/-(none|minimal|low|medium|high|xhigh|max|thinking)$/i, "");
+  // 去掉结尾的日期版本（-20250514 / -2025-05-14）
+  s = s.replace(/-(\d{8}|\d{4}-\d{2}-\d{2})$/i, "");
+  return s;
+}
+
+/** id 规范化：小写、去 provider 前缀（openai/…）、去 `:tag` 变体标签、去 effort/思考后缀、去日期版本尾巴。 */
 export function normalizeModelId(raw: string): string {
   let s = String(raw || "").toLowerCase().trim();
   if (!s) {
@@ -88,12 +112,20 @@ export function normalizeModelId(raw: string): string {
   if (slash >= 0) {
     s = s.slice(slash + 1);
   }
-  // 去掉常见思考/努力档位后缀
-  s = s.replace(/-(none|minimal|low|medium|high|xhigh|max|thinking)$/i, "");
-  // 去掉结尾的日期版本（-20250514 / -2025-05-14 / :20250514）
-  s = s.replace(/[-:](\d{8}|\d{4}-\d{2}-\d{2})$/i, "");
-  s = s.replace(/-v\d+(\.\d+)?$/i, (m) => m); // 保留 -v4 这类真实版本，不误删
-  return s;
+  return stripVariantSuffixes(s);
+}
+
+/**
+ * 带 provider 前缀的全名键（4.13.55）：`openrouter/free` 与 `orcarouter/free` 去前缀后都是 `free`，只按规范化键查
+ * 会让前者命中目录里先到的后者（65536 vs 200000）。目录条目 id 本身带 `/` 时另登记一把 `full:` 键，
+ * 查询方 id 也带 `/` 时先按全名精确查，再退到去前缀的规范化键。无 `/` 的 id 返回 ""（与规范化键重合，不必登记）。
+ */
+export function fullModelKey(raw: string): string {
+  const s = String(raw || "").toLowerCase().trim();
+  if (!s || s.indexOf("/") < 0) {
+    return "";
+  }
+  return stripVariantSuffixes(s);
 }
 
 function toBoolInput(mods: unknown): ModelCapability["input"] {
@@ -176,21 +208,35 @@ function parseCatalog(json: unknown): { byId: Map<string, ModelCapability>; prov
         contextWindow: typeof limit.context === "number" ? limit.context : undefined,
         maxOutputTokens: typeof limit.output === "number" ? limit.output : undefined,
       };
-      // 同一模型可能被多个 provider 收录；规范化后先到先得，够用。
-      const key = normalizeModelId(mid);
-      if (key && !map.has(key)) {
-        map.set(key, cap);
-      }
-      // 也用 family 兜底一层键，让 deepseek-v4-pro 能命中 family=deepseek 的条目。
-      if (cap.family) {
-        const fkey = normalizeModelId(cap.family);
-        if (fkey && !map.has("family:" + fkey)) {
-          map.set("family:" + fkey, cap);
-        }
-      }
+      registerCapability(map, cap);
     }
   }
   return { byId: map, providers };
+}
+
+/**
+ * 把一条能力登记进索引：规范化键 / 带前缀全名键 / family 别名键，三种键都**先到先得**。
+ * parseCatalog（拉取）、initModelCatalog（快照重建）、resetCatalogForTest 共用同一份规则——4.13.55 之前
+ * 快照重建用的是无条件 `map.set`，重启后「先到先得」变成「后到覆盖」（MiniMax-M2.5 报 65536 而非 204800）。
+ */
+function registerCapability(map: Map<string, ModelCapability>, cap: ModelCapability): void {
+  // 同一模型可能被多个 provider 收录；规范化后先到先得，够用。
+  const key = normalizeModelId(cap.id);
+  if (key && !map.has(key)) {
+    map.set(key, cap);
+  }
+  // 带 provider 前缀的全名（openrouter/free）另登记一把，让带前缀的查询先精确命中自己那条。
+  const full = fullModelKey(cap.id);
+  if (full && !map.has("full:" + full)) {
+    map.set("full:" + full, cap);
+  }
+  // 也用 family 兜底一层键，让 deepseek-v4-pro 能命中 family=deepseek 的条目（只借能力，不借窗口，见 lookupCapability）。
+  if (cap.family) {
+    const fkey = normalizeModelId(cap.family);
+    if (fkey && !map.has("family:" + fkey)) {
+      map.set("family:" + fkey, cap);
+    }
+  }
 }
 
 interface Snapshot {
@@ -211,14 +257,11 @@ export function initModelCatalog(context: vscode.ExtensionContext): void {
   ctx = context;
   const snap = context.globalState.get<Snapshot>(CACHE_KEY);
   if (snap && Array.isArray(snap.models)) {
+    // 快照按首次登记顺序保存（Set 保序），逐条重新登记即可复原「先到先得」。
     const map = new Map<string, ModelCapability>();
     for (const cap of snap.models) {
-      const key = normalizeModelId(cap.id);
-      if (key) {
-        map.set(key, cap);
-      }
-      if (cap.family) {
-        map.set("family:" + normalizeModelId(cap.family), cap);
+      if (cap && typeof cap.id === "string") {
+        registerCapability(map, cap);
       }
     }
     const providers = new Map<string, CatalogProvider>();
@@ -281,10 +324,22 @@ export function catalogProvider(id: string): CatalogProvider | undefined {
 }
 
 /**
- * 查一个模型的能力。先精确规范化匹配，再退到 family 别名。查不到返回 undefined
- * —— 调用方据此回退既有的猜/学逻辑。
+ * 查一个模型的能力。带 `/` 的 id 先按全名精确查，再按去前缀的规范化键精确查，最后退到 family 别名。
+ * 查不到返回 undefined —— 调用方据此回退既有的猜/学逻辑。
+ *
+ * family 兜底只借「能力」（图片 / 推理 / 档位形态），**不借窗口**：同族另一个模型的 `contextWindow` /
+ * `maxOutputTokens` 与本模型无关（`longcat-flash` 按 family 命中 `longcat-2.0-free` 会报 1,000,000，
+ * 真实只有 128K–256K → 撑爆上游），4.13.55 起返回的副本里这两项为 undefined，上层走下一来源或标「未知」。
+ * 因此：`lookupCapability(id)?.contextWindow` 有值 ⟺ 目录里有该模型自己的条目。
  */
 export function lookupCapability(modelId: string): ModelCapability | undefined {
+  const full = fullModelKey(modelId);
+  if (full) {
+    const byFull = state.byId.get("full:" + full);
+    if (byFull) {
+      return byFull;
+    }
+  }
   const key = normalizeModelId(modelId);
   if (!key) {
     return undefined;
@@ -295,7 +350,11 @@ export function lookupCapability(modelId: string): ModelCapability | undefined {
   }
   // family 兜底：取规范化 id 的第一段（deepseek-v4-pro → deepseek）
   const head = key.split("-")[0];
-  return state.byId.get("family:" + head);
+  const fam = state.byId.get("family:" + head);
+  if (!fam) {
+    return undefined;
+  }
+  return { ...fam, contextWindow: undefined, maxOutputTokens: undefined };
 }
 
 /** 目录是否已就绪（有数据）。 */

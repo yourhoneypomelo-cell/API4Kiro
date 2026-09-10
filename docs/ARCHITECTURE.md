@@ -65,8 +65,9 @@ flowchart LR
 | `endpoints.ts` | Kiro 端点设置的备份 / 重定向 / 复原 | vscode globalState |
 | `portBinder.ts` / `proxyIdentity.ts` | 多窗口共用端口：先到者为主实例，后到者探测端口发现是同类实例即待机；升级后旧实例被识别并让位 | net |
 | `requestGuard.ts` | 两个本地服务的请求来源守卫：Host 回环、无 `Origin`、`Sec-Fetch-Site` 缺失或 `none`、远端回环才放行，否则 403（text/plain，无 CORS 头，限频记日志） | log |
-| `krsServer.ts` | 运行时反代与意图分类本地应答 | 协议模块, credentialPool, usageStore, contextParser, turnLedger, imagePolicy |
-| `cpsServer.ts` | 模型列表广播（把推理 / 图片能力与上下文窗口编码进模型 description，供选择器徽章与弹层读取）、测活、用量查询 | providers, modelStore, usageStore |
+| `krsServer.ts` | 运行时反代与意图分类本地应答；上游超长时回 Kiro ValidationException 触发被动压缩 | 协议模块, credentialPool, usageStore, contextParser, turnLedger, imagePolicy, contextOverflow |
+| `contextWindow.ts` / `contextOverflow.ts` | 每模型挡位解析与 CPS description 往返；上游超长判定 | 无 |
+| `cpsServer.ts` | 模型列表广播（把推理 / 图片能力与生效上下文窗口编码进模型 description，供选择器徽章、弹层与 Ctx 下拉读取）、测活、用量查询 | providers, modelStore, usageStore, contextWindow |
 | `providers.ts` / `credentialPool.ts` | 注册表、路由、凭证调度 | oauth/tokenStore, config |
 | `providerProbe.ts` | 对草稿渠道测延迟 / 拉模型 / 测活，不写注册表 | upstream, providers |
 | `modelCatalog.ts` / `modelStore.ts` | models.dev 目录缓存；聚合列表与路由表；学到的模型名单 | globalState, upstream |
@@ -74,9 +75,11 @@ flowchart LR
 | `ccSwitchImport.ts` / `sqliteReader.ts` | 只读解析 `~/.cc-switch/cc-switch.db` 导入渠道 | fs |
 | `usageStore.ts` / `turnLedger.ts` / `contextParser.ts` | 账本、整轮累计、上下文分项 | cwTypes, promptStore |
 | `promptStore.ts` | 提示词库（单条启用，注入 system） | globalState |
-| `sidebar.ts` | Webview 四页模板与图表（趋势、Sankey、上下文卡） | 各 store, providerProbe, ccSwitchImport |
-| `selectorStyle.ts` | Kiro 三处靶文件的补丁 / 复原 / 漂移检测；通道 A 刷新 | Kiro 安装目录文件 |
-| `updateChecker.ts` | GitHub `releases/latest` 只读拉取、版本比较、通知 | https |
+| `sidebar.ts` | Webview 四页模板与图表（趋势、六层 Sankey、路径条、设置页 MCP / 子代理 / 上下文卡） | 各 store, providerProbe, ccSwitchImport, mcpConfig, agentConfig, contextWindow, updateChecker |
+| `mcpConfig.ts` | 直管 Kiro 两份 mcp.json：容错 JSONC、原子写、备份、监听 | fs |
+| `agentConfig.ts` | 直管两级自定义 agent 文件（md / json），写回保留未知块 | fs |
+| `selectorStyle.ts` | Kiro 三处靶文件的补丁 / 复原 / 漂移检测；通道 A 刷新；聊天框 Ctx 下拉与宿主转发钩子 | Kiro 安装目录文件 |
+| `updateChecker.ts` | GitHub Release 更新检查与自更新（下载 vsix → 校验 → installExtension） | https |
 | `eventstream.ts` / `cwEvents.ts` / `cwTypes.ts` | CodeWhisperer 协议编解码与类型 | 无 |
 
 ## Key 池状态机
@@ -107,8 +110,8 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 | 靶文件（相对 Kiro 安装目录） | 补丁内容 |
 | --- | --- |
 | `extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/style.css` | 分组标题 / 卡片 / 弹层样式（全部限定在扩展自己的类名作用域内） |
-| `extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/assets/mermaid-*.js` | 选择器组头渲染；Context Usage 弹层改为读 description 里的真实窗口 |
-| `extensions/kiro.kiro-agent/dist/extension.js` | 在模型配置 provider 的 setter 上挂钩子，暴露给同宿主的本扩展，用于「通道 A」静默刷新 |
+| `extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist/assets/mermaid-*.js` | 选择器组头渲染；Context Usage 弹层改为读 description 里的真实窗口；Effort 旁「Ctx」挡位下拉 |
+| `extensions/kiro.kiro-agent/dist/extension.js` | 在模型配置 provider 的 setter 上挂钩子，暴露给同宿主的本扩展，用于「通道 A」静默刷新；`a2k:ctx` 挡位转发 |
 
 约束与机制：
 

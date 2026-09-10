@@ -2,7 +2,26 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import { readdirSync } from "fs";
-import { isEnabled, updateSetting } from "./config";
+import { clearContextWindowOverrides, getContextWindowOverrides, isEnabled, setContextWindowOverride, updateSetting } from "./config";
+import {
+  AgentEntry,
+  AgentFields,
+  AgentRoots,
+  AgentWatcher,
+  BUILTIN_MODE_IDS,
+  DISPATCH_KINDS,
+  DispatchKind,
+  defaultAgentRoots,
+  deleteAgent,
+  importAgent,
+  isInsideAgentRoots,
+  listAgents,
+  listSteeringFiles,
+  steeringDirs,
+  upsertAgent,
+  watchAgents,
+} from "./agentConfig";
+import { formatContextTokens, normalizeContextOverride } from "./contextWindow";
 import { GITHUB_URL, getUpdateState, installLatestFromGitHub, onUpdateStateChanged } from "./updateChecker";
 import {
   PRESETS,
@@ -31,8 +50,8 @@ import {
   tokenKeyOf,
 } from "./providers";
 import { clearCooldown, credentialRuntimes, forgetCredential, poolStatus, reasonText } from "./credentialPool";
-import { maskKey, error } from "./log";
-import { RelayModel, capabilitySource, fetchAllModels, fetchProviderModels, resolveModelImage, resolveModelReasoning, seedProviderModels } from "./modelStore";
+import { maskKey, error, warn } from "./log";
+import { RelayModel, capabilitySource, contextWindowRows, fetchAllModels, fetchProviderModels, resolveModelImage, resolveModelReasoning, seedProviderModels } from "./modelStore";
 import { catalogSize, onCatalogChanged, refreshCatalog } from "./modelCatalog";
 import {
   RangePreset,
@@ -46,7 +65,9 @@ import {
   getModelUsageRatios,
   getSankeyData,
   getUsageAnalyticsStats,
+  normalizeLayers,
   onUsageChanged,
+  readSankeyLayersState,
   recentRecords,
   resolveRange,
   statsByProvider,
@@ -64,6 +85,25 @@ import { BatchHandle, ProviderDraft, measureLatency, probeModels, testModels } f
 import { RECOMMENDED_COUNT, apiFormatOf, autoIconId, isOAuthProvider, normalizeIcon, presetIconId, providerFromOAuthVendor, providerIconId, vendorIconId } from "./providers";
 import { LoginMode, OAUTH_VENDORS, getVendor } from "./oauth/vendors";
 import { APP_LABEL, ScanResult, candidateToProvider, findCcSwitchStore, scanCcSwitch } from "./ccSwitchImport";
+import {
+  CcSwitchMcpScan,
+  KIRO_MCP,
+  McpConfigError,
+  McpScope,
+  McpWatcher,
+  deleteServer as mcpDeleteServer,
+  ensureMcpFile,
+  getServer as mcpGetServer,
+  importServers as mcpImportServers,
+  importSnippet as mcpImportSnippet,
+  listServers as mcpListServers,
+  scanCcSwitchMcp,
+  setDisabled as mcpSetDisabled,
+  upsertServer as mcpUpsertServer,
+  validateServer as mcpValidateServer,
+  watchMcpFiles,
+} from "./mcpConfig";
+import { readTable } from "./sqliteReader";
 import { isHttpUrl, openInBrowser } from "./openBrowser";
 import { copyToken, deleteProviderTokens, deleteToken, getToken, moveToken, onTokensChanged, setToken } from "./oauth/tokenStore";
 
@@ -191,6 +231,8 @@ const ICONS = {
   import: svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>'),
   /** 头部「检查更新」：云 + 向下箭头（Feather download-cloud）——从远端（GitHub Release）取回并安装。 */
   cloudDown: svg('<path d="M20.9 18.1A5 5 0 0 0 18 9h-1.3A8 8 0 1 0 3 16.3"/><path d="M12 12v9"/><path d="m8 17 4 4 4-4"/>'),
+  /** 路径条说明：圆 + 竖线 + 点（Lucide info） */
+  info: svg('<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>'),
   /** 加号：池底部「再登录一个账号 / 再加一把 Key」的方形小按钮（Lucide plus，线条加粗到 2.4 免得 15px 下发虚）。 */
   plus: svg('<path d="M5 12h14"/><path d="M12 5v14"/>', 2.4),
   /**
@@ -224,6 +266,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private oauthCreated = new Map<string, string>();
   /** 上一次「从 CC Switch 导入」扫出来的候选（含明文 key，只留在扩展侧；webview 里按 idx 勾选）。 */
   private ccScan: ScanResult | undefined;
+  /** `.kiro/agents` 两级目录监听（fs.watch + 目录出现轮询）；workspace folders 变化时重建。 */
+  private agentWatcher: AgentWatcher | undefined;
+  /** cc-switch `mcp_servers` 表的扫描结果（含 env / headers 明文，只留扩展侧；webview 按 id 勾选） */
+  private mcpCcScan?: CcSwitchMcpScan;
+  /** 两份 mcp.json 所在目录的监视器：外部（Kiro / 编辑器）改动 → 300 ms 后重推列表 */
+  private mcpWatcher?: McpWatcher;
 
   constructor(context: vscode.ExtensionContext, getPorts: () => PortInfo) {
     this.context = context;
@@ -269,8 +317,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
       })
     );
-    // 更新状态（启动静默查到新版 / 检查更新进行中 / 已装好待重载）→ 头部「检查更新」图标的小圆点与转圈
+    // 更新状态（启动静默查到新版 / 检查更新进行中 / 已装好待重载）→ 设置页按钮文案 + 标题栏 context key
     context.subscriptions.push(onUpdateStateChanged(() => this.postUpdateState()));
+    this.mcpWatcher = watchMcpFiles(() => this.postMcp(), this.mcpPathOpts());
+    context.subscriptions.push({ dispose: () => this.mcpWatcher?.dispose() });
+    this.startAgentWatcher();
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.startAgentWatcher()));
+    context.subscriptions.push({ dispose: () => this.agentWatcher?.dispose() });
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -293,6 +346,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     } else {
       void vscode.commands.executeCommand("api2kiroDual.panel.focus");
     }
+  }
+
+  /** 标题栏 / 设置页「检查更新」共用：查 GitHub 最新 Release → 有新版就下载、校验、安装、提示重载。 */
+  async checkUpdate(): Promise<void> {
+    await installLatestFromGitHub(this.context, { toast: (k, m) => this.toast(k, m) });
   }
 
   private async onMessage(msg: { type: string; [k: string]: unknown }): Promise<void> {
@@ -652,6 +710,54 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case "setCtxWindow": {
+        // 模型页每行「上下文」下拉（4.13.55，目标 A4）：modelId 是 Kiro 选择器里的 id（含 @providerId 限定），
+        // tokens 为空 / 0 / 非法 = 回到自动。选中的正是解析值时也按「清除覆盖」处理——用户是想回到跟随目录，不是钉死。
+        const modelId = String(msg.modelId || "").trim();
+        if (!modelId) {
+          this.toast("error", "参数无效");
+          break;
+        }
+        const tokens = normalizeContextOverride(msg.tokens) ?? null;
+        const r = await this.applyContextWindowOverride(modelId, tokens, "panel");
+        if (!r.settingsOk) {
+          this.toast("error", "已本地记录，但写入 Kiro 设置失败:" + (r.error || "未知错误"));
+        } else {
+          this.toast("ok", tokens ? `${modelId} 上下文 → ${formatContextTokens(tokens)}` : `${modelId} 上下文 → 自动`);
+        }
+        break;
+      }
+
+      case "ctxResetAll": {
+        const count = Object.keys(getContextWindowOverrides()).length;
+        if (!count) {
+          this.toast("ok", "没有需要重置的上下文覆盖");
+          this.postCtxWindows();
+          break;
+        }
+        const resetOk =
+          msg.confirmed === true
+            ? "全部重置"
+            : await vscode.window.showWarningMessage(`清除 ${count} 个模型的上下文覆盖，回到自动？`, { modal: true }, "全部重置");
+        if (resetOk !== "全部重置") {
+          break;
+        }
+        this.selfWriteUntil = Date.now() + 1500;
+        let settleChannelA!: (ok: boolean) => void;
+        this.channelA = new Promise<boolean>((resolve) => (settleChannelA = resolve));
+        const r = await clearContextWindowOverrides();
+        void vscode.commands
+          .executeCommand<boolean>("api2kiroDual.refreshActiveSession")
+          .then((ok) => settleChannelA(ok === true), () => settleChannelA(false));
+        this.postCtxWindows();
+        if (!r.settingsOk) {
+          this.toast("error", "已本地记录，但写入 Kiro 设置失败:" + (r.error || "未知错误"));
+        } else {
+          this.toast("ok", `已清除 ${count} 个上下文覆盖，全部回到自动`);
+        }
+        break;
+      }
+
       case "toggleProvider": {
         const id = String(msg.id);
         const list = getProviders();
@@ -980,9 +1086,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       }
 
       case "checkUpdate":
-        // 头部图标与设置页「检查更新」共用：查 GitHub 最新 Release → 有新版就下载 vsix 资产、校验、安装、提示重载；
-        // 已最新 / 失败 / 取消都由 updateChecker 自己给通知，这里只处理「正在进行中」的重复点击 toast
-        await installLatestFromGitHub(this.context, { toast: (k, m) => this.toast(k, m) });
+        await this.checkUpdate();
         break;
 
       case "copyText": {
@@ -1021,6 +1125,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         const r = String(msg.range || "today");
         this.usageRange = r === "7d" || r === "30d" || r === "all" ? r : "today";
         this.postUsage();
+        break;
+      }
+
+      case "sankeyLayers": {
+        const dim = msg.dim === "requests" ? "requests" : "tokens";
+        const cur = readSankeyLayersState(this.context.globalState.get("ui.sankeyLayers"));
+        cur[dim] = normalizeLayers(msg.layers, dim);
+        void this.context.globalState.update("ui.sankeyLayers", cur).then(() => this.postUsage());
         break;
       }
 
@@ -1158,6 +1270,323 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         this.postPrompts();
         break;
       }
+
+      // ---------- 设置页 · MCP 服务器（直接读写 Kiro 的 mcp.json） ----------
+      case "mcpList": {
+        this.postMcp();
+        break;
+      }
+
+      case "mcpGet": {
+        // 只在打开编辑弹窗时把完整 env / headers 发给 webview
+        const scope = this.mcpScopeOf(msg.scope);
+        const name = String(msg.name || "");
+        try {
+          const server = mcpGetServer(scope, name, this.mcpPathOpts());
+          if (!server) {
+            this.toast("error", `没有名为「${name}」的服务器（文件可能刚被改过）`);
+            this.postMcp();
+            break;
+          }
+          this.post({ type: "mcpServer", scope, name, server });
+        } catch (e) {
+          this.toast("error", "读取失败：" + this.mcpErr(e));
+        }
+        break;
+      }
+
+      case "mcpSave": {
+        const scope = this.mcpScopeOf(msg.scope);
+        const name = String(msg.name || "").trim();
+        const originalName = typeof msg.originalName === "string" && msg.originalName ? msg.originalName : undefined;
+        const patch = msg.server && typeof msg.server === "object" ? (msg.server as Record<string, unknown>) : {};
+        try {
+          const opts = this.mcpPathOpts();
+          const info = mcpListServers(scope, opts);
+          if (info.error) {
+            throw new McpConfigError(info.error, "EJSON");
+          }
+          // 宿主侧复核：以合并后的对象校验（表单只发了差量）
+          const existing = originalName ? mcpGetServer(scope, originalName, opts) : mcpGetServer(scope, name, opts);
+          const merged: Record<string, unknown> = { ...(existing ?? {}) };
+          for (const [k, v] of Object.entries(patch)) {
+            if (v === null || v === undefined) {
+              delete merged[k];
+            } else {
+              merged[k] = v;
+            }
+          }
+          const errs = mcpValidateServer(name, merged, { existingNames: info.servers.map((s) => s.name), originalName });
+          if (errs.length) {
+            this.toast("error", errs[0]);
+            break;
+          }
+          await mcpUpsertServer(scope, name, patch, { ...opts, originalName });
+          this.toast("ok", originalName ? `已保存「${name}」，Kiro 会自动重连` : `已添加「${name}」`);
+        } catch (e) {
+          this.toast("error", "保存失败：" + this.mcpErr(e));
+        }
+        this.postMcp();
+        break;
+      }
+
+      case "mcpDelete": {
+        const scope = this.mcpScopeOf(msg.scope);
+        const name = String(msg.name || "");
+        if (msg.confirmed !== true) {
+          break;
+        }
+        try {
+          const ok = await mcpDeleteServer(scope, name, this.mcpPathOpts());
+          this.toast(ok ? "ok" : "error", ok ? `已删除「${name}」` : `没有名为「${name}」的服务器`);
+        } catch (e) {
+          this.toast("error", "删除失败：" + this.mcpErr(e));
+        }
+        this.postMcp();
+        break;
+      }
+
+      case "mcpToggle": {
+        const scope = this.mcpScopeOf(msg.scope);
+        const name = String(msg.name || "");
+        const disabled = msg.disabled === true;
+        try {
+          await mcpSetDisabled(scope, name, disabled, this.mcpPathOpts());
+          this.toast("ok", disabled ? `已停用「${name}」` : `已启用「${name}」，Kiro 会自动连接`);
+        } catch (e) {
+          this.toast("error", this.mcpErr(e));
+        }
+        this.postMcp();
+        break;
+      }
+
+      case "mcpImport": {
+        const scope = this.mcpScopeOf(msg.scope);
+        try {
+          const r = await mcpImportSnippet(scope, String(msg.text || ""), {
+            ...this.mcpPathOpts(),
+            name: typeof msg.name === "string" ? msg.name : undefined,
+            overwrite: msg.overwrite === true,
+            enable: msg.enable !== false,
+          });
+          const parts = [];
+          if (r.added.length) parts.push(`新增 ${r.added.length} 台`);
+          if (r.overwritten.length) parts.push(`覆盖 ${r.overwritten.length} 台`);
+          if (r.conflicts.length) parts.push(`${r.conflicts.length} 台同名未覆盖`);
+          if (r.skipped.length) parts.push(`跳过 ${r.skipped.length} 台`);
+          const changed = r.added.length + r.overwritten.length > 0;
+          this.toast(changed ? "ok" : "error", changed ? `已导入：${parts.join("，")}` : `没有导入任何服务器${parts.length ? `（${parts.join("，")}）` : ""}`);
+          this.post({ type: "mcpImportDone", ok: changed, result: r });
+        } catch (e) {
+          this.toast("error", "导入失败：" + this.mcpErr(e));
+          this.post({ type: "mcpImportDone", ok: false, error: this.mcpErr(e) });
+        }
+        this.postMcp();
+        break;
+      }
+
+      case "mcpCcScan": {
+        // 从 cc-switch 的 mcp_servers 表只读扫描；候选（含 env 明文）留扩展侧，webview 只拿键名
+        const scope = this.mcpScopeOf(msg.scope);
+        try {
+          const names = mcpListServers(scope, this.mcpPathOpts()).servers.map((s) => s.name);
+          const scan = scanCcSwitchMcp(names, { findStore: findCcSwitchStore, readTable });
+          this.mcpCcScan = scan;
+          this.post({
+            type: "mcpCcResult",
+            scope,
+            path: scan.path || "",
+            items: scan.candidates.map((c) => ({
+              id: c.id,
+              name: c.name,
+              transport: c.transport,
+              summary: c.summary,
+              envKeys: c.envKeys,
+              headerKeys: c.headerKeys,
+              unmapped: c.unmapped,
+              note: c.note || "",
+              exists: c.exists,
+            })),
+            skipped: scan.skipped,
+          });
+        } catch (e) {
+          error("mcp cc-switch scan failed:", this.mcpErr(e));
+          this.post({ type: "mcpCcResult", scope, error: this.mcpErr(e) });
+        }
+        break;
+      }
+
+      case "mcpCcImport": {
+        const scope = this.mcpScopeOf(msg.scope);
+        const ids = new Set(Array.isArray(msg.ids) ? (msg.ids as unknown[]).map(String) : []);
+        const scan = this.mcpCcScan;
+        if (!scan || !ids.size) {
+          this.toast("error", "没有可导入的条目");
+          this.post({ type: "mcpImportDone", ok: false });
+          break;
+        }
+        const entries: Record<string, unknown> = {};
+        for (const c of scan.candidates) {
+          if (ids.has(c.id)) {
+            entries[c.name] = c.server;
+          }
+        }
+        try {
+          const r = await mcpImportServers(scope, entries, { ...this.mcpPathOpts(), overwrite: msg.overwrite === true, enable: msg.enable !== false });
+          const changed = r.added.length + r.overwritten.length > 0;
+          this.toast(changed ? "ok" : "error", changed ? `已从 CC Switch 导入 ${r.added.length + r.overwritten.length} 台 MCP 服务器` : "没有导入任何服务器");
+          this.post({ type: "mcpImportDone", ok: changed, result: r });
+        } catch (e) {
+          this.toast("error", "导入失败：" + this.mcpErr(e));
+          this.post({ type: "mcpImportDone", ok: false, error: this.mcpErr(e) });
+        }
+        this.postMcp();
+        break;
+      }
+
+      case "mcpOpen": {
+        // 优先走 Kiro 自己的命令（不存在则建模板再打开）；命令不可用时自己建文件 + showTextDocument
+        const scope = this.mcpScopeOf(msg.scope);
+        const opts = this.mcpPathOpts();
+        try {
+          await vscode.commands.executeCommand(scope === "workspace" ? KIRO_MCP.openWorkspaceConfig : KIRO_MCP.openUserConfig);
+        } catch (e) {
+          try {
+            const file = await ensureMcpFile(scope, opts);
+            await vscode.window.showTextDocument(vscode.Uri.file(file));
+          } catch (e2) {
+            this.toast("error", "打不开配置文件：" + this.mcpErr(e2));
+          }
+        }
+        break;
+      }
+
+      case "mcpEnableKiro": {
+        try {
+          await vscode.commands.executeCommand(KIRO_MCP.enable);
+          this.toast("ok", "已请求 Kiro 启用 MCP 支持");
+        } catch (e) {
+          this.toast("error", "Kiro 命令不可用：请在 Kiro 设置里搜索 MCP 手动启用");
+        }
+        this.postMcp();
+        break;
+      }
+
+      case "mcpLogs": {
+        try {
+          await vscode.commands.executeCommand(KIRO_MCP.showLogs);
+        } catch {
+          this.toast("error", "Kiro 命令不可用（kiroAgent.mcp.showLogs）");
+        }
+        break;
+      }
+
+      case "agentList": {
+        await this.postAgents();
+        break;
+      }
+
+      case "agentSave": {
+        const roots = this.agentRoots();
+        const scope = msg.scope === "workspace" ? "workspace" : "user";
+        const filePath = typeof msg.filePath === "string" && msg.filePath ? msg.filePath : undefined;
+        try {
+          if (!this.isAgentRoot(msg.dir, roots)) {
+            throw new Error("目标目录不在 .kiro/agents 两级目录内");
+          }
+          if (filePath && !isInsideAgentRoots(filePath, roots)) {
+            throw new Error("文件不在 .kiro/agents 两级目录内");
+          }
+          const fields = this.agentFieldsFrom(msg.fields);
+          const r = await upsertAgent({ scope, dir: String(msg.dir), filePath, fields, addPermissions: msg.addPermissions === true });
+          this.post({ type: "agentSaveResult", ok: true });
+          this.toast("ok", (r.created ? "已新建 " : "已保存 ") + path.basename(r.filePath) + (r.backedUp ? "（原文件已留 .bak）" : "") + "，Kiro 会自动重载");
+        } catch (e) {
+          const m = (e as Error)?.message || String(e);
+          this.post({ type: "agentSaveResult", ok: false, error: m });
+          this.toast("error", "保存失败：" + m);
+        }
+        await this.postAgents();
+        break;
+      }
+
+      case "agentDelete": {
+        const roots = this.agentRoots();
+        const filePath = typeof msg.filePath === "string" ? msg.filePath : "";
+        if (!isInsideAgentRoots(filePath, roots)) {
+          this.toast("error", "文件不在 .kiro/agents 两级目录内");
+          break;
+        }
+        const delOk =
+          msg.confirmed === true
+            ? "删除"
+            : await vscode.window.showWarningMessage(`确定要删除 agent 文件「${path.basename(filePath)}」吗？会先留一份 .bak。`, { modal: true }, "删除");
+        if (delOk === "删除") {
+          try {
+            const r = await deleteAgent(filePath);
+            this.toast("ok", `已删除 ${path.basename(filePath)}` + (r.backedUp ? "（已留 .bak）" : ""));
+          } catch (e) {
+            this.toast("error", "删除失败：" + ((e as Error)?.message || String(e)));
+          }
+        }
+        await this.postAgents();
+        break;
+      }
+
+      case "agentImport": {
+        const roots = this.agentRoots();
+        const scope = msg.scope === "workspace" ? "workspace" : "user";
+        try {
+          if (!this.isAgentRoot(msg.dir, roots)) {
+            throw new Error("目标目录不在 .kiro/agents 两级目录内");
+          }
+          const text = typeof msg.text === "string" ? msg.text : "";
+          if (!text.trim()) {
+            throw new Error("请粘贴 agent 的 JSON 或前置元数据文本");
+          }
+          const name = typeof msg.name === "string" && msg.name.trim() ? msg.name.trim() : undefined;
+          const r = await importAgent(scope, String(msg.dir), text, name);
+          this.post({ type: "agentSaveResult", ok: true });
+          this.toast("ok", `已导入 ${path.basename(r.filePath)}，Kiro 会自动重载`);
+        } catch (e) {
+          const m = (e as Error)?.message || String(e);
+          this.post({ type: "agentSaveResult", ok: false, error: m });
+          this.toast("error", "导入失败：" + m);
+        }
+        await this.postAgents();
+        break;
+      }
+
+      case "agentOpen": {
+        const filePath = typeof msg.filePath === "string" ? msg.filePath : "";
+        if (filePath) {
+          if (!this.isOpenableKiroFile(filePath)) {
+            this.toast("error", "文件不在 .kiro/agents、.kiro/steering 或工作区 AGENTS.md 之内");
+            break;
+          }
+          try {
+            await vscode.window.showTextDocument(vscode.Uri.file(filePath), { preview: false });
+          } catch (e) {
+            this.toast("error", "打开失败：" + ((e as Error)?.message || String(e)));
+          }
+          break;
+        }
+        const roots = this.agentRoots();
+        if (!this.isAgentRoot(msg.dir, roots)) {
+          this.toast("error", "目录不在 .kiro/agents 两级目录内");
+          break;
+        }
+        if (!fs.existsSync(String(msg.dir))) {
+          this.toast("error", "目录尚不存在：新建一个 agent 后会自动创建");
+          break;
+        }
+        try {
+          await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(String(msg.dir)));
+        } catch (e) {
+          this.toast("error", "打开目录失败：" + ((e as Error)?.message || String(e)));
+        }
+        break;
+      }
     }
   }
 
@@ -1251,7 +1680,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const stats = getUsageAnalyticsStats();
     const heatmap = getActivityHeatmap();
     const modelRatios = getModelUsageRatios(range);
-    const sankey = getSankeyData(range);
+    const layerState = readSankeyLayersState(this.context.globalState.get("ui.sankeyLayers"));
+    const sankey = getSankeyData(range, layerState.tokens);
+    const sankeyRequests = getSankeyData(range, layerState.requests);
     const contextBreakdown = getContextBreakdownStats(range);
     const recent = recentRecords(30, range).map((r) => ({
       ts: r.ts,
@@ -1282,6 +1713,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       heatmap,
       modelRatios,
       sankey,
+      sankeyRequests,
+      sankeyLayers: layerState,
       contextBreakdown,
     });
   }
@@ -1341,6 +1774,53 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     void this.refresh(true);
   }
 
+  /**
+   * 上下文挡位覆盖（4.13.55）：写设置 + 通道 A，走与 persist 相同的自写窗口——onConfigChanged 看到 isSelfWrite 只推派生
+   * 数据、拿这里登记的通道 A 结果，不再重拉全部 /models、不重复刷 Kiro。`tokens` 恰是解析值（自动值）时按清除覆盖处理。
+   * 面板下拉（origin=panel）与聊天框下拉（origin=chat，经 extension.ts 的 globalThis 钩子）都走这里。
+   */
+  async applyContextWindowOverride(modelId: string, tokens: number | null, origin: "panel" | "chat"): Promise<{ settingsOk: boolean; error?: string }> {
+    const row = contextWindowRows().find((r) => r.kiroId === modelId);
+    const next = tokens && row && tokens === row.info.resolved ? null : tokens;
+    this.selfWriteUntil = Date.now() + 1500;
+    let settleChannelA!: (ok: boolean) => void;
+    this.channelA = new Promise<boolean>((resolve) => (settleChannelA = resolve));
+    const r = await setContextWindowOverride(modelId, next);
+    void vscode.commands
+      .executeCommand<boolean>("api2kiroDual.refreshActiveSession")
+      .then((ok) => settleChannelA(ok === true), () => settleChannelA(false));
+    if (!row) {
+      warn(`context window override (${origin}): ${modelId} is not in the current Kiro list; stored anyway`);
+    }
+    this.postCtxWindows();
+    return r;
+  }
+
+  /**
+   * 模型页每行「上下文」下拉的数据（4.13.55）：与 CPS 同一套 contextWindowRows()，键是 Kiro 里的模型 id。
+   * mergedCache 由 fetchAllModels 维护；这里先按缓存重算（60s 内零网络），保证面板与 Kiro 看到的一致。
+   */
+  private postCtxWindows(): void {
+    void fetchAllModels(false)
+      .catch(() => undefined)
+      .then(() => {
+        const rows = contextWindowRows().map((r) => ({
+          kiroId: r.kiroId,
+          baseId: r.baseId,
+          providerId: r.providerId,
+          candidates: r.info.candidates,
+          effective: r.info.effective,
+          resolved: r.info.resolved,
+          source: r.info.source,
+          resolvedSource: r.info.resolvedSource,
+          known: r.info.known,
+          max: r.info.max,
+          override: r.info.override ?? null,
+        }));
+        this.post({ type: "ctxWindows", rows });
+      });
+  }
+
   /** 我们自己写 settings 的时间窗，期间到来的配置变更回调不再触发全量刷新。 */
   private selfWriteUntil = 0;
   /** 最近一次 persist 触发的通道 A 刷新结果（true = Kiro 已静默刷新，不必提示重载）。 */
@@ -1361,13 +1841,168 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.postUsage();
     this.postPrompts();
     this.postUpdateState();
+    this.postMcp();
+    void this.postAgents();
     void this.refresh(true);
   }
 
-  /** 头部「检查更新」图标的状态：有新版 → 小圆点 + title；busy → 转圈并拒绝重复点击；装好待重载 → 提示文案。 */
+  /** 设置页「检查更新」按钮的状态：有新版改文案；busy → 置灰「检查中…」；装好待重载 → 提示文案。 */
   private postUpdateState(): void {
     this.post({ type: "updateState", ...getUpdateState() });
   }
+
+  private mcpPathOpts(): { workspaceDir?: string } {
+    return { workspaceDir: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath };
+  }
+
+  private kiroMcpEnabled(): boolean {
+    try {
+      return vscode.workspace.getConfiguration("kiroAgent").get<string>(KIRO_MCP.configureSetting) === "Enabled";
+    } catch {
+      return true;
+    }
+  }
+
+  /** 推两份 mcp.json 的列表（不含 env / headers 值）；webview 自己记住当前选中的作用域。 */
+  private postMcp(): void {
+    const opts = this.mcpPathOpts();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    this.post({
+      type: "mcp",
+      user: mcpListServers("user", opts),
+      workspace: mcpListServers("workspace", opts),
+      workspaceAvailable: !!folder,
+      workspaceName: folder?.name ?? "",
+      workspaceTrusted: vscode.workspace.isTrusted,
+      kiroMcpEnabled: this.kiroMcpEnabled(),
+    });
+  }
+
+  private mcpScopeOf(v: unknown): McpScope {
+    return v === "workspace" ? "workspace" : "user";
+  }
+
+  private mcpErr(e: unknown): string {
+    return e instanceof McpConfigError ? e.message : (e as Error)?.message || String(e);
+  }
+
+  private agentRoots(): AgentRoots {
+    return defaultAgentRoots((vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath));
+  }
+
+  private isAgentRoot(dir: unknown, roots: AgentRoots): dir is string {
+    if (typeof dir !== "string" || !dir) {
+      return false;
+    }
+    const norm = (p: string) => path.resolve(p).toLowerCase();
+    return [roots.user, ...roots.workspaces].some((r) => norm(r) === norm(dir));
+  }
+
+  private isOpenableKiroFile(filePath: string): boolean {
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    if (isInsideAgentRoots(filePath, this.agentRoots())) {
+      return true;
+    }
+    const sd = steeringDirs(folders);
+    if (isInsideAgentRoots(filePath, { user: sd.user, workspaces: sd.workspaces })) {
+      return true;
+    }
+    const norm = (p: string) => path.resolve(p).toLowerCase();
+    return folders.some((w) => norm(path.join(w, "AGENTS.md")) === norm(filePath));
+  }
+
+  private startAgentWatcher(): void {
+    this.agentWatcher?.dispose();
+    this.agentWatcher = watchAgents(this.agentRoots(), () => {
+      if (this.view?.visible) {
+        void this.postAgents();
+      }
+    });
+  }
+
+  private agentFieldsFrom(raw: unknown): AgentFields {
+    const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+    const lines = (v: unknown): string[] | undefined => {
+      const arr = Array.isArray(v) ? v : typeof v === "string" ? v.split(/\r?\n/) : [];
+      const out = arr.filter((x): x is string => typeof x === "string").map((x) => x.trim()).filter(Boolean);
+      return out.length ? out : undefined;
+    };
+    const dk = str(r.dispatchKind);
+    return {
+      name: str(r.name),
+      description: str(r.description),
+      prompt: typeof r.prompt === "string" ? r.prompt : "",
+      tools: r.tools === "*" ? "*" : lines(r.tools),
+      excludedTools: lines(r.excludedTools),
+      model: str(r.model),
+      effortLevel: str(r.effortLevel),
+      includeMcpJson: typeof r.includeMcpJson === "boolean" ? r.includeMcpJson : undefined,
+      includePowers: typeof r.includePowers === "boolean" ? r.includePowers : undefined,
+      resources: lines(r.resources),
+      welcomeMessage: str(r.welcomeMessage),
+      dispatchKind: dk && (DISPATCH_KINDS as readonly string[]).includes(dk) ? (dk as DispatchKind) : undefined,
+    };
+  }
+
+  private mcpServerNamesForAgents(): string[] {
+    const opts = this.mcpPathOpts();
+    const names = new Set<string>();
+    for (const scope of ["user", "workspace"] as const) {
+      try {
+        for (const s of mcpListServers(scope, opts).servers) {
+          if (s && typeof s.name === "string" && s.name) {
+            names.add(s.name);
+          }
+        }
+      } catch {
+        /* 某一级读失败不影响另一级 */
+      }
+    }
+    return [...names].sort();
+  }
+
+  private async postAgents(): Promise<void> {
+    const roots = this.agentRoots();
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    let entries: AgentEntry[] = [];
+    let listError = "";
+    let steering: Awaited<ReturnType<typeof listSteeringFiles>> = [];
+    try {
+      entries = await listAgents(roots);
+    } catch (e) {
+      listError = (e as Error)?.message || String(e);
+      error("读取 .kiro/agents 失败:", listError);
+    }
+    try {
+      steering = await listSteeringFiles(folders);
+    } catch (e) {
+      error("读取 steering 列表失败:", (e as Error)?.message || String(e));
+    }
+    this.post({
+      type: "agents",
+      roots,
+      entries: entries.map((e) => ({
+        id: e.id,
+        scope: e.scope,
+        dir: e.dir,
+        filePath: e.filePath,
+        rel: e.rel,
+        format: e.format,
+        fields: e.fields,
+        opaque: e.opaque,
+        warnings: e.warnings,
+        error: e.error || "",
+        size: e.size,
+        mtime: e.mtime,
+      })),
+      mcpServers: this.mcpServerNamesForAgents(),
+      builtinIds: BUILTIN_MODE_IDS,
+      listError,
+      steering,
+    });
+  }
+
 
   /** 只推派生数据（模型清单/计数），全走缓存、不发任何 HTTP。 */
   postDerived(): void {
@@ -1575,6 +2210,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         e.row.kiroId = ids[i];
       });
       this.post({ type: "models", counts, modelsByProvider });
+      this.postCtxWindows();
     };
 
     // 二三十个渠道并发拉；不等最慢的那个——预算一到先发一版（慢的渠道用勾选的 id 顶上），
@@ -1689,43 +2325,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 10px; }
   .cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; }
 
-  /* 顶栏开关右侧/包裹器 */
+  /* 顶栏：开关在左、提供商/模型计数在右（GitHub / 检查更新已移到 Kiro 视图标题栏） */
+  .hdr { flex-wrap:nowrap; }
+  .hdr .badge { flex:none; margin-left:auto; }
   .switch-wrap { display:inline-flex; align-items:center; gap:6px; flex:none; }
   .switch-lbl { font-size:12px; font-weight:700; color:var(--muted); transition:color .2s; white-space:nowrap; }
   .switch-lbl.on { color:rgb(var(--accent-edge)); text-shadow:0 0 8px rgba(var(--accent-rgb),.5); }
 
   /* 顶栏阶梯响应式收缩 */
-  .hdr .title-text { white-space:nowrap; flex:none; }
-  @container (max-width: 360px) {
-    .hdr .title-text { display:none; } /* ① 优先隐藏 API4Kiro 标题 */
-  }
   @container (max-width: 290px) {
-    .switch-lbl { display:none; } /* ② 其次隐藏「开启代理」文字 */
+    .switch-lbl { display:none; } /* ① 先隐藏「开启代理」文字 */
   }
   @container (max-width: 230px) {
-    .badge .bi .lbl { display:none !important; } /* ③ 再其次压缩提供商&模型文字只留logo和数字 */
+    .badge .bi .lbl { display:none !important; } /* ② 再压缩提供商&模型文字只留 logo 和数字 */
     .hdr .badge.badge-on { padding:1px 4px; }
   }
-  /* 顶栏左侧两枚图标入口：GitHub 项目主页 / 检查更新。无边框、随主题色，悬停亮成荧光紫并带光晕（与面板其它图标按钮同一套调子）；
-     窄栏只缩到 20px，不隐藏（P13：窄栏优先收缩为 logo）。 */
-  .hdr .hlinks { display:inline-flex; align-items:center; gap:4px; flex:none; }
-  .hdr .hbtn { position:relative; display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; padding:0; border-radius:7px; border:1px solid transparent; background:transparent; color:var(--muted); cursor:pointer; transition:color .15s, border-color .15s, box-shadow .15s, background .15s; }
-  .hdr .hbtn svg { width:17px; height:17px; display:block; }
-  .hdr .hbtn:hover, .hdr .hbtn:focus-visible { color:rgb(var(--accent-edge)); border-color:rgba(var(--accent-rgb),.55); background:rgba(var(--accent-rgb),.10); box-shadow:0 0 10px rgba(var(--accent-rgb),.45), inset 0 0 6px rgba(var(--accent-rgb),.12); outline:none; }
-  .hdr .hbtn:active { transform:translateY(1px); }
-  .hdr .hbtn .spin { display:none; margin:0; width:13px; height:13px; border-width:2px; }
-  .hdr .hbtn .upd-dot { display:none; position:absolute; top:1px; right:1px; width:7px; height:7px; border-radius:50%; background:var(--accent); box-shadow:0 0 6px rgba(var(--accent-rgb),.95), 0 0 0 1.5px var(--card2); }
-  .hdr .hbtn.has-update .upd-dot { display:block; }
-  .hdr .hbtn.has-update { color:rgb(var(--accent-edge)); }
-  .hdr .hbtn.busy { cursor:progress; color:var(--accent); border-color:rgba(var(--accent-rgb),.35); }
-  .hdr .hbtn.busy svg { display:none; }
-  .hdr .hbtn.busy .spin { display:inline-block; }
-  .hdr .hbtn.busy .upd-dot { display:none; }
-  .hdr .hbtn[disabled] { pointer-events:none; }
-  @container (max-width: 230px) {
-    .hdr .hbtn { width:20px; height:20px; }
-    .hdr .hbtn svg { width:15px; height:15px; }
-    .hdr .hlinks { gap:2px; }
+  @container (max-width: 190px) {
+    .badge .bi .ico { display:none; } /* ③ 更窄只留数量 */
   }
   /* 设置页「关于」卡按钮里的 GitHub 标：与文字同行 */
   #ghRepo svg { width:13px; height:13px; margin-right:5px; vertical-align:-2px; }
@@ -1798,6 +2414,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   .cap.vision { background: rgba(57,197,207,.14); color: #5fd4dc; border-color: rgba(57,197,207,.45); cursor:default; }
   .cap.on.reason { background: rgba(255,166,87,.2); color: #ffb26b; border-color: rgba(255,166,87,.6); cursor:pointer; }
   .cap.on.vision { background: rgba(57,197,207,.2); color: #5fd4dc; border-color: rgba(57,197,207,.6); cursor:pointer; }
+  /* 每行「上下文」下拉（4.13.55）：与能力胶囊同高同圆角，原生 select 去掉系统外观、右侧画一枚小箭头；有用户覆盖时描边泛紫。
+     宽度写死 66px：原生 select 会按最宽的 option / optgroup 标签（「自动 · 渠道 /models 字段」）撑开，显示文案其实只有 4–5 个字符（200K / 1.3M），
+     不钉宽度它就把窄面板里的模型名挤没了。 */
+  .ctxsel { appearance:none; -webkit-appearance:none; display:inline-block; font-size:10px; line-height:1.3; padding:2px 15px 2px 6px; border-radius:5px; border:1px solid var(--border); background: var(--input-bg); color: var(--muted); cursor:pointer; flex:none; width:66px; max-width:66px; box-sizing:border-box; font-family:inherit; outline:none; user-select:none; position:relative;
+    background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%); background-position: right 8px center, right 4px center; background-size: 4px 4px, 4px 4px; background-repeat:no-repeat; }
+  .ctxsel:hover { color: var(--fg); border-color: rgba(var(--accent-rgb),.6); }
+  .ctxsel.ov { color: rgb(214,196,255); border-color: rgba(var(--accent-rgb),.55); background-color: rgba(var(--accent-rgb),.12); }
+  .ctxsel option, .ctxsel optgroup { background: var(--vscode-dropdown-background, #1e1e1e); color: var(--vscode-dropdown-foreground, #ccc); }
+  .ctxsel optgroup { font-style: normal; font-weight: 600; color: var(--muted); }
   .mfoot { font-size:10px; color: var(--muted); margin-top:6px; line-height:1.5; }
   .row { display: flex; align-items: center; justify-content: space-between; padding: 3px 0; gap: 8px; }
   .key { color: var(--muted); }
@@ -2207,11 +2832,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     cursor: pointer;
   }
   .ctx-seg:hover { filter: brightness(1.25); }
-  .ctx-seg.files { background: #38bdf8; }
-  .ctx-seg.history { background: #818cf8; }
-  .ctx-seg.tools { background: #c084fc; }
-  .ctx-seg.rules { background: #f43f5e; }
-  .ctx-seg.current { background: #34d399; }
+  .ctx-seg.prompts { background: #60a5fa; }
+  .ctx-seg.responses { background: #c084fc; }
+  .ctx-seg.session { background: #fbbf24; }
+  .ctx-seg.builtin { background: #34d399; }
+  .ctx-seg.mcp { background: #f472b6; }
+  .ctx-seg.steering { background: #fb7185; }
+  .ctx-seg.legacy { background: #6b7280; }
   .ctx-legend {
     display: flex;
     flex-wrap: wrap;
@@ -2230,11 +2857,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
   .ctx-item:hover { background: rgba(255,255,255,0.06); }
   .ctx-dot { width: 8px; height: 8px; border-radius: 50%; }
-  .ctx-dot.files { background: #38bdf8; box-shadow: 0 0 6px rgba(56, 189, 248, 0.6); }
-  .ctx-dot.history { background: #818cf8; box-shadow: 0 0 6px rgba(129, 140, 248, 0.6); }
-  .ctx-dot.tools { background: #c084fc; box-shadow: 0 0 6px rgba(192, 132, 252, 0.6); }
-  .ctx-dot.rules { background: #f43f5e; box-shadow: 0 0 6px rgba(244, 63, 94, 0.6); }
-  .ctx-dot.current { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, 0.6); }
+  .ctx-dot.prompts { background: #60a5fa; box-shadow: 0 0 6px rgba(96, 165, 250, 0.6); }
+  .ctx-dot.responses { background: #c084fc; box-shadow: 0 0 6px rgba(192, 132, 252, 0.6); }
+  .ctx-dot.session { background: #fbbf24; box-shadow: 0 0 6px rgba(251, 191, 36, 0.6); }
+  .ctx-dot.builtin { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, 0.6); }
+  .ctx-dot.mcp { background: #f472b6; box-shadow: 0 0 6px rgba(244, 114, 182, 0.6); }
+  .ctx-dot.steering { background: #fb7185; box-shadow: 0 0 6px rgba(251, 113, 133, 0.6); }
+  .ctx-dot.legacy { background: #6b7280; box-shadow: 0 0 6px rgba(107, 114, 128, 0.5); }
+  .ctx-item.legacy-row { display: none; }
+  .ctx-item.legacy-row.on { display: flex; }
+  .sk-path { display:flex; flex-wrap:wrap; align-items:center; gap:4px 2px; padding:0 2px 8px; }
+  .sk-path-info { width:18px; height:18px; color:var(--muted); display:inline-flex; align-items:center; justify-content:center; flex:none; cursor:help; }
+  .sk-path-info svg { width:14px; height:14px; }
+  .sk-cap { height:22px; padding:0 9px; border-radius:999px; font-size:10.5px; line-height:20px; cursor:pointer; border:1px solid var(--input-border); background:var(--input-bg); color:var(--fg); }
+  .sk-cap.on { background:linear-gradient(135deg, rgba(166,108,255,.32), rgba(120,68,220,.24)); color:#fff; font-weight:600; box-shadow:0 0 10px rgba(var(--accent-rgb),.3); border-color:transparent; }
+  .sk-cap.off { color:var(--muted); opacity:.6; border-style:dashed; }
+  .sk-cap.na { opacity:.45; cursor:default; border-style:dotted; }
+  .sk-cap.lock { cursor:not-allowed; }
+  .sk-sep { color:var(--muted); font-size:12px; padding:0 1px; }
   .ctx-val { font-weight: 600; color: #f8fafc; margin-left: 2px; }
   .ctx-pct { color: #94a3b8; font-size: 10px; }
   .rrow-detail {
@@ -2789,6 +3429,119 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   .psum { font-size:12px; color:var(--muted); padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--card2); margin-bottom:8px; }
   .psum b { color:var(--fg); font-weight:600; }
   .pmeta { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px; }
+
+  /* 设置页 · MCP 服务器卡：路径行 / 提示条 / 列表行徽标 / 弹窗表单里的键值行 */
+  .mcppath { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); min-width:0; margin-bottom:6px; }
+  .mcppath .k { flex:none; }
+  .mcppath .mono { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mcppath .lnk { flex:none; background:none; border:none; padding:0; font-size:11px; color:var(--accent); cursor:pointer; }
+  .mcppath .lnk:hover { text-decoration:underline; }
+  .mcpnote { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11px; line-height:1.5; padding:6px 8px; border-radius:7px; margin-bottom:6px; border:1px solid rgba(210,153,34,.45); background:rgba(210,153,34,.08); color:var(--yellow); }
+  .mcpnote.err { border-color:rgba(255,107,107,.4); background:rgba(255,107,107,.08); color:#ff8080; word-break:break-all; }
+  .mcpnote .btn { margin-left:auto; }
+  .mcpnote.hidden { display:none; }
+  .mcprow .ln .mtype { flex:none; margin-left:6px; padding:0 5px; border-radius:4px; font-size:10px; font-weight:600; line-height:16px; border:1px solid var(--border); color:var(--muted); }
+  .mcprow .ln .mtype.stdio { color:#5fd4dc; border-color:rgba(95,212,220,.4); }
+  .mcprow .ln .mtype.http { color:rgb(var(--accent-edge)); border-color:rgba(var(--accent-rgb),.5); }
+  .mcprow .ln .mtype.invalid { color:#ff8080; border-color:rgba(255,107,107,.4); }
+  .mcprow .ln .mauto { flex:none; margin-left:4px; padding:0 5px; border-radius:4px; font-size:10px; line-height:16px; background:var(--card2); border:1px solid var(--border); color:var(--muted); }
+  .mcprow .ls { font-family:var(--mono, ui-monospace, Menlo, Consolas, monospace); }
+  .mcprow.off .ln .nm, .mcprow.off .ls { opacity:.55; }
+  .modal.mcp { max-width:460px; }
+  .modal.mcp .mtseg { margin:2px 0 4px; }
+  .modal.mcp .grp.hidden { display:none; }
+  .modal.mcp textarea { min-height:64px; }
+  .modal.mcp .mcpkv { display:flex; align-items:center; gap:6px; margin-top:4px; }
+  .modal.mcp .mcpkv input.kk { flex:0 0 38%; min-width:0; font-family:var(--mono, ui-monospace, Menlo, Consolas, monospace); font-size:12px; }
+  .modal.mcp .mcpkv .keywrap { flex:1 1 auto; min-width:0; }
+  .modal.mcp .mcpkv .iconbtn { flex:none; border-color:transparent; color:var(--muted); }
+  .modal.mcp .mcpkv .iconbtn:hover { color:var(--red); border-color:rgba(248,81,73,.4); background:rgba(248,81,73,.08); }
+  .modal.mcp .kvadd { margin-top:6px; }
+  .modal.mcp .ferr { color:#ff8080; font-size:11px; line-height:1.5; margin-top:8px; }
+  .modal.mcp .ferr:empty { display:none; }
+  .modal.mcp .mcpsw { display:flex; align-items:center; gap:8px; margin-top:10px; font-size:12px; color:var(--fg); }
+  .modal.mcp .mcpsw .switch { flex:none; }
+  .modal.mcpimport textarea.paste { min-height:150px; }
+  .modal.mcpimport .mcpprev { font-size:11px; color:var(--muted); line-height:1.6; margin-top:6px; word-break:break-all; }
+  .modal.mcpimport .mcpprev b { color:var(--fg); }
+  .modal.mcpimport .mcpprev .bad { color:#ff8080; }
+  .modal.mcpimport .mcpopts { display:flex; flex-wrap:wrap; gap:12px; margin-top:8px; font-size:12px; }
+  .modal.mcpimport .mcpopts label, .modal.mcpcc .mcpopts label { display:inline-flex; align-items:center; gap:6px; margin:0; color:var(--fg); font-size:12px; cursor:pointer; }
+  .modal.mcpcc .mcpopts { display:flex; flex-wrap:wrap; gap:12px; margin:8px 0 0; font-size:12px; }
+  .ccrow .ccsub .tag.tp { color:#5fd4dc; border-color:rgba(95,212,220,.4); font-size:10px; padding:0 5px; }
+  .ccrow .ccsub .tag.tp.http { color:rgb(var(--accent-edge)); border-color:rgba(var(--accent-rgb),.5); }
+  .ccrow .ccsub .tag.warn { color:var(--yellow); border-color:rgba(210,153,34,.45); font-size:10px; padding:0 5px; }
+  .btn .ccmini { width:14px; height:14px; border-radius:3px; margin-right:5px; vertical-align:-2px; }
+  @container (max-width: 250px) {
+    .mcpseg button { padding:6px 4px; font-size:10px; }
+    .mcprow .ln .mauto { display:none; }
+    .mcprow .ln .mtype { margin-left:4px; padding:0 3px; }
+    .mcppath .k { display:none; }
+  }
+
+  /* 设置页可折叠卡：子代理 / 上下文（默认展开；折叠态只留标题行） */
+  .fcard .cardhead.fold { cursor:pointer; user-select:none; margin-bottom:8px; }
+  .fcard .cardhead.fold .fchev { color:var(--muted); font-size:10px; width:10px; flex:none; transition:transform .15s; transform:rotate(90deg); }
+  .fcard.collapsed .cardhead.fold .fchev { transform:none; }
+  .fcard.collapsed .cardhead.fold { margin-bottom:0; }
+  .fcard.collapsed .fbody { display:none; }
+  .fcard .cardhead.fold h3 { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .agent-card .aseg { margin-top:6px; }
+  .agent-card .aseghead { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); padding:4px 2px; min-width:0; }
+  .agent-card .aseghead .t { font-weight:600; flex:none; }
+  .agent-card .aseghead .p { flex:1 1 0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono); }
+  .agent-card .aseghead .iconbtn { width:22px; height:22px; }
+  .agent-card .arow { display:flex; align-items:center; gap:8px; padding:7px 8px; border-radius:8px; min-width:0; }
+  .agent-card .arow:hover { background:rgba(255,255,255,.03); }
+  .agent-card .arow .ltext { flex:1 1 0; min-width:0; overflow:hidden; }
+  .agent-card .arow .ln { display:flex; align-items:center; gap:6px; min-width:0; font-size:12.5px; }
+  .agent-card .arow .ln .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+  .agent-card .arow .ls { font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px; }
+  .agent-card .arow .lact { display:flex; align-items:center; gap:0; flex:none; }
+  .agent-card .tag.fmt { font-size:10px; padding:0 5px; text-transform:uppercase; letter-spacing:.3px; }
+  .agent-card .tag.warn { color:#e3b341; border-color:rgba(227,179,65,.45); font-size:10px; padding:0 5px; }
+  .agent-card .tag.err { color:var(--red); border-color:rgba(248,81,73,.45); font-size:10px; padding:0 5px; }
+  .agent-card .arow.bad .ln .nm { color:var(--red); }
+  .agent-card .empty.small { padding:8px 6px; }
+  @container (max-width: 260px) {
+    .agent-card .btns { flex-wrap:wrap; }
+    .agent-card .arow .ls { white-space:normal; }
+  }
+  .modal.agent .arows { display:flex; flex-direction:column; gap:6px; }
+  .modal.agent .afield { display:flex; flex-direction:column; gap:4px; }
+  .modal.agent .afield label { margin:0; }
+  .modal.agent .achk { display:flex; align-items:center; gap:8px; font-size:12px; }
+  .modal.agent .achk input { width:auto; }
+  .modal.agent textarea.aPrompt { min-height:140px; font-family:var(--mono); font-size:12px; }
+  .modal.agent textarea.aLines { min-height:56px; font-family:var(--mono); font-size:12px; }
+  .modal.agent .amcp { display:flex; flex-wrap:wrap; gap:6px; }
+  .modal.agent .amcp .ck { cursor:pointer; }
+  .modal.agent .amcp .tag { cursor:pointer; user-select:none; }
+  .modal.agent .amcp .tag.on { color:rgb(var(--accent-edge)); border-color:rgba(var(--accent-rgb),.6); background:rgba(var(--accent-rgb),.12); }
+  .modal.agent .anote { font-size:11px; color:#e3b341; line-height:1.4; }
+  .modal.agent .aerr { font-size:11px; color:var(--red); line-height:1.4; min-height:14px; }
+
+  .ctxmgr-card .cseghead { font-size:11px; color:var(--muted); font-weight:600; padding:6px 2px 2px; }
+  .ctxmgr-card .crow { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:8px; min-width:0; }
+  .ctxmgr-card .crow:hover { background:rgba(255,255,255,.03); }
+  .ctxmgr-card .crow .ltext { flex:1 1 0; min-width:0; overflow:hidden; }
+  .ctxmgr-card .crow .ln { display:flex; align-items:center; gap:6px; min-width:0; font-size:12.5px; }
+  .ctxmgr-card .crow .ln .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ctxmgr-card .crow .ls { font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px; }
+  .ctxmgr-card .crow .lact { display:flex; align-items:center; gap:4px; flex:none; }
+  .ctxmgr-card .crow .lact .ctxsel { max-width:110px; }
+  .ctxmgr-card .tag.err { color:var(--red); border-color:rgba(248,81,73,.45); font-size:10px; padding:0 5px; }
+  .ctxmgr-card .tag.ov { color:rgb(var(--accent-edge)); border-color:rgba(var(--accent-rgb),.6); font-size:10px; padding:0 5px; }
+  .ctxmgr-card .csteer { margin-top:8px; border-top:1px solid var(--border); padding-top:6px; }
+  .ctxmgr-card .csteer .srow { display:flex; align-items:center; gap:8px; padding:4px 8px; font-size:11.5px; min-width:0; }
+  .ctxmgr-card .csteer .srow .nm { flex:1 1 0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono); }
+  .ctxmgr-card .csteer .srow .muted { flex:none; }
+  .ctxmgr-card .csteer .iconbtn { width:22px; height:22px; }
+  @container (max-width: 260px) {
+    .ctxmgr-card .crow { flex-wrap:wrap; }
+    .ctxmgr-card .crow .lact { width:100%; justify-content:flex-end; }
+    .ctxmgr-card .crow .ls { white-space:normal; }
+  }
   .modal.prompt { max-width:420px; }
   .modal.connect { max-width:420px; }
 
@@ -2852,18 +3605,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div class="cardhead hdr" style="margin-bottom:10px;">
-    <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto;overflow:hidden;">
-      <div class="hlinks">
-        <button class="hbtn" id="hdrGh" type="button" title="GitHub 项目主页" aria-label="GitHub 项目主页">${ghSvg}</button>
-        <button class="hbtn hbtn-upd" id="hdrUpd" type="button" title="检查更新（从 GitHub 下载并安装最新版）" aria-label="检查更新">${ICONS.cloudDown}<span class="spin"></span><span class="upd-dot"></span></button>
-      </div>
-      <h3 class="title-text" style="font-size:15px;white-space:nowrap;">API4Kiro</h3>
-      <span class="badge" id="statusBadge" title="">--</span>
-    </div>
     <div class="switch-wrap">
-      <span class="switch-lbl" id="enableLbl">开启代理</span>
       <label class="switch" title="启用/关闭代理"><input type="checkbox" id="enable"><span class="slider"></span></label>
+      <span class="switch-lbl" id="enableLbl">开启代理</span>
     </div>
+    <span class="badge" id="statusBadge" title="">--</span>
   </div>
 
   <div class="tabs" role="tablist">
@@ -3012,47 +3758,61 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     <div class="card ctx-card" id="ctxBreakdownCard">
       <div class="ctx-header">
         <div class="ctx-title">
-          <span>✨ 上下文微观构成透视 (Context Composition · Cursor Style)</span>
+          <span>上下文微观构成透视</span>
         </div>
         <div class="ctx-subtitle" id="ctxTotalTok">输入总量: -- Tokens</div>
       </div>
       <div class="ctx-bar" id="ctxBar">
-        <div class="ctx-seg files" id="ctxSegFiles" style="width: 0%;" data-k-tip="关联代码文件"></div>
-        <div class="ctx-seg history" id="ctxSegHistory" style="width: 0%;" data-k-tip="历史会话记录"></div>
-        <div class="ctx-seg tools" id="ctxSegTools" style="width: 0%;" data-k-tip="工具规格定义"></div>
-        <div class="ctx-seg rules" id="ctxSegRules" style="width: 0%;" data-k-tip="系统规则设定"></div>
-        <div class="ctx-seg current" id="ctxSegCurrent" style="width: 0%;" data-k-tip="当前用户指令"></div>
+        <div class="ctx-seg prompts" id="ctxSegPrompts" style="width: 0%;" data-k-tip="用户提示"></div>
+        <div class="ctx-seg responses" id="ctxSegResponses" style="width: 0%;" data-k-tip="Kiro 回复"></div>
+        <div class="ctx-seg session" id="ctxSegSession" style="width: 0%;" data-k-tip="会话文件"></div>
+        <div class="ctx-seg builtin" id="ctxSegBuiltin" style="width: 0%;" data-k-tip="内置工具"></div>
+        <div class="ctx-seg mcp" id="ctxSegMcp" style="width: 0%;" data-k-tip="MCP 工具"></div>
+        <div class="ctx-seg steering" id="ctxSegSteering" style="width: 0%;" data-k-tip="Steering 文件"></div>
+        <div class="ctx-seg legacy" id="ctxSegLegacy" style="width: 0%;" data-k-tip="旧记录未细分"></div>
       </div>
       <div class="ctx-legend">
-        <div class="ctx-item" data-k-tip="当前打开与关联读取的代码文档">
-          <span class="ctx-dot files"></span>
-          <span>关联代码文件</span>
-          <span class="ctx-val" id="ctxValFiles">--</span>
-          <span class="ctx-pct" id="ctxPctFiles">(0%)</span>
+        <div class="ctx-item" data-k-tip="用户亲写的提示（Your prompts）">
+          <span class="ctx-dot prompts"></span>
+          <span>用户提示</span>
+          <span class="ctx-val" id="ctxValPrompts">--</span>
+          <span class="ctx-pct" id="ctxPctPrompts">(0%)</span>
         </div>
-        <div class="ctx-item" data-k-tip="多轮历史提问、回复与思考链路">
-          <span class="ctx-dot history"></span>
-          <span>历史会话记录</span>
-          <span class="ctx-val" id="ctxValHistory">--</span>
-          <span class="ctx-pct" id="ctxPctHistory">(0%)</span>
+        <div class="ctx-item" data-k-tip="历史助手回复与工具结果（Kiro responses）">
+          <span class="ctx-dot responses"></span>
+          <span>Kiro 回复</span>
+          <span class="ctx-val" id="ctxValResponses">--</span>
+          <span class="ctx-pct" id="ctxPctResponses">(0%)</span>
         </div>
-        <div class="ctx-item" data-k-tip="Kiro 声明的工具规格与 JSON Schema">
-          <span class="ctx-dot tools"></span>
-          <span>工具规格定义</span>
-          <span class="ctx-val" id="ctxValTools">--</span>
-          <span class="ctx-pct" id="ctxPctTools">(0%)</span>
+        <div class="ctx-item" data-k-tip="会话里显式加入的文件（Session files）">
+          <span class="ctx-dot session"></span>
+          <span>会话文件</span>
+          <span class="ctx-val" id="ctxValSession">--</span>
+          <span class="ctx-pct" id="ctxPctSession">(0%)</span>
         </div>
-        <div class="ctx-item" data-k-tip="系统 Prompt、MCP 规约与工作区规则">
-          <span class="ctx-dot rules"></span>
-          <span>系统规则设定</span>
-          <span class="ctx-val" id="ctxValRules">--</span>
-          <span class="ctx-pct" id="ctxPctRules">(0%)</span>
+        <div class="ctx-item" data-k-tip="内置 / Powers / hooks 工具定义（Built-in tools）">
+          <span class="ctx-dot builtin"></span>
+          <span>内置工具</span>
+          <span class="ctx-val" id="ctxValBuiltin">--</span>
+          <span class="ctx-pct" id="ctxPctBuiltin">(0%)</span>
         </div>
-        <div class="ctx-item" data-k-tip="当前轮次用户提问与工具执行输出">
-          <span class="ctx-dot current"></span>
-          <span>当前用户指令</span>
-          <span class="ctx-val" id="ctxValCurrent">--</span>
-          <span class="ctx-pct" id="ctxPctCurrent">(0%)</span>
+        <div class="ctx-item" data-k-tip="名称以 mcp_ 开头的工具（MCP tools）">
+          <span class="ctx-dot mcp"></span>
+          <span>MCP 工具</span>
+          <span class="ctx-val" id="ctxValMcp">--</span>
+          <span class="ctx-pct" id="ctxPctMcp">(0%)</span>
+        </div>
+        <div class="ctx-item" data-k-tip="Steering 与提示词库">
+          <span class="ctx-dot steering"></span>
+          <span>Steering 文件</span>
+          <span class="ctx-val" id="ctxValSteering">--</span>
+          <span class="ctx-pct" id="ctxPctSteering">(0%)</span>
+        </div>
+        <div class="ctx-item legacy-row" id="ctxItemLegacy" data-k-tip="4.13.57 之前的记录无法拆到六桶">
+          <span class="ctx-dot legacy"></span>
+          <span>旧记录未细分</span>
+          <span class="ctx-val" id="ctxValLegacy">--</span>
+          <span class="ctx-pct" id="ctxPctLegacy">(0%)</span>
         </div>
       </div>
     </div>
@@ -3068,6 +3828,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           <button data-sk="tokens" class="sel">Token</button>
           <button data-sk="requests">次数</button>
         </div>
+      </div>
+      <div class="sk-path" id="sankeyPath" role="group" aria-label="桑基路径层开关">
+        <span class="sk-path-info" id="sankeyPathInfo" data-k-tip="路径节点条：每个胶囊是桑基的一层，点击隐藏 / 显示，至少保留两层；隐藏的层流量直接跨到下一层，Token 守恒不变。渠道 = 命中的 Provider；凭证 = 用的哪把 Key；模型 = Kiro 选中的模型；状态 = 成功 / 失败；Token 类型 = 缓存读 / 缓存写 / 常规输入 / 输出（账单原生分项）；上下文类别 = 把常规输入按 Kiro Context Usage 弹层的六桶再拆——用户提示 / Kiro 回复 / 会话文件 / 内置工具 / MCP 工具 / Steering 文件，为按字符权重估算的前端口径，不是账单分项；缓存与输出以「· 直通」节点保留到最后一层；4.13.57 之前的记录显示为「旧记录未细分」。">${ICONS.info}</span>
+        <span id="sankeyPathCaps"></span>
       </div>
       <div class="usankey-scroll">
         <div class="usankey-box" id="uSankeySvg"></div>
@@ -3111,6 +3875,59 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       <div class="hint">启用的提示词作为 system 注入每次请求；同一时间仅启用一条，即时生效。</div>
     </div>
 
+    <!-- MCP 服务器：直接读写 Kiro 的 mcp.json（用户级 ~/.kiro/settings/mcp.json / 工作区级 .kiro/settings/mcp.json）；
+         列表只带 env / headers 的键名，值只在编辑弹窗里以打码输入框出现 -->
+    <div class="card mcpcard">
+      <div class="cardhead" style="margin-bottom:6px;">
+        <h3>MCP 服务器</h3>
+        <div class="seg mcpseg" role="tablist" aria-label="配置作用域">
+          <button type="button" data-mscope="user" class="sel" role="tab" aria-selected="true" title="~/.kiro/settings/mcp.json，所有工作区共用">用户级</button>
+          <button type="button" data-mscope="workspace" role="tab" aria-selected="false">工作区级</button>
+        </div>
+      </div>
+      <div class="mcppath"><span class="k">文件</span><span class="mono" id="mcpPathTxt" title="">--</span><button type="button" class="lnk" id="mcpOpen" title="在 Kiro 编辑器里打开这份 mcp.json（不存在则先创建）">在 Kiro 中打开</button></div>
+      <div class="mcpnote hidden" id="mcpNote"></div>
+      <div id="mcpList"></div>
+      <div class="btns" style="margin-top:8px;">
+        <button class="btn btn-connect" id="mcpAdd" title="新建一台 MCP 服务器"><span class="ico">${ICONS.plus}</span><span class="lbl">添加 MCP 服务器</span></button>
+        <button class="btn btn-ghost" id="mcpImport" title="粘贴其它工具里的 mcp.json 片段（{&quot;mcpServers&quot;:{…}} / VS Code servers / 单台服务器对象）">粘贴 JSON 导入</button>
+        <button class="btn btn-ghost" id="mcpCc" title="从本机 CC Switch 的 MCP 服务器表只读导入"><img class="ccmini" src="${ccLogo}" alt="">从 CC Switch 导入</button>
+        <button class="btn btn-ghost" id="mcpLogs" title="打开 Kiro 的 MCP 日志输出通道">MCP 日志</button>
+      </div>
+      <div class="hint">直接读写 Kiro 自己的 mcp.json：保存即生效，Kiro 会自动重连有变化的服务器；工作区级同名服务器覆盖用户级。首次写入前会在旁边留一份 <span class="mono">mcp.json.api4kiro.bak</span>。</div>
+    </div>
+
+    <!-- 子代理 / Agent：两级 .kiro/agents 文件的列表 + 新建 / 导入 / 编辑 / 删除 -->
+    <div class="card fcard agent-card" id="agentCard">
+      <div class="cardhead fold" data-fold="agentCard" role="button" tabindex="0" aria-expanded="true">
+        <span class="fchev">▶</span><h3>子代理 / Agent</h3><span class="muted" id="agentSum">--</span>
+      </div>
+      <div class="fbody">
+        <div class="btns" style="margin-bottom:8px;">
+          <button class="btn btn-ghost btn-sm" id="agentNewUser" title="在 ~/.kiro/agents 新建">新建 agent（用户级）</button>
+          <button class="btn btn-ghost btn-sm" id="agentNewWs" title="在本工作区 .kiro/agents 新建">新建（工作区级）</button>
+          <button class="btn btn-ghost btn-sm" id="agentImport" title="粘贴 JSON 或前置元数据文本导入">粘贴 JSON 导入</button>
+        </div>
+        <div id="agentLists"></div>
+        <div class="hint">Kiro 从 <span class="mono">~/.kiro/agents</span> 与工作区 <span class="mono">.kiro/agents</span> 递归读取 <span class="mono">.md</span>（YAML 前置元数据 + 正文 = 系统提示词）与 <span class="mono">.json</span>，保存后 Kiro 自动重载（聊天底栏 agent 选择器与 invoke_sub_agent 同一批）。内置子代理（context-gatherer / general-task-execution / custom-agent-creator / introspect）不落盘、不可编辑。改动前自动留一份 .bak。</div>
+      </div>
+    </div>
+
+    <!-- 上下文：已勾选模型的窗口总览 + 挡位 + 重置；steering 只读。类名不用 .ctx-card（用量页方法 B 已占用） -->
+    <div class="card fcard ctxmgr-card" id="ctxMgrCard">
+      <div class="cardhead fold" data-fold="ctxMgrCard" role="button" tabindex="0" aria-expanded="true">
+        <span class="fchev">▶</span><h3>上下文</h3><span class="muted" id="ctxSum">--</span>
+      </div>
+      <div class="fbody">
+        <div class="hint" style="margin-top:0">Kiro 按每个模型报出的窗口算用量百分比：≥ 80% 自动摘要、≥ 95% 截断。上游返回「上下文超长」时本扩展已转成 Kiro 认得的溢出异常（Kiro 会自动压缩后重试，内建、无需开关）。窗口来源优先级：渠道 /models 字段 → 内置厂商表 → models.dev → 默认 200K；你的覆盖优先于全部。</div>
+        <div class="btns" style="margin:8px 0;">
+          <button class="btn btn-ghost btn-sm" id="ctxResetAll" disabled>全部重置为自动</button>
+        </div>
+        <div id="ctxMgrRows"></div>
+        <div class="csteer" id="ctxSteer"></div>
+      </div>
+    </div>
+
     <!-- 本地端口与核心端点设置（仅在设置页显示） -->
     <div class="card">
       <div class="cardhead" style="margin-bottom:8px;">
@@ -3132,7 +3949,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         <button class="btn btn-ghost" id="ghRepo" style="flex:1;">${ghSvg}GitHub 项目主页</button>
         <button class="btn btn-ghost" id="checkUpdate" style="flex:1;">检查更新</button>
       </div>
-      <div class="hint">开源于 GitHub。「检查更新」会比对仓库最新 Release，有新版就直接下载 .vsix 并安装，装好后提示重新加载窗口；面板左上角的两枚图标是同样的入口。</div>
+      <div class="hint">开源于 GitHub。「检查更新」会比对仓库最新 Release，有新版就直接下载 .vsix 并安装，装好后提示重新加载窗口；视图标题栏右侧的两个图标是同样的入口。</div>
     </div>
   </div>
 
@@ -3207,6 +4024,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   let modelCounts = {};
   let modelsByProvider = {};
+  // 每行「上下文」下拉的数据（扩展 ctxWindows 消息）：键 = Kiro 里的模型 id（小写）；值 = { candidates, effective, resolved, source, known, ... }
+  let ctxRows = {};
+  let agentModal = null;
   let lastProviders = [];
   let lastPresets = [];
   let lastVendors = [];
@@ -4259,7 +5079,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (activeProbe) { try { activeProbe.dispose(); } catch (e) { /* ignore */ } activeProbe = null; }
     setModalKey(null);
     // 登录弹窗关掉不取消登录：用户可能正在浏览器里授权，回来发现 provider 已经建好（扩展会 toast）。
-    $('modalRoot').innerHTML = ''; addModal = null; editModal = null; oauthModal = null; ccModal = null;
+    $('modalRoot').innerHTML = ''; addModal = null; editModal = null; oauthModal = null; ccModal = null; mcpImportModal = null;
   }
   // 确认弹窗：和其它弹窗同一套皮（不再弹系统原生对话框）。{ icon, iconId, fallbackId, title, desc, okText, danger, onOk }
   function confirmModal(o) {
@@ -5437,7 +6257,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         snapHeatmapToLatest();
         if (currentUsageMsg) {
           renderTrendCurve(currentUsageMsg.providers || [], currentUsageMsg.trend || [], currentUsageMsg.seriesTrend || [], currentUsageMsg.range || "today");
-          renderSankey(currentUsageMsg.sankey || { nodes: [], links: [] });
+          renderSankey(currentSankeyData());
         }
       });
     }
@@ -5487,7 +6307,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         lastWidth = width;
         cancelAnimationFrame(sankeyFrame);
         sankeyFrame = requestAnimationFrame(() => {
-          if (currentUsageMsg && curTab === 'usage') renderSankey(currentUsageMsg.sankey);
+          if (currentUsageMsg && curTab === 'usage') renderSankey(currentSankeyData());
         });
       }).observe(sankeyBox);
     }
@@ -5497,7 +6317,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       snapHeatmapToLatest();
       if (currentUsageMsg && curTab === 'usage') {
         renderTrendCurve(currentUsageMsg.providers || [], currentUsageMsg.trend || [], currentUsageMsg.seriesTrend || [], currentUsageMsg.range || "today");
-        renderSankey(currentUsageMsg.sankey);
+        renderSankey(currentSankeyData());
       }
     });
   }
@@ -5587,6 +6407,52 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   const kiroIdOf = (mm) => mm.kiroId || mm.id;
   function isDefaultRow(p, mm) { return !!selectedModel && selectedModel.toLowerCase() === kiroIdOf(mm).toLowerCase(); }
 
+  // 上下文挡位标签（与 src/contextWindow.ts formatContextTokens 同口径）：整千按十进制（128000 → 128K），
+  // 1024 的倍数按二进制（131072 → 128K、204800 → 200K、1048576 → 1M），其余保留一位小数。
+  function fmtCtx(n) {
+    n = Number(n);
+    if (!(n > 0)) return '?';
+    const f = (v, u) => (Number.isInteger(v) ? String(v) : v.toFixed(1)) + u;
+    if (n % 1000 !== 0 && n % 1024 === 0) { const k = n / 1024; return k >= 1024 ? f(k / 1024, 'M') : f(k, 'K'); }
+    const k = n / 1000;
+    return k >= 1000 ? f(k / 1000, 'M') : f(k, 'K');
+  }
+  // 来源标签；default 只在三来源都缺时出现（有任何来源就不会落到默认），所以直接写成「未知」
+  const CTX_SRC = { override: '你的覆盖', upstream: '渠道 /models 字段', vendor: '内置厂商表', catalog: 'models.dev 目录', default: '未知，按默认 200K' };
+  // 每行「上下文」下拉（4.13.55）：数据来自扩展 ctxWindows 消息（与 CPS 广播同一套算法）。候选 = 标准梯子 ≤ 已知最大窗口 ∪ 各来源
+  // 精确值；当前值 = 用户覆盖 ?? 解析值。Kiro 按这里报出的窗口算用量百分比与 80% / 95% 压缩阈值——上游拒收长输入的模型选小一档即可。
+  // 选项分两组：「自动 · 来源」（解析值，选它 = 清除覆盖、回到跟随目录）与「手动覆盖」（其余挡位）——显示文案只有数字，窄面板里
+  // 不再挤掉模型名。乐观更新：先改本地副本立刻重画，扩展回推 ctxWindows 时以真实状态覆盖。
+  function ctxCell(p, mm) {
+    const r = ctxRows[kiroIdOf(mm).toLowerCase()];
+    if (!r || !Array.isArray(r.candidates) || !r.candidates.length) return null;
+    const sel = document.createElement('select');
+    sel.className = 'ctxsel' + (r.source === 'override' ? ' ov' : '');
+    const opt = (v) => { const o = document.createElement('option'); o.value = String(v); o.textContent = fmtCtx(v); if (v === r.effective) o.selected = true; return o; };
+    const autoV = r.candidates.includes(r.resolved) ? r.resolved : null;
+    if (autoV !== null) {
+      const ga = document.createElement('optgroup'); ga.label = '自动 · ' + (CTX_SRC[r.resolvedSource] || r.resolvedSource || '目录');
+      ga.appendChild(opt(autoV));
+      const gm = document.createElement('optgroup'); gm.label = '手动覆盖';
+      for (const v of r.candidates) if (v !== autoV) gm.appendChild(opt(v));
+      sel.appendChild(ga); sel.appendChild(gm);
+    } else {
+      for (const v of r.candidates) sel.appendChild(opt(v));
+    }
+    sel.title = '上下文窗口：' + fmtCtx(r.effective) + ' tokens（' + (CTX_SRC[r.source] || r.source) + '）。Kiro 按它算用量百分比，到 80% 自动摘要、95% 截断；'
+      + '上游拒收长输入时选小一档，选「自动」组里的那项即回到跟随目录。改动会即时同步到 Kiro 右侧选择器（下一轮请求起生效）。';
+    sel.addEventListener('click', (e) => e.stopPropagation());
+    sel.addEventListener('dblclick', (e) => e.stopPropagation());
+    sel.addEventListener('change', () => {
+      const v = Number(sel.value);
+      const auto = v === r.resolved;
+      r.effective = v; r.source = auto ? r.resolvedSource : 'override'; r.override = auto ? null : v;
+      renderModels();
+      vscode.postMessage({ type: 'setCtxWindow', modelId: kiroIdOf(mm), tokens: auto ? null : v });
+    });
+    return sel;
+  }
+
   function modelLine(p, mm, mode) {
     const isCur = mode === 'del' && isDefaultRow(p, mm);
     const isChecked = mode === 'del' && editMode && checked.has(ckey(p.id, mm.id));
@@ -5609,6 +6475,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       line.appendChild(mid);
     }
     for (const t of capTags(mm)) line.appendChild(t);
+    if (mode === 'del') {
+      // 已在 Kiro 列表里的行才有「上下文」下拉（候选池里的模型没进 CPS 广播，也就没有 Kiro 侧的窗口可调）
+      const ctx = ctxCell(p, mm);
+      if (ctx) line.appendChild(ctx);
+    }
     if (mode === 'del') {
       if (editMode) {
         // 编辑态：点整行勾/取消勾；不响应双击设默认。
@@ -5770,38 +6641,32 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   $('showAdd').addEventListener('click', openSelectModal);
   $('log').addEventListener('click', () => vscode.postMessage({ type: 'openLog' }));
   $('catRefresh').addEventListener('click', () => vscode.postMessage({ type: 'refreshCatalog' }));
-  // GitHub 入口（头部图标 + 设置页按钮）与「检查更新」（头部图标 + 设置页按钮）：两处各共用同一条宿主消息
+  // 设置页 GitHub / 检查更新（标题栏入口走 view/title 命令，不在 webview 顶栏）
   const openGitHub = () => vscode.postMessage({ type: 'openExternal', url: ${JSON.stringify(GITHUB_URL)} });
   $('ghRepo') && $('ghRepo').addEventListener('click', openGitHub);
-  $('hdrGh') && $('hdrGh').addEventListener('click', openGitHub);
-  // 点了先本地进入 busy（转圈、禁点），宿主随后推 updateState 接管；宿主没回也 15 秒自动复位，不会一直卡在转圈
   let updBusyTimer = 0;
   const setUpdateBusy = (on) => {
-    const h = $('hdrUpd'), s = $('checkUpdate');
-    if (h) { h.classList.toggle('busy', !!on); h.disabled = !!on; }
+    const s = $('checkUpdate');
     if (s) { s.disabled = !!on; s.textContent = on ? '检查中…' : '检查更新'; }
     if (updBusyTimer) { clearTimeout(updBusyTimer); updBusyTimer = 0; }
     if (on) updBusyTimer = setTimeout(() => setUpdateBusy(false), 15000);
   };
   const requestUpdate = () => { setUpdateBusy(true); vscode.postMessage({ type: 'checkUpdate' }); };
   $('checkUpdate') && $('checkUpdate').addEventListener('click', requestUpdate);
-  $('hdrUpd') && $('hdrUpd').addEventListener('click', requestUpdate);
-  // 宿主推来的更新状态：有新版 → 右上角小圆点 + title 改成版本号；已装好待重载 → 同样亮点、文案换；busy → 转圈
   function applyUpdateState(m) {
-    const h = $('hdrUpd');
-    if (!h) return;
     setUpdateBusy(!!m.busy);
     const latest = m.latest ? String(m.latest).replace(/^v/i, '') : '';
     const installed = m.installed ? String(m.installed).replace(/^v/i, '') : '';
     const pending = !!installed && !m.hasUpdate;
-    h.classList.toggle('has-update', !!m.hasUpdate || pending);
     const t = m.busy ? '正在检查更新…'
       : pending ? ('已安装 v' + installed + '，重新加载窗口后生效')
       : m.hasUpdate ? ('有新版本 v' + latest + '，点击更新') + (m.current ? '（当前 v' + m.current + '）' : '')
       : '检查更新（从 GitHub 下载并安装最新版）' + (m.current ? ' · 当前 v' + m.current : '');
-    h.title = t; h.setAttribute('aria-label', t);
     const s = $('checkUpdate');
-    if (s && !m.busy) s.textContent = m.hasUpdate ? ('更新到 v' + latest) : '检查更新';
+    if (s) {
+      s.title = t;
+      if (!m.busy) s.textContent = pending ? ('已安装 v' + installed) : m.hasUpdate ? ('更新到 v' + latest) : '检查更新';
+    }
   }
 
   // ---------- 用量页 ----------
@@ -5859,13 +6724,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   document.querySelectorAll('.useg-sk button').forEach((b) => b.addEventListener('click', () => {
     document.querySelectorAll('.useg-sk button').forEach((x) => x.classList.toggle('sel', x === b));
     sankeyDim = b.dataset.sk;
-    const subEl = $('sankeySub');
-    if (subEl) {
-      subEl.innerHTML = sankeyDim === 'tokens'
-        ? '渠道 &rarr; 凭证 &rarr; 模型 &rarr; 状态 &rarr; 缓存命中 / Token 细分'
-        : '渠道 &rarr; 凭证 &rarr; 模型 &rarr; 状态';
+    if (currentUsageMsg) {
+      renderSankeyPathBar();
+      renderSankey(currentSankeyData());
     }
-    if (currentUsageMsg) renderSankey(currentUsageMsg.sankey || { nodes: [], links: [] });
   }));
 
   $('uRefresh').addEventListener('click', () => { $('uRefresh').textContent = '…'; vscode.postMessage({ type: 'refreshUsage' }); });
@@ -5946,8 +6808,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (!box || !legBox) return;
     // 维度：Token（默认）或请求次数。同一份时间序列，两个维度各自成图；标题随维度切换。
     const isTok = curveDim !== 'requests';
+    // 「今天」的点位是 10 分钟槽，不是「每日」（4.13.55）；7d / 30d / all 仍按日。
+    const isToday = currentRange === 'today';
     const title = document.getElementById('trendTitle');
-    if (title) title.textContent = isTok ? '每日 Token 趋势图' : '每日 请求 趋势图';
+    if (title) title.textContent = (isToday ? '今日 ' : '每日 ') + (isTok ? 'Token 趋势图' : '请求 趋势图');
     const valOf = (d) => (isTok ? d.tokens : d.requests) || 0;
     const modelValOf = (d, m) => ((isTok ? d.modelTokens : d.modelRequests) || {})[m] || 0;
     const fmtVal = (v) => (isTok ? tokShort(v) : fmt(Math.round(v)));
@@ -5973,9 +6837,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       legBox.innerHTML = '';
       return;
     }
-    // 「全部」范围的连续序列会从纪元起逐日补零（宿主按 range.from=0 生成）；超过一个月的序列只保留首个有数据的点起的尾段，
-    // 无数据时保留最新 31 点。挤压时优先显示最新日期，也避免几万个隐藏悬停节点。
-    if (dataPoints.length > 31) {
+    // 多天范围的长序列只保留首个有数据的点起的尾段（无数据时保留最新 31 点）：挤压时优先显示最新日期，也避免几万个隐藏悬停节点
+    // （4.13.53 起宿主侧「全部」已不再从纪元补零，这里只剩兜底）。「今天」不裁：它是 10 分钟细桶（4.13.49，最多 144 点），
+    // 横轴必须从 00:00 画到当前槽——此前过了 05:10 就被这段裁成「从首个有用量的槽起」（4.13.55 修）。
+    if (!isToday && dataPoints.length > 31) {
       const first = dataPoints.findIndex((p) => (p.tokens > 0) || (p.requests > 0));
       const keepFrom = first < 0 ? dataPoints.length - 31 : Math.min(first, dataPoints.length - 7);
       if (keepFrom > 0) dataPoints = dataPoints.slice(keepFrom);
@@ -6371,7 +7236,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         if (b.id === 's:failed') return -1;
         const orderTok = { 't:cache_read': 1, 't:cache_write': 2, 't:input': 3, 't:output': 4 };
         if (orderTok[a.id] && orderTok[b.id]) return orderTok[a.id] - orderTok[b.id];
-        const orderCtx = { 'ctx:files': 1, 'ctx:history': 2, 'ctx:tools': 3, 'ctx:rules': 4, 'ctx:current': 5, 'out:completion': 6 };
+        const orderCtx = { 'out:cache_read': 1, 'out:cache_write': 2, 'ctx:userPrompts': 3, 'ctx:kiroResponses': 4, 'ctx:sessionFiles': 5, 'ctx:builtinTools': 6, 'ctx:mcpTools': 7, 'ctx:steering': 8, 'ctx:legacy': 9, 'out:completion': 10 };
         if (orderCtx[a.id] && orderCtx[b.id]) return orderCtx[a.id] - orderCtx[b.id];
         return (b.value - a.value) || a.id.localeCompare(b.id);
       });
@@ -6443,6 +7308,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const box = $('uSankeySvg');
     if (!box) return;
     if (kTipTarget && box.contains(kTipTarget)) hideKTip();
+    const layerSet = new Set();
+    ((data && data.nodes) || []).forEach((n) => {
+      if (!n || typeof n.id !== 'string') return;
+      if (sankeyDim === 'requests' && /^(t:|ctx:|out:)/.test(n.id)) return;
+      layerSet.add(n.layer);
+    });
+    const L = layerSet.size;
+    box.style.minWidth = Math.max(960, 180 + 195 * Math.max(0, L - 1)) + 'px';
     const layout = layoutSankey(data, sankeyDim, box.clientWidth);
     // 显式 CSS 像素高度避免宽屏按 SVG 宽高比把整张图拉长。
     box.style.height = layout.height + 'px';
@@ -6521,7 +7394,72 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     box.innerHTML = svg + '</svg>';
   }
 
-  
+  function currentSankeyData() {
+    if (!currentUsageMsg) return { nodes: [], links: [] };
+    if (sankeyDim === 'requests') return currentUsageMsg.sankeyRequests || currentUsageMsg.sankey || { nodes: [], links: [] };
+    return currentUsageMsg.sankey || { nodes: [], links: [] };
+  }
+
+  function renderSankeyPathBar() {
+    const box = $('sankeyPathCaps');
+    if (!box) return;
+    const catalog = sankeyDim === 'requests'
+      ? ['provider', 'credential', 'model', 'status']
+      : ['provider', 'credential', 'model', 'status', 'tokenType', 'context'];
+    const labels = { provider: '渠道', credential: '凭证', model: '模型', status: '状态', tokenType: 'Token 类型', context: '上下文类别' };
+    const saved = ((currentUsageMsg && currentUsageMsg.sankeyLayers) || {})[sankeyDim] || catalog;
+    const enabled = new Set(saved);
+    const data = currentSankeyData();
+    const unavailable = new Set((data && data.unavailableLayers) || []);
+    const onCount = catalog.filter((id) => enabled.has(id)).length;
+    let html = '';
+    catalog.forEach((id, i) => {
+      if (i) html += '<span class="sk-sep">›</span>';
+      const on = enabled.has(id);
+      const na = unavailable.has(id);
+      const lock = on && onCount <= 2 && !na;
+      const cls = 'sk-cap' + (na ? ' na' : on ? ' on' : ' off') + (lock ? ' lock' : '');
+      const tip = na
+        ? '当前范围明细已裁、改走小时桶，无凭证层'
+        : lock
+          ? '至少保留两层'
+          : (on ? '点击隐藏这一层' : '点击显示这一层');
+      html += '<button type="button" class="' + cls + '" data-layer="' + id + '" aria-pressed="' + (on && !na ? 'true' : 'false') + '" data-k-tip="' + tip + '">' + labels[id] + '</button>';
+    });
+    box.innerHTML = html;
+    const sub = $('sankeySub');
+    if (sub) {
+      sub.innerHTML = catalog.filter((id) => enabled.has(id)).map((id) => labels[id]).join(' &rarr; ');
+    }
+  }
+
+  const pathCaps = $('sankeyPathCaps');
+  if (pathCaps) {
+    pathCaps.addEventListener('click', (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('.sk-cap') : null;
+      if (!btn || !btn.dataset.layer) return;
+      if (btn.classList.contains('na') || btn.classList.contains('lock')) return;
+      if (!currentUsageMsg) return;
+      const catalog = sankeyDim === 'requests'
+        ? ['provider', 'credential', 'model', 'status']
+        : ['provider', 'credential', 'model', 'status', 'tokenType', 'context'];
+      const saved = ((currentUsageMsg && currentUsageMsg.sankeyLayers) || {})[sankeyDim] || catalog;
+      const next = new Set(saved);
+      const id = btn.dataset.layer;
+      if (next.has(id)) {
+        if (next.size <= 2) return;
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      const ordered = catalog.filter((x) => next.has(x));
+      if (!currentUsageMsg.sankeyLayers) currentUsageMsg.sankeyLayers = { tokens: catalog, requests: ['provider', 'credential', 'model', 'status'] };
+      currentUsageMsg.sankeyLayers[sankeyDim] = ordered;
+      renderSankeyPathBar();
+      vscode.postMessage({ type: 'sankeyLayers', dim: sankeyDim, layers: ordered });
+    });
+  }
+
   function renderContextBreakdownCard(cb) {
     if (!cb) return;
     const total = cb.totalInputTokens || 0;
@@ -6539,11 +7477,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (pctEl) pctEl.textContent = '(' + pct.toFixed(1) + '%)';
     };
 
-    setSeg('ctxSegFiles', 'ctxValFiles', 'ctxPctFiles', cb.filesTokens || 0, cb.filesPct || 0, '关联代码文件');
-    setSeg('ctxSegHistory', 'ctxValHistory', 'ctxPctHistory', cb.historyTokens || 0, cb.historyPct || 0, '历史会话记录');
-    setSeg('ctxSegTools', 'ctxValTools', 'ctxPctTools', cb.toolsTokens || 0, cb.toolsPct || 0, '工具规格定义');
-    setSeg('ctxSegRules', 'ctxValRules', 'ctxPctRules', cb.rulesTokens || 0, cb.rulesPct || 0, '系统规则设定');
-    setSeg('ctxSegCurrent', 'ctxValCurrent', 'ctxPctCurrent', cb.currentInputTokens || 0, cb.currentPct || 0, '当前用户指令');
+    setSeg('ctxSegPrompts', 'ctxValPrompts', 'ctxPctPrompts', cb.userPromptsTokens || 0, cb.userPromptsPct || 0, '用户提示');
+    setSeg('ctxSegResponses', 'ctxValResponses', 'ctxPctResponses', cb.kiroResponsesTokens || 0, cb.kiroResponsesPct || 0, 'Kiro 回复');
+    setSeg('ctxSegSession', 'ctxValSession', 'ctxPctSession', cb.sessionFilesTokens || 0, cb.sessionFilesPct || 0, '会话文件');
+    setSeg('ctxSegBuiltin', 'ctxValBuiltin', 'ctxPctBuiltin', cb.builtinToolsTokens || 0, cb.builtinToolsPct || 0, '内置工具');
+    setSeg('ctxSegMcp', 'ctxValMcp', 'ctxPctMcp', cb.mcpToolsTokens || 0, cb.mcpToolsPct || 0, 'MCP 工具');
+    setSeg('ctxSegSteering', 'ctxValSteering', 'ctxPctSteering', cb.steeringTokens || 0, cb.steeringPct || 0, 'Steering 文件');
+    const legacy = cb.legacyTokens || 0;
+    setSeg('ctxSegLegacy', 'ctxValLegacy', 'ctxPctLegacy', legacy, cb.legacyPct || 0, '旧记录未细分');
+    const row = $('ctxItemLegacy');
+    if (row) row.classList.toggle('on', legacy > 0);
   }
 
   function renderUsage(m) {
@@ -6570,7 +7513,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     renderDonut(m.modelRatios || []);
 
     // 5. 桑基分流数图
-    renderSankey(m.sankey || { nodes: [], links: [] });
+    renderSankeyPathBar();
+    renderSankey(currentSankeyData());
 
     // 5.1 Cursor 风格上下文微观构成卡片 (方法 B)
     if (m.contextBreakdown) {
@@ -6737,6 +7681,690 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
   $('showAddPrompt').addEventListener('click', () => openPromptModal(null));
 
+  // ---------- 设置页 · MCP 服务器：直接读写 Kiro 的 mcp.json（用户级 / 工作区级） ----------
+  // 宿主 mcp 消息带两份文件的列表（只有 env / headers 的键名）；作用域选中态只在 webview。
+  // 编辑要看明文 → 先 mcpGet，宿主回 mcpServer 再开弹窗；关弹窗即丢，不缓存。
+  let mcpState = null;
+  let mcpScope = 'user';
+  let mcpPendingEdit = null;   // { scope, name }：等宿主回 mcpServer
+  let mcpImportModal = null;   // { modal, box, kind: 'paste' | 'cc' }
+  const mcpInfo = () => (mcpState ? (mcpScope === 'workspace' ? mcpState.workspace : mcpState.user) : null);
+  const mcpNames = () => { const i = mcpInfo(); return i ? i.servers.map((s) => s.name) : []; };
+  function mcpShortPath(p) { const segs = String(p || '').split(/[\\\\/]+/).filter(Boolean); return (segs.length > 3 ? '…/' : '') + segs.slice(-3).join('/'); }
+  // 与扩展侧 parseJsonc 同口径的容错解析（预览用；真正写盘以扩展侧为准）
+  function mcpParseJsonc(text) {
+    let src = String(text || ''); if (src.charCodeAt(0) === 0xfeff) src = src.slice(1);
+    const out = []; let i = 0; const n = src.length; let inStr = false;
+    while (i < n) {
+      const ch = src[i];
+      if (inStr) { out.push(ch); if (ch === '\\\\' && i + 1 < n) { out.push(src[i + 1]); i += 2; continue; } if (ch === '"') inStr = false; i++; continue; }
+      if (ch === '"') { inStr = true; out.push(ch); i++; continue; }
+      if (ch === '/' && src[i + 1] === '/') { const nl = src.indexOf('\\n', i); i = nl === -1 ? n : nl; continue; }
+      if (ch === '/' && src[i + 1] === '*') { const e = src.indexOf('*/', i + 2); i = e === -1 ? n : e + 2; continue; }
+      if (ch === ',') { let j = i + 1; while (j < n && /\\s/.test(src[j])) j++; if (j < n && (src[j] === '}' || src[j] === ']')) { i++; continue; } }
+      out.push(ch); i++;
+    }
+    const s = out.join('');
+    return s.trim() === '' ? {} : JSON.parse(s);
+  }
+  const mcpIsObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  function mcpIsHttpsOrLocalhost(u) { try { const x = new URL(u); if (x.protocol === 'https:') return true; const h = x.hostname; return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'; } catch (e) { return false; } }
+
+  function renderMcp() {
+    const wrap = $('mcpList'); if (!wrap) return;
+    const st = mcpState;
+    if (st && mcpScope === 'workspace' && !st.workspaceAvailable) mcpScope = 'user';
+    for (const b of document.querySelectorAll('.mcpseg button')) {
+      const sc = b.dataset.mscope;
+      const on = sc === mcpScope;
+      b.classList.toggle('sel', on); b.setAttribute('aria-selected', on ? 'true' : 'false');
+      if (sc === 'workspace') {
+        const ok = !!(st && st.workspaceAvailable);
+        b.disabled = !ok;
+        b.title = !ok ? '当前没有打开工作区文件夹，没有工作区级 mcp.json' : ('<工作区>/.kiro/settings/mcp.json，只对 ' + (st.workspaceName || '当前工作区') + ' 生效' + (st.workspaceTrusted === false ? '；工作区未受信任时 Kiro 不加载它' : ''));
+      }
+    }
+    wrap.innerHTML = '';
+    const info = mcpInfo();
+    const pathTxt = $('mcpPathTxt'), note = $('mcpNote');
+    note.innerHTML = ''; note.className = 'mcpnote hidden';
+    if (!info) { pathTxt.textContent = '--'; pathTxt.title = ''; return; }
+    pathTxt.textContent = mcpShortPath(info.path) + (info.exists ? '' : '（尚未创建，首次保存时生成）');
+    pathTxt.title = info.path || '';
+    if (info.error) {
+      note.className = 'mcpnote err'; note.textContent = '这份 mcp.json 解析失败，已停止写入以免损坏：' + info.error + '。请在 Kiro 中打开修正。';
+    } else if (st && st.kiroMcpEnabled === false) {
+      note.className = 'mcpnote';
+      const t = document.createElement('span'); t.textContent = 'Kiro 尚未启用 MCP 支持（设置 kiroAgent.configureMCP 为 Disabled），这里保存的服务器不会被连接。'; note.appendChild(t);
+      const b = document.createElement('button'); b.className = 'btn btn-ghost btn-sm'; b.textContent = '在 Kiro 中启用'; b.addEventListener('click', () => vscode.postMessage({ type: 'mcpEnableKiro' })); note.appendChild(b);
+    } else if (info.hasComments) {
+      note.className = 'mcpnote'; note.textContent = '这份文件含注释：本扩展保存时会去掉注释（首次保存前已备份为 mcp.json.api4kiro.bak）。';
+    }
+    $('mcpAdd').disabled = !!info.error; $('mcpImport').disabled = !!info.error; $('mcpCc').disabled = !!info.error;
+    if (info.error) return;
+    if (!info.servers.length) {
+      const e = document.createElement('div'); e.className = 'empty';
+      e.textContent = mcpScope === 'workspace' ? '这个工作区还没有自己的 MCP 服务器。这里加的只对本工作区生效，并覆盖用户级同名服务器。' : '还没有 MCP 服务器。点「添加 MCP 服务器」，或把其它工具里的 mcp.json 片段粘进来。';
+      wrap.appendChild(e); return;
+    }
+    for (const s of info.servers) {
+      const row = document.createElement('div'); row.className = 'prow mcprow' + (s.disabled ? ' off' : ' on'); row.dataset.name = s.name;
+      const sw = document.createElement('label'); sw.className = 'switch'; sw.title = s.disabled ? '启用（Kiro 会自动连接）' : '停用（Kiro 会断开）';
+      sw.innerHTML = '<input type="checkbox"><span class="slider"></span>';
+      const chk = sw.querySelector('input'); chk.checked = !s.disabled;
+      chk.addEventListener('change', (e) => {
+        const on = e.target.checked; s.disabled = !on; renderMcp();
+        vscode.postMessage({ type: 'mcpToggle', scope: mcpScope, name: s.name, disabled: !on });
+      });
+      row.appendChild(sw);
+      const t = document.createElement('div'); t.className = 'ltext';
+      const n = document.createElement('div'); n.className = 'ln';
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = s.name; nm.title = s.name; n.appendChild(nm);
+      const tp = document.createElement('span'); tp.className = 'mtype ' + s.transport;
+      tp.textContent = s.transport === 'stdio' ? 'stdio' : s.transport === 'http' ? 'http' : '无效';
+      tp.title = s.transport === 'stdio' ? '本地进程（command）' : s.transport === 'http' ? '远程 HTTP（url）' : '既没有 command 也没有 url，Kiro 会忽略这台';
+      n.appendChild(tp);
+      if (s.autoApprove && s.autoApprove.length) {
+        const a = document.createElement('span'); a.className = 'mauto';
+        a.textContent = s.autoApprove.includes('*') ? '自动批准全部' : ('自动批准 ' + s.autoApprove.length);
+        a.title = '免确认工具：' + s.autoApprove.join(', '); n.appendChild(a);
+      }
+      const ls = document.createElement('div'); ls.className = 'ls';
+      const extra = [];
+      if (s.envKeys && s.envKeys.length) extra.push(s.envKeys.length + ' 个环境变量');
+      if (s.headerKeys && s.headerKeys.length) extra.push(s.headerKeys.length + ' 个请求头');
+      if (s.timeout) extra.push('超时 ' + s.timeout + ' ms');
+      ls.textContent = (s.summary || '（未配置命令 / 地址）') + (extra.length ? '  ·  ' + extra.join(' · ') : '');
+      ls.title = (s.summary || '') + (s.envKeys && s.envKeys.length ? '\\n环境变量：' + s.envKeys.join(', ') : '') + (s.headerKeys && s.headerKeys.length ? '\\n请求头：' + s.headerKeys.join(', ') : '');
+      t.appendChild(n); t.appendChild(ls); row.appendChild(t);
+      const act = document.createElement('div'); act.className = 'lact';
+      const ed = document.createElement('button'); ed.className = 'iconbtn'; ed.title = '编辑'; ed.setAttribute('aria-label', '编辑'); ed.innerHTML = ICON_PENCIL;
+      ed.addEventListener('click', () => { mcpPendingEdit = { scope: mcpScope, name: s.name }; vscode.postMessage({ type: 'mcpGet', scope: mcpScope, name: s.name }); });
+      const del = document.createElement('button'); del.className = 'iconbtn del'; del.title = '删除'; del.setAttribute('aria-label', '删除'); del.innerHTML = ICON_TRASH;
+      del.addEventListener('click', () => confirmModal({
+        icon: s.name, iconId: 'glyph:layers-iso', title: '删除 MCP 服务器「' + s.name + '」？',
+        desc: '只从' + (mcpScope === 'workspace' ? '工作区级' : '用户级') + ' mcp.json 里移除这一条，Kiro 会断开它。首次写入前已备份 mcp.json.api4kiro.bak。', okText: '删除', danger: true,
+        onOk: () => vscode.postMessage({ type: 'mcpDelete', scope: mcpScope, name: s.name, confirmed: true }),
+      }));
+      act.appendChild(ed); act.appendChild(del); row.appendChild(act);
+      wrap.appendChild(row);
+    }
+  }
+
+  // 键值行（env / headers）：键名等宽输入 + 值走 Key 眼睛打码输入 + 删除
+  function mcpKvRow(host, k, v, keyPh, valPh) {
+    const row = document.createElement('div'); row.className = 'mcpkv';
+    row.innerHTML = '<input class="kk" type="text" spellcheck="false" autocomplete="off" placeholder="' + esc(keyPh) + '">' + keyInput('kv', valPh) + '<button type="button" class="iconbtn del" title="删除这一行" aria-label="删除这一行">' + ICON_TRASH + '</button>';
+    row.querySelector('.kk').value = k || '';
+    row.querySelector('.kv').value = v == null ? '' : String(v);
+    row.querySelector('.iconbtn.del').addEventListener('click', () => row.remove());
+    bindEyes(row);
+    host.appendChild(row);
+    return row;
+  }
+  function mcpReadKv(host) {
+    const out = {}; const errs = [];
+    for (const r of host.querySelectorAll('.mcpkv')) {
+      const k = r.querySelector('.kk').value.trim(), v = r.querySelector('.kv').value;
+      if (!k && !v) continue;
+      if (!k) { errs.push('有一行值没有键名'); continue; }
+      if (k in out) { errs.push('键名重复：' + k); continue; }
+      out[k] = v;
+    }
+    return { rec: out, errs };
+  }
+  const mcpLines = (s) => String(s || '').split(/[\\n,]/).map((x) => x.trim()).filter(Boolean);
+
+  // 添加 / 编辑弹窗。existing = { name, server }（server 含 env / headers 明文）或 null。
+  function openMcpModal(scope, existing) {
+    const editing = !!existing;
+    const cur = editing ? existing.server : {};
+    const modal = buildModal('', editing ? '编辑 MCP 服务器' : '添加 MCP 服务器', (scope === 'workspace' ? '写入工作区级' : '写入用户级') + ' mcp.json；保存即生效，Kiro 会自动重连这台服务器。');
+    modal.classList.add('mcp');
+    const box = document.createElement('div'); box.className = 'mcpform';
+    box.innerHTML =
+      '<label>名称</label><input class="mName" type="text" spellcheck="false" autocomplete="off" placeholder="例如：fetch、github、我的服务器" maxlength="120">'
+      + '<label>类型</label><div class="seg mtseg" role="tablist"><button type="button" data-t="stdio">本地进程 stdio</button><button type="button" data-t="http">远程 HTTP</button></div>'
+      + '<div class="grp g-stdio">'
+      +   '<label>命令 <span class="lblhint">可执行文件或命令名</span></label><input class="mCmd" type="text" spellcheck="false" autocomplete="off" placeholder="例如：npx、uvx、C:\\\\tools\\\\server.exe">'
+      +   '<label>参数 <span class="lblhint">每行一个</span></label><textarea class="mArgs" spellcheck="false" placeholder="-y&#10;@modelcontextprotocol/server-fetch"></textarea>'
+      +   '<label>环境变量 <span class="lblhint">值默认打码，点眼睛查看；可写 &#36;{VAR} 引用（需在 Kiro 里批准）</span></label><div class="mEnv"></div><button type="button" class="btn btn-ghost btn-sm kvadd mEnvAdd">' + ICON_PLUS + ' 添加变量</button>'
+      +   '<label>工作目录 <span class="lblhint">可选（cwd）</span></label><input class="mCwd" type="text" spellcheck="false" autocomplete="off" placeholder="留空 = Kiro 默认">'
+      + '</div>'
+      + '<div class="grp g-http">'
+      +   '<label>URL <span class="lblhint">https，或 localhost / 127.0.0.1 的 http</span></label><input class="mUrl" type="text" spellcheck="false" autocomplete="off" placeholder="https://example.com/mcp">'
+      +   '<label>请求头 <span class="lblhint">值默认打码；可写 &#36;{VAR}</span></label><div class="mHdr"></div><button type="button" class="btn btn-ghost btn-sm kvadd mHdrAdd">' + ICON_PLUS + ' 添加请求头</button>'
+      + '</div>'
+      + '<label>超时 <span class="lblhint">毫秒，可选；留空 = Kiro 默认</span></label><input class="mTimeout" type="number" min="1" step="1" placeholder="例如 60000">'
+      + '<label>自动批准的工具 <span class="lblhint">逗号或换行分隔；* = 全部工具免确认</span></label><textarea class="mAuto" spellcheck="false" placeholder="read_file, list_directory"></textarea>'
+      + '<label>禁用的工具 <span class="lblhint">可选；这些工具不提供给模型</span></label><textarea class="mDis" spellcheck="false" placeholder="delete_file"></textarea>'
+      + '<label class="mcpsw"><span class="switch"><input type="checkbox" class="mEnabled"><span class="slider"></span></span><span>启用这台服务器</span></label>'
+      + '<div class="ferr"></div>'
+      + '<div class="mfootbtns"><button class="btn btn-primary mSave">保存</button><button class="btn btn-ghost btn-sm mCancel">取消</button></div>';
+    modal.appendChild(box);
+    const q = (s) => box.querySelector(s);
+    const name = q('.mName'), cmd = q('.mCmd'), args = q('.mArgs'), env = q('.mEnv'), cwd = q('.mCwd'), url = q('.mUrl'), hdr = q('.mHdr'), timeout = q('.mTimeout'), auto = q('.mAuto'), dis = q('.mDis'), enabled = q('.mEnabled'), ferr = q('.ferr'), save = q('.mSave');
+    // 与 Kiro 同序：有 command 即 stdio，否则有 url 即 http
+    let ttype = cur.command ? 'stdio' : cur.url ? 'http' : 'stdio';
+    const paintType = () => {
+      for (const b of box.querySelectorAll('.mtseg button')) b.classList.toggle('sel', b.dataset.t === ttype);
+      q('.g-stdio').classList.toggle('hidden', ttype !== 'stdio');
+      q('.g-http').classList.toggle('hidden', ttype !== 'http');
+    };
+    for (const b of box.querySelectorAll('.mtseg button')) b.addEventListener('click', () => { ttype = b.dataset.t; paintType(); });
+    paintType();
+    if (editing) {
+      name.value = existing.name; cmd.value = cur.command || ''; args.value = Array.isArray(cur.args) ? cur.args.join('\\n') : ''; cwd.value = cur.cwd || '';
+      url.value = cur.url || ''; timeout.value = cur.timeout != null ? String(cur.timeout) : '';
+      auto.value = Array.isArray(cur.autoApprove) ? cur.autoApprove.join('\\n') : ''; dis.value = Array.isArray(cur.disabledTools) ? cur.disabledTools.join('\\n') : '';
+      if (mcpIsObj(cur.env)) for (const [k, v] of Object.entries(cur.env)) mcpKvRow(env, k, v, 'KEY', '值');
+      if (mcpIsObj(cur.headers)) for (const [k, v] of Object.entries(cur.headers)) mcpKvRow(hdr, k, v, 'Header-Name', '值');
+      enabled.checked = cur.disabled !== true;
+    } else {
+      enabled.checked = true;
+    }
+    q('.mEnvAdd').addEventListener('click', () => { const r = mcpKvRow(env, '', '', 'KEY', '值'); r.querySelector('.kk').focus(); });
+    q('.mHdrAdd').addEventListener('click', () => { const r = mcpKvRow(hdr, '', '', 'Header-Name', '值'); r.querySelector('.kk').focus(); });
+    // 收集成「差量」：清掉的字段发 null（宿主删键、未知键保留）
+    const collect = () => {
+      const errs = [];
+      const nm = name.value;
+      if (!nm.trim()) errs.push('名称不能为空'); else if (nm.trim() !== nm) errs.push('名称首尾不能有空白');
+      const taken = new Set(mcpNames()); if (editing) taken.delete(existing.name);
+      if (nm.trim() && taken.has(nm)) errs.push('已有同名服务器「' + nm + '」');
+      const server = {};
+      if (ttype === 'stdio') {
+        const c = cmd.value.trim(); if (!c) errs.push('本地服务器必须填写命令'); server.command = c || null;
+        const a = String(args.value || '').split(/\\r?\\n/).map((x) => x.trim()).filter(Boolean); server.args = a.length ? a : null;
+        const e = mcpReadKv(env); errs.push(...e.errs.map((x) => '环境变量：' + x)); server.env = Object.keys(e.rec).length ? e.rec : null;
+        server.cwd = cwd.value.trim() || null;
+        server.url = null; server.headers = null;
+      } else {
+        const u = url.value.trim(); if (!u) errs.push('远程服务器必须填写 URL'); else if (!mcpIsHttpsOrLocalhost(u)) errs.push('URL 必须是 https，或 localhost / 127.0.0.1 的 http（否则 Kiro 会忽略这台）');
+        server.url = u || null;
+        const h = mcpReadKv(hdr); errs.push(...h.errs.map((x) => '请求头：' + x)); server.headers = Object.keys(h.rec).length ? h.rec : null;
+        server.command = null; server.args = null; server.env = null; server.cwd = null;
+      }
+      const to = timeout.value.trim();
+      if (to) { const nnum = Number(to); if (!Number.isInteger(nnum) || nnum <= 0) errs.push('超时必须是正整数（毫秒）'); server.timeout = nnum; } else server.timeout = null;
+      const ap = mcpLines(auto.value); server.autoApprove = ap.length ? ap : null;
+      const dt = mcpLines(dis.value); server.disabledTools = dt.length ? dt : null;
+      server.disabled = !enabled.checked;
+      return { errs, name: nm, server };
+    };
+    const paint = () => { const r = collect(); ferr.textContent = r.errs.length ? r.errs[0] : ''; save.disabled = r.errs.length > 0; };
+    box.addEventListener('input', paint); box.addEventListener('change', paint);
+    for (const b of box.querySelectorAll('.mtseg button')) b.addEventListener('click', paint);
+    paint();
+    const doSave = () => {
+      const r = collect(); if (r.errs.length) { ferr.textContent = r.errs[0]; return; }
+      vscode.postMessage({ type: 'mcpSave', scope, name: r.name, originalName: editing ? existing.name : '', server: r.server });
+      closeModal();
+    };
+    save.addEventListener('click', doSave);
+    q('.mCancel').addEventListener('click', closeModal);
+    box.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doSave(); } });
+    setTimeout(() => (editing ? (ttype === 'stdio' ? cmd : url) : name).focus(), 30);
+    requestAnimationFrame(() => fitModalContent(modal));
+  }
+
+  // 粘贴 JSON 导入弹窗：即时预览识别到几台 / 冲突 / 错误
+  function openMcpImportModal(scope) {
+    const modal = buildModal('', '粘贴 JSON 导入 MCP 服务器', '接受 {"mcpServers":{…}}（Kiro / Claude / Cursor）、VS Code 的 {"servers":{…}} 或单台服务器对象；写入' + (scope === 'workspace' ? '工作区级' : '用户级') + ' mcp.json。');
+    modal.classList.add('mcp'); modal.classList.add('mcpimport');
+    const box = document.createElement('div'); box.className = 'mcpform';
+    box.innerHTML =
+      '<label>JSON 片段</label><textarea class="paste" spellcheck="false" placeholder="{&#10;  &quot;mcpServers&quot;: {&#10;    &quot;fetch&quot;: { &quot;command&quot;: &quot;uvx&quot;, &quot;args&quot;: [&quot;mcp-server-fetch&quot;] }&#10;  }&#10;}"></textarea>'
+      + '<div class="grp g-name hidden"><label>名称 <span class="lblhint">粘贴的是单台服务器对象，需要起个名字</span></label><input class="iName" type="text" spellcheck="false" autocomplete="off" placeholder="例如：fetch"></div>'
+      + '<div class="mcpprev"></div>'
+      + '<div class="mcpopts"><label><span class="ck on iOver">✓</span>覆盖同名服务器</label><label><span class="ck on iEnable">✓</span>导入后立即启用</label></div>'
+      + '<div class="mfootbtns"><button class="btn btn-primary iGo" disabled>导入</button><button class="btn btn-ghost btn-sm iCancel">取消</button></div>';
+    modal.appendChild(box);
+    mcpImportModal = { modal, box, kind: 'paste' };
+    const q = (s) => box.querySelector(s);
+    const ta = q('.paste'), nameWrap = q('.g-name'), iName = q('.iName'), prev = q('.mcpprev'), over = q('.iOver'), en = q('.iEnable'), go = q('.iGo');
+    over.classList.remove('on'); // 默认不覆盖：同名先提示
+    let flags = { overwrite: false, enable: true };
+    over.addEventListener('click', () => { flags.overwrite = !flags.overwrite; over.classList.toggle('on', flags.overwrite); preview(); });
+    en.addEventListener('click', () => { flags.enable = !flags.enable; en.classList.toggle('on', flags.enable); });
+    let single = false;
+    function preview() {
+      const text = ta.value; single = false;
+      if (!text.trim()) { prev.innerHTML = ''; go.disabled = true; nameWrap.classList.add('hidden'); return; }
+      let v; try { v = mcpParseJsonc(text); } catch (e) { prev.innerHTML = '<span class="bad">无法解析：' + esc(e.message) + '</span>'; go.disabled = true; nameWrap.classList.add('hidden'); return; }
+      let entries = null;
+      if (mcpIsObj(v) && mcpIsObj(v.mcpServers)) entries = v.mcpServers;
+      else if (mcpIsObj(v) && mcpIsObj(v.servers)) entries = v.servers;
+      else if (mcpIsObj(v) && ('command' in v || 'url' in v)) { single = true; entries = { [iName.value.trim() || '(未命名)']: v }; }
+      nameWrap.classList.toggle('hidden', !single);
+      if (!entries) { prev.innerHTML = '<span class="bad">无法识别：需要 {"mcpServers":{…}}、{"servers":{…}} 或单台服务器对象（含 command / url）</span>'; go.disabled = true; return; }
+      const names = Object.keys(entries);
+      const taken = new Set(mcpNames());
+      const conflicts = names.filter((n) => taken.has(n));
+      const bad = names.filter((n) => { const s = entries[n]; return !mcpIsObj(s) || !((typeof s.command === 'string' && s.command.trim()) || (typeof s.url === 'string' && s.url.trim())); });
+      const parts = ['识别到 <b>' + names.length + '</b> 台：' + esc(names.join(', '))];
+      if (conflicts.length) parts.push((flags.overwrite ? '将覆盖同名 ' : '<span class="bad">同名未覆盖（勾「覆盖同名」或改名）</span> ') + esc(conflicts.join(', ')));
+      if (bad.length) parts.push('<span class="bad">缺 command / url 会被跳过：' + esc(bad.join(', ')) + '</span>');
+      prev.innerHTML = parts.join('<br>');
+      go.disabled = !names.length || (single && !iName.value.trim());
+    }
+    ta.addEventListener('input', preview); iName.addEventListener('input', preview);
+    go.addEventListener('click', () => {
+      go.disabled = true; go.textContent = '导入中…';
+      vscode.postMessage({ type: 'mcpImport', scope, text: ta.value, name: single ? iName.value.trim() : '', overwrite: flags.overwrite, enable: flags.enable });
+    });
+    q('.iCancel').addEventListener('click', closeModal);
+    setTimeout(() => ta.focus(), 30);
+    requestAnimationFrame(() => fitModalContent(modal));
+  }
+
+  // 从 CC Switch 导入 MCP：扫 mcp_servers 表 → 勾选 → 导入（只读，不改 CC Switch）
+  function openMcpCcModal(scope) {
+    const logo = document.createElement('span'); logo.className = 'picon img';
+    const img = document.createElement('img'); img.src = CCSWITCH_LOGO; img.alt = 'CC Switch'; logo.appendChild(img);
+    const modal = buildModal('CC', '从 CC Switch 导入 MCP 服务器', '读取 CC Switch 库里的 MCP 服务器表（Claude Code / Codex 形状），转成 Kiro 的 mcp.json 条目写入' + (scope === 'workspace' ? '工作区级' : '用户级') + '。只读，不改 CC Switch 的任何文件。', { iconNode: logo });
+    modal.classList.add('connect'); modal.classList.add('ccimport'); modal.classList.add('mcpcc');
+    const box = document.createElement('div'); box.className = 'ccbox';
+    box.innerHTML = '<div class="omsg"><span class="spin"></span> 正在读取 CC Switch 数据…</div>';
+    modal.appendChild(box);
+    mcpImportModal = { modal, box, kind: 'cc' };
+    vscode.postMessage({ type: 'mcpCcScan', scope });
+  }
+  function onMcpCcResult(m) {
+    if (!mcpImportModal || mcpImportModal.kind !== 'cc' || !mcpImportModal.modal.isConnected) return;
+    const box = mcpImportModal.box; box.innerHTML = '';
+    const pathLine = document.createElement('div'); pathLine.className = 'ccpath';
+    pathLine.innerHTML = '<span class="k">来源</span><span class="mono" title="' + esc(m.path || '') + '">' + esc(m.path ? mcpShortPath(m.path) : '（没找到 cc-switch.db）') + '</span>';
+    box.appendChild(pathLine);
+    const foot = document.createElement('div'); foot.className = 'mfootbtns';
+    const cancel = document.createElement('button'); cancel.className = 'btn btn-ghost'; cancel.textContent = '取消'; cancel.addEventListener('click', closeModal);
+    if (m.error) {
+      const e = document.createElement('div'); e.className = 'oerr'; e.textContent = '读取失败：' + m.error; box.appendChild(e);
+      cancel.textContent = '关闭'; foot.appendChild(cancel); box.appendChild(foot); return;
+    }
+    const items = m.items || [];
+    const picked = new Set(items.filter((it) => !it.exists).map((it) => it.id));
+    const list = document.createElement('div'); list.className = 'cclist';
+    const head = document.createElement('div'); head.className = 'selgroup';
+    const headT = document.createElement('span'); head.appendChild(headT);
+    const all = ckEl(''); all.title = '全选 / 全不选'; head.appendChild(all);
+    const go = document.createElement('button'); go.className = 'btn btn-primary';
+    foot.appendChild(cancel); foot.appendChild(go);
+    let enable = true;
+    function paint() {
+      headT.textContent = items.length ? ('找到 ' + items.length + ' 台 MCP 服务器 · 已勾 ' + picked.size) : '没有找到 MCP 服务器（CC Switch 的 MCP 页为空）';
+      const allOn = picked.size === items.length && items.length > 0, some = !allOn && picked.size > 0;
+      all.className = 'ck' + (allOn ? ' on' : some ? ' some' : ''); all.textContent = some ? '–' : '✓';
+      list.querySelectorAll('.ccrow').forEach((r) => { const on = picked.has(r.dataset.id); r.querySelector('.ck').className = 'ck' + (on ? ' on' : ''); r.classList.toggle('dim', !on); });
+      go.textContent = picked.size ? ('导入 ' + picked.size + ' 台') : '导入'; go.disabled = !picked.size;
+    }
+    all.addEventListener('click', () => { if (picked.size === items.length) picked.clear(); else for (const it of items) picked.add(it.id); paint(); });
+    for (const it of items) {
+      const row = document.createElement('div'); row.className = 'ccrow'; row.dataset.id = it.id;
+      row.appendChild(ckEl(''));
+      const main = document.createElement('div'); main.className = 'ccmain';
+      const nm = document.createElement('div'); nm.className = 'ccname';
+      const n = document.createElement('span'); n.className = 'nm'; n.textContent = it.name; nm.appendChild(n);
+      if (it.exists) { const t = document.createElement('span'); t.className = 'tag exist'; t.textContent = '已存在'; t.title = '这一级 mcp.json 里已有同名服务器，勾选即覆盖'; nm.appendChild(t); }
+      const sub = document.createElement('div'); sub.className = 'ccsub';
+      const tp = document.createElement('span'); tp.className = 'tag tp ' + it.transport; tp.textContent = it.transport; sub.appendChild(tp);
+      if (it.note) { const w = document.createElement('span'); w.className = 'tag warn'; w.textContent = 'SSE'; w.title = it.note; sub.appendChild(w); }
+      const txt = document.createElement('span'); txt.className = 'cctxt';
+      const extra = [];
+      if (it.envKeys && it.envKeys.length) extra.push(it.envKeys.length + ' 个环境变量');
+      if (it.headerKeys && it.headerKeys.length) extra.push(it.headerKeys.length + ' 个请求头');
+      if (it.unmapped && it.unmapped.length) extra.push('未映射：' + it.unmapped.join(', '));
+      txt.innerHTML = '<span class="mono">' + esc(it.summary) + '</span>' + (extra.length ? ' · ' + esc(extra.join(' · ')) : '');
+      sub.appendChild(txt);
+      sub.title = (it.summary || '') + (it.envKeys && it.envKeys.length ? '\\n环境变量（值导入后只在编辑时可见）：' + it.envKeys.join(', ') : '') + (it.unmapped && it.unmapped.length ? '\\n未映射字段（Kiro 没有对应语义，不带入）：' + it.unmapped.join(', ') : '') + (it.note ? '\\n' + it.note : '');
+      main.appendChild(nm); main.appendChild(sub); row.appendChild(main);
+      row.addEventListener('click', () => { if (picked.has(it.id)) picked.delete(it.id); else picked.add(it.id); paint(); });
+      list.appendChild(row);
+    }
+    box.appendChild(head); box.appendChild(list);
+    if (m.skipped && m.skipped.length) {
+      const d = document.createElement('details'); d.className = 'ccskip';
+      d.innerHTML = '<summary>跳过 ' + m.skipped.length + ' 项</summary><ul>' + m.skipped.map((s) => '<li><b>' + esc(s.name) + '</b> ' + esc(s.reason) + '</li>').join('') + '</ul>';
+      box.appendChild(d);
+    }
+    const opts = document.createElement('div'); opts.className = 'mcpopts';
+    const enLbl = document.createElement('label'); const enCk = ckEl('on'); enLbl.appendChild(enCk); enLbl.appendChild(document.createTextNode('导入后立即启用'));
+    enLbl.addEventListener('click', () => { enable = !enable; enCk.className = 'ck' + (enable ? ' on' : ''); });
+    opts.appendChild(enLbl); box.appendChild(opts);
+    box.appendChild(foot);
+    go.addEventListener('click', () => { if (!picked.size) return; go.disabled = true; go.textContent = '导入中…'; vscode.postMessage({ type: 'mcpCcImport', scope: m.scope || mcpScope, ids: Array.from(picked), overwrite: true, enable }); });
+    paint();
+    requestAnimationFrame(() => fitModalContent(mcpImportModal.modal));
+  }
+  function onMcpImportDone(m) {
+    if (!mcpImportModal || !mcpImportModal.modal.isConnected) return;
+    if (m.ok) { closeModal(); return; }
+    // 失败：把按钮放回去，结果留在弹窗里让用户改
+    const go = mcpImportModal.box.querySelector('.iGo') || mcpImportModal.box.querySelector('.mfootbtns .btn-primary');
+    if (go) { go.disabled = false; go.textContent = '导入'; }
+    const r = m.result;
+    if (mcpImportModal.kind === 'paste') {
+      const prev = mcpImportModal.box.querySelector('.mcpprev');
+      if (prev && r) prev.innerHTML = '<span class="bad">' + esc((r.conflicts && r.conflicts.length ? '同名未覆盖：' + r.conflicts.join(', ') + '；' : '') + (r.skipped && r.skipped.length ? '跳过：' + r.skipped.map((s) => s.name + '（' + s.reason + '）').join('；') : '')) + '</span>';
+      else if (prev && m.error) prev.innerHTML = '<span class="bad">' + esc(m.error) + '</span>';
+    }
+  }
+  for (const b of document.querySelectorAll('.mcpseg button')) b.addEventListener('click', () => { if (b.disabled) return; mcpScope = b.dataset.mscope; renderMcp(); });
+  $('mcpAdd').addEventListener('click', () => { if (!mcpInfo() || mcpInfo().error) return; openMcpModal(mcpScope, null); });
+  $('mcpImport').addEventListener('click', () => { if (!mcpInfo() || mcpInfo().error) return; openMcpImportModal(mcpScope); });
+  $('mcpCc').addEventListener('click', () => { if (!mcpInfo() || mcpInfo().error) return; openMcpCcModal(mcpScope); });
+  $('mcpLogs').addEventListener('click', () => vscode.postMessage({ type: 'mcpLogs' }));
+  $('mcpOpen').addEventListener('click', () => vscode.postMessage({ type: 'mcpOpen', scope: mcpScope }));
+
+  // ---------- 设置页可折叠卡（子代理 / 上下文）：状态记在 vscode state 里，默认展开 ----------
+  let foldState = {};
+  try { foldState = (vscode.getState() || {}).foldState || {}; } catch (e) { foldState = {}; }
+  function applyFold(id) {
+    const card = $(id); if (!card) return;
+    const collapsed = !!foldState[id];
+    card.classList.toggle('collapsed', collapsed);
+    const head = card.querySelector('.cardhead.fold'); if (head) head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  document.querySelectorAll('.cardhead.fold').forEach((head) => {
+    const id = head.dataset.fold;
+    const toggle = () => { foldState[id] = !foldState[id]; try { const st = vscode.getState() || {}; st.foldState = foldState; vscode.setState(st); } catch (e) { /* ignore */ } applyFold(id); };
+    head.addEventListener('click', (e) => { if (e.target.closest('button')) return; toggle(); });
+    head.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    applyFold(id);
+  });
+
+  function cselHtml(cls, opts, value) {
+    const selOpt = opts.find((o) => o.v === value) || opts[0];
+    let h = '<div class="csel ' + cls + '-wrap" data-cls="' + cls + '">';
+    h += '<select class="' + cls + '" style="display:none;">' + opts.map((o) => '<option value="' + esc(o.v) + '"' + (o.v === selOpt.v ? ' selected' : '') + '>' + esc(o.label) + '</option>').join('') + '</select>';
+    h += '<div class="csel-trigger"><span class="csel-label">' + esc(selOpt.label) + '</span><span class="csel-arrow"></span></div><div class="csel-menu">';
+    for (const o of opts) h += '<div class="csel-opt' + (o.v === selOpt.v ? ' sel' : '') + '" data-val="' + esc(o.v) + '"><span>' + esc(o.label) + '</span></div>';
+    return h + '</div></div>';
+  }
+
+  let agentData = { roots: { user: '', workspaces: [] }, entries: [], mcpServers: [], builtinIds: [], steering: [] };
+  const A_NL = String.fromCharCode(10);
+  const A_CR = String.fromCharCode(13);
+  function aLines(s) { return String(s || '').split(A_CR).join('').split(A_NL).map((x) => x.trim()).filter(Boolean); }
+  const AGENT_TOOL_TAGS = ['read', 'write', 'shell', 'web', 'subagent', 'spec', 'context', '@mcp', '@powers', '@builtin'];
+  function enabledKiroIds() {
+    const out = [];
+    for (const p of lastProviders.filter((x) => x.enabled)) for (const mm of (modelsByProvider[p.id] || [])) if (mm.enabled) out.push(mm.kiroId || mm.id);
+    return Array.from(new Set(out));
+  }
+  function agentToolCount(e) {
+    if (!e.fields) return '';
+    if (e.fields.tools === '*') return '全部工具';
+    const n = Array.isArray(e.fields.tools) ? e.fields.tools.length : 0;
+    return n ? (n + ' 个工具') : '无工具';
+  }
+  function agentMcpCount(e) {
+    const ref = Array.isArray(e.fields && e.fields.tools) ? e.fields.tools.filter((t) => /^@(?!mcp$|powers$|builtin$|subagent)/.test(t)).length : 0;
+    const emb = e.opaque ? (e.opaque.mcpServers || 0) : 0;
+    const n = ref + emb;
+    return n ? (n + ' 个 MCP') : '';
+  }
+  function renderAgents() {
+    const wrap = $('agentLists'); if (!wrap) return;
+    wrap.innerHTML = '';
+    const entries = agentData.entries || [];
+    const bad = entries.filter((e) => e.error).length;
+    $('agentSum').textContent = entries.length ? (entries.length + ' 个' + (bad ? ' · ' + bad + ' 个无法解析' : '')) : '尚无 agent';
+    const segs = [{ scope: 'user', title: '用户级', dir: agentData.roots.user }].concat((agentData.roots.workspaces || []).map((d) => ({ scope: 'workspace', title: '工作区级', dir: d })));
+    for (const seg of segs) {
+      const list = entries.filter((e) => e.scope === seg.scope && (seg.scope === 'user' || e.dir === seg.dir));
+      const box = document.createElement('div'); box.className = 'aseg';
+      const head = document.createElement('div'); head.className = 'aseghead';
+      const t = document.createElement('span'); t.className = 't'; t.textContent = seg.title + '（' + list.length + '）'; head.appendChild(t);
+      const p = document.createElement('span'); p.className = 'p'; p.textContent = seg.dir || ''; p.title = seg.dir || ''; head.appendChild(p);
+      const open = document.createElement('button'); open.className = 'iconbtn'; open.title = '在 Kiro 中打开目录'; open.setAttribute('aria-label', '在 Kiro 中打开目录'); open.innerHTML = ICON_IMPORT;
+      open.addEventListener('click', () => vscode.postMessage({ type: 'agentOpen', scope: seg.scope, dir: seg.dir }));
+      head.appendChild(open);
+      box.appendChild(head);
+      if (!list.length) {
+        const e = document.createElement('div'); e.className = 'empty small'; e.textContent = seg.scope === 'user' ? '还没有用户级 agent。' : '本工作区还没有 agent。'; box.appendChild(e);
+      }
+      for (const e of list) box.appendChild(agentRow(e));
+      wrap.appendChild(box);
+    }
+  }
+  function agentRow(e) {
+    const row = document.createElement('div'); row.className = 'arow' + (e.error ? ' bad' : '');
+    const t = document.createElement('div'); t.className = 'ltext';
+    const ln = document.createElement('div'); ln.className = 'ln';
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = e.id; nm.title = e.filePath; ln.appendChild(nm);
+    const fmt = document.createElement('span'); fmt.className = 'tag fmt'; fmt.textContent = e.format; ln.appendChild(fmt);
+    if (e.error) { const g = document.createElement('span'); g.className = 'tag err'; g.textContent = '无法解析'; g.title = e.error; ln.appendChild(g); }
+    for (const w of (e.warnings || []).slice(0, 2)) { const g = document.createElement('span'); g.className = 'tag warn'; g.textContent = /忽略|跳过/.test(w) ? 'Kiro 会忽略' : /覆盖|保留/.test(w) ? '同名' : '提示'; g.title = w; ln.appendChild(g); }
+    const ls = document.createElement('div'); ls.className = 'ls';
+    const parts = [];
+    if (!e.error) {
+      parts.push(e.fields.description || '（无描述）');
+      parts.push('模型 ' + (e.fields.model || '默认'));
+      parts.push(agentToolCount(e));
+      const mc = agentMcpCount(e); if (mc) parts.push(mc);
+    } else parts.push(e.error);
+    ls.textContent = parts.filter(Boolean).join(' · '); ls.title = ls.textContent;
+    t.appendChild(ln); t.appendChild(ls); row.appendChild(t);
+    const act = document.createElement('div'); act.className = 'lact';
+    const open = document.createElement('button'); open.className = 'iconbtn'; open.title = '打开文件'; open.setAttribute('aria-label', '打开文件'); open.innerHTML = ICON_SQPEN;
+    open.addEventListener('click', () => vscode.postMessage({ type: 'agentOpen', filePath: e.filePath }));
+    act.appendChild(open);
+    if (!e.error) {
+      const ed = document.createElement('button'); ed.className = 'iconbtn'; ed.title = '编辑'; ed.setAttribute('aria-label', '编辑'); ed.innerHTML = ICON_PENCIL;
+      ed.addEventListener('click', () => openAgentModal(e.scope, e.dir, e));
+      act.appendChild(ed);
+    }
+    const del = document.createElement('button'); del.className = 'iconbtn del'; del.title = '删除'; del.setAttribute('aria-label', '删除'); del.innerHTML = ICON_TRASH;
+    del.addEventListener('click', () => confirmModal({
+      icon: e.id, iconId: 'glyph:layers-iso', title: '删除 agent「' + e.id + '」？', desc: '会先留一份 .bak 再删除文件：' + e.filePath, okText: '删除', danger: true,
+      onOk: () => vscode.postMessage({ type: 'agentDelete', filePath: e.filePath, confirmed: true }),
+    }));
+    act.appendChild(del);
+    row.appendChild(act);
+    return row;
+  }
+  function openAgentModal(scope, dir, e) {
+    const editing = !!e;
+    const f = editing ? (e.fields || {}) : {};
+    const modal = buildModal('', editing ? ('编辑 agent「' + e.id + '」') : ('新建 agent（' + (scope === 'user' ? '用户级' : '工作区级') + '）'), editing ? esc(e.filePath) : esc(dir) + ' · 新建为 <span class="mono">&lt;slug&gt;.md</span>');
+    modal.classList.add('agent');
+    const box = document.createElement('div'); box.className = 'arows';
+    const models = enabledKiroIds();
+    const toolsIsAll = f.tools === '*';
+    const toolLines = Array.isArray(f.tools) ? f.tools.filter((t) => !/^@(?!mcp$|powers$|builtin$|subagent)/.test(t)) : [];
+    const refServers = Array.isArray(f.tools) ? f.tools.filter((t) => /^@(?!mcp$|powers$|builtin$|subagent)/.test(t)).map((t) => t.slice(1)) : [];
+    const cliOnly = editing && (e.warnings || []).some((w) => /CLI 专用字段/.test(w));
+    box.innerHTML =
+      '<div class="afield"><label>名称（Kiro 里的 agent id）</label><input class="aName" type="text" spellcheck="false" maxlength="80" placeholder="例如：code-reviewer"></div>'
+      + '<div class="afield"><label>描述（主 agent 据此自动挑选子代理）</label><input class="aDesc" type="text" spellcheck="false" maxlength="300" placeholder="做什么、何时用"></div>'
+      + '<div class="afield"><label>模型</label><div class="aModelHost"></div><input class="aModelCustom hidden" type="text" spellcheck="false" placeholder="自定义模型 id（须在 Kiro /model 列表里）"></div>'
+      + '<div class="afield"><label>思考档位 effortLevel（可空）</label><input class="aEffort" type="text" spellcheck="false" placeholder="low / medium / high…"></div>'
+      + '<label class="achk"><input type="checkbox" class="aAll"> 全部工具（tools: "*"）</label>'
+      + '<div class="afield aToolsField"><label>工具（每行一个；标签：read / write / shell / web / subagent / spec / context / @mcp / @powers / @builtin，或 @服务器 / @服务器/工具）</label><textarea class="aLines aTools" spellcheck="false" placeholder="read&#10;write&#10;shell"></textarea><div class="btns"><span class="aTagHost"></span></div></div>'
+      + '<div class="afield aMcpField"><label>MCP 服务器（引用 mcp.json 里的服务器，写成 tools 的 @名）</label><div class="amcp aMcp"></div></div>'
+      + '<div class="afield"><label>排除工具 excludedTools（每行一个）</label><textarea class="aLines aExcl" spellcheck="false"></textarea></div>'
+      + '<label class="achk"><input type="checkbox" class="aIncMcp"> includeMcpJson：自动带入 mcp.json 全部 MCP 工具</label>'
+      + '<label class="achk"><input type="checkbox" class="aIncPow"> includePowers：自动带入 kiro_powers</label>'
+      + '<div class="afield"><label>资源 resources（每行一个 file:// 或 skill://）</label><textarea class="aLines aRes" spellcheck="false" placeholder="file://README.md&#10;skill://.kiro/skills/**/SKILL.md"></textarea></div>'
+      + '<div class="afield"><label>欢迎语 welcomeMessage</label><input class="aWelcome" type="text" spellcheck="false"></div>'
+      + '<div class="afield"><label>分派方式 dispatchKind</label><div class="aDispHost"></div></div>'
+      + '<div class="afield"><label>系统提示词' + (editing && e.format === 'json' ? '（prompt 字段；file:// 引用原样保留）' : '（.md 正文）') + '</label><textarea class="aPrompt" spellcheck="false" placeholder="You are …"></textarea></div>'
+      + (cliOnly ? '<label class="achk anote"><input type="checkbox" class="aFixCli" checked> 此 JSON 含 allowedTools / toolsSettings 且无 permissions，Kiro IDE 会忽略整份文件；保存时补 permissions: {rules: []} 放行</label>' : '')
+      + (editing && (e.warnings || []).some((w) => /注释/.test(w)) ? '<div class="anote">文件含 JSON 注释，保存后注释会丢失。</div>' : '')
+      + (editing && e.opaque && (e.opaque.mcpServers || e.opaque.permissions || e.opaque.hooks || (e.opaque.other || []).length) ? '<div class="hint" style="margin-top:0">原样保留、不在此编辑：' + [e.opaque.mcpServers ? '内嵌 mcpServers ' + e.opaque.mcpServers : '', e.opaque.permissions ? 'permissions ' + e.opaque.permissions + ' 条' : '', e.opaque.hooks ? 'hooks ' + e.opaque.hooks : '', (e.opaque.other || []).length ? '其它字段 ' + e.opaque.other.join(', ') : ''].filter(Boolean).map(esc).join(' · ') + '</div>' : '')
+      + '<div class="aerr"></div>'
+      + '<div class="mfootbtns"><button class="btn btn-primary aSave">保存</button><button class="btn btn-ghost btn-sm aCancel">取消</button></div>';
+    modal.appendChild(box);
+    const q = (s) => box.querySelector(s);
+    q('.aName').value = f.name || (editing ? e.id : '');
+    q('.aDesc').value = f.description || '';
+    q('.aEffort').value = f.effortLevel || '';
+    q('.aAll').checked = toolsIsAll;
+    q('.aTools').value = toolLines.join(A_NL);
+    q('.aExcl').value = (f.excludedTools || []).join(A_NL);
+    q('.aIncMcp').checked = !!f.includeMcpJson;
+    q('.aIncPow').checked = !!f.includePowers;
+    q('.aRes').value = (f.resources || []).join(A_NL);
+    q('.aWelcome').value = f.welcomeMessage || '';
+    q('.aPrompt').value = f.prompt || '';
+    const modelOpts = [{ v: '', label: '默认（Kiro 当前模型）' }].concat(models.map((id) => ({ v: id, label: id }))).concat([{ v: '__custom__', label: '自定义…' }]);
+    const curModel = f.model || '';
+    q('.aModelHost').innerHTML = cselHtml('aModel', modelOpts, models.includes(curModel) || !curModel ? curModel : '__custom__');
+    mountCustomSelect(q('.aModelHost'));
+    const modelSel = q('select.aModel');
+    const syncModel = () => { const custom = modelSel.value === '__custom__'; q('.aModelCustom').classList.toggle('hidden', !custom); };
+    modelSel.addEventListener('change', syncModel);
+    if (curModel && !models.includes(curModel)) q('.aModelCustom').value = curModel;
+    syncModel();
+    q('.aDispHost').innerHTML = cselHtml('aDisp', [{ v: '', label: '默认（sub-agent）' }, { v: 'custom-agent', label: 'custom-agent（带上之前消息与 hooks）' }, { v: 'spec', label: 'spec（走规格工作流）' }], f.dispatchKind || '');
+    mountCustomSelect(q('.aDispHost'));
+    const dispSel = q('select.aDisp');
+    const tagHost = q('.aTagHost');
+    for (const tag of AGENT_TOOL_TAGS) { const b = document.createElement('span'); b.className = 'tag'; b.textContent = tag; b.style.cursor = 'pointer'; b.title = '追加到工具列表'; b.addEventListener('click', () => { const ta = q('.aTools'); const lines = aLines(ta.value); if (!lines.includes(tag)) lines.push(tag); ta.value = lines.join(A_NL); }); tagHost.appendChild(b); }
+    const picked = new Set(refServers);
+    const mcpHost = q('.aMcp');
+    const known = Array.from(new Set((agentData.mcpServers || []).concat(refServers)));
+    if (!known.length) { mcpHost.innerHTML = '<span class="muted" style="font-size:11px">mcp.json 里还没有服务器（在上方「MCP」卡添加）</span>'; }
+    for (const s of known) { const t = document.createElement('span'); t.className = 'tag' + (picked.has(s) ? ' on' : ''); t.textContent = '@' + s; t.title = picked.has(s) ? '点击取消引用' : '点击引用该服务器的全部工具'; t.addEventListener('click', () => { if (picked.has(s)) picked.delete(s); else picked.add(s); t.classList.toggle('on', picked.has(s)); }); mcpHost.appendChild(t); }
+    const syncAll = () => { const all = q('.aAll').checked; q('.aToolsField').classList.toggle('hidden', all); q('.aMcpField').classList.toggle('hidden', all); };
+    q('.aAll').addEventListener('change', syncAll); syncAll();
+    const lines = aLines;
+    const err = q('.aerr');
+    const doSave = () => {
+      const name = q('.aName').value.trim();
+      if (!name) { err.textContent = '名称不能为空'; q('.aName').focus(); return; }
+      if ((agentData.builtinIds || []).includes(name)) { err.textContent = '「' + name + '」是 Kiro 内置模式名，换一个'; return; }
+      const dup = (agentData.entries || []).find((x) => !x.error && x.scope === scope && x.dir === dir && x.id === name && (!editing || x.filePath !== e.filePath));
+      if (dup) { err.textContent = '同级目录已有名为「' + name + '」的 agent（' + dup.rel + '）'; return; }
+      const modelV = modelSel.value === '__custom__' ? q('.aModelCustom').value.trim() : modelSel.value;
+      let tools;
+      if (q('.aAll').checked) tools = '*';
+      else { tools = lines(q('.aTools').value); for (const s of picked) if (!tools.includes('@' + s)) tools.push('@' + s); }
+      const fields = {
+        name, description: q('.aDesc').value.trim(), prompt: q('.aPrompt').value,
+        tools, excludedTools: lines(q('.aExcl').value), model: modelV, effortLevel: q('.aEffort').value.trim(),
+        includeMcpJson: q('.aIncMcp').checked, includePowers: q('.aIncPow').checked,
+        resources: lines(q('.aRes').value), welcomeMessage: q('.aWelcome').value.trim(), dispatchKind: dispSel.value || undefined,
+      };
+      const fix = q('.aFixCli');
+      q('.aSave').disabled = true; q('.aSave').textContent = '保存中…';
+      vscode.postMessage({ type: 'agentSave', scope, dir, filePath: editing ? e.filePath : '', fields, addPermissions: !!(fix && fix.checked) });
+    };
+    q('.aSave').addEventListener('click', doSave);
+    q('.aCancel').addEventListener('click', closeModal);
+    box.addEventListener('keydown', (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { ev.preventDefault(); doSave(); } });
+    agentModal = { modal, err, save: q('.aSave') };
+    setTimeout(() => (editing ? q('.aPrompt') : q('.aName')).focus(), 30);
+  }
+  function openAgentImportModal() {
+    const modal = buildModal('', '粘贴导入 agent', '以 <span class="mono">{</span> 开头按 JSON（Kiro CLI 格式）解析，否则按 <span class="mono">---</span> 前置元数据解析；文件名 = slug(名称)');
+    modal.classList.add('agent');
+    const box = document.createElement('div'); box.className = 'arows';
+    box.innerHTML = '<div class="afield"><label>写入到</label><div class="aScopeHost"></div></div>'
+      + '<div class="afield"><label>名称（可空；填了就覆盖文本里的 name）</label><input class="aName" type="text" spellcheck="false" maxlength="80"></div>'
+      + '<div class="afield"><label>内容</label><textarea class="aPrompt aText" spellcheck="false" placeholder="{&quot;name&quot;: &quot;reviewer&quot;, &quot;description&quot;: &quot;…&quot;, &quot;tools&quot;: [&quot;read&quot;], &quot;prompt&quot;: &quot;…&quot;}"></textarea></div>'
+      + '<div class="aerr"></div>'
+      + '<div class="mfootbtns"><button class="btn btn-primary aSave">导入</button><button class="btn btn-ghost btn-sm aCancel">取消</button></div>';
+    modal.appendChild(box);
+    const q = (s) => box.querySelector(s);
+    const scopes = [{ v: 'user|' + agentData.roots.user, label: '用户级 ' + agentData.roots.user }].concat((agentData.roots.workspaces || []).map((d) => ({ v: 'workspace|' + d, label: '工作区级 ' + d })));
+    q('.aScopeHost').innerHTML = cselHtml('aScope', scopes, scopes[scopes.length > 1 ? 1 : 0].v);
+    mountCustomSelect(q('.aScopeHost'));
+    const scopeSel = q('select.aScope');
+    const err = q('.aerr');
+    const go = () => {
+      const text = q('.aText').value;
+      if (!text.trim()) { err.textContent = '内容为空'; return; }
+      const [scope, dir] = scopeSel.value.split('|');
+      q('.aSave').disabled = true; q('.aSave').textContent = '导入中…';
+      vscode.postMessage({ type: 'agentImport', scope, dir, text, name: q('.aName').value.trim() });
+    };
+    q('.aSave').addEventListener('click', go);
+    q('.aCancel').addEventListener('click', closeModal);
+    agentModal = { modal, err, save: q('.aSave') };
+    setTimeout(() => q('.aText').focus(), 30);
+  }
+  $('agentNewUser').addEventListener('click', () => openAgentModal('user', agentData.roots.user, null));
+  $('agentNewWs').addEventListener('click', () => { const d = (agentData.roots.workspaces || [])[0]; if (!d) { toast('error', '当前没有打开的工作区文件夹'); return; } openAgentModal('workspace', d, null); });
+  $('agentImport').addEventListener('click', openAgentImportModal);
+
+  function providerNameOf(pid) { const p = lastProviders.find((x) => x.id === pid); return p ? (p.name || p.id) : pid; }
+  function ctxWho(r) { return r.source === 'default' && !r.known ? '未知，默认 200K' : (CTX_SRC[r.source] || r.source); }
+  function ctxApply(r, v) {
+    const auto = v === null || v === r.resolved;
+    r.effective = auto ? r.resolved : v; r.source = auto ? r.resolvedSource : 'override'; r.override = auto ? null : v;
+    renderModels(); renderCtxCard();
+    vscode.postMessage({ type: 'setCtxWindow', modelId: r.kiroId, tokens: auto ? null : v });
+  }
+  function ctxCardSelect(r) {
+    const sel = document.createElement('select');
+    sel.className = 'ctxsel' + (r.source === 'override' ? ' ov' : '');
+    for (const v of r.candidates) { const o = document.createElement('option'); o.value = String(v); o.textContent = fmtCtx(v) + (v === r.resolved ? ' · 自动' : ''); if (v === r.effective) o.selected = true; sel.appendChild(o); }
+    sel.title = '上下文窗口：' + fmtCtx(r.effective) + ' tokens（' + ctxWho(r) + '）。选带「自动」的那项即回到跟随目录；改动即时同步到 Kiro 右侧选择器（下一轮请求起生效）。';
+    sel.addEventListener('change', () => ctxApply(r, Number(sel.value)));
+    return sel;
+  }
+  function renderCtxCard() {
+    const host = $('ctxMgrRows'); if (!host) return;
+    host.innerHTML = '';
+    const rows = Object.values(ctxRows).filter((r) => r && Array.isArray(r.candidates) && r.candidates.length);
+    const order = new Map(lastProviders.map((p, i) => [p.id, i]));
+    rows.sort((a, b) => ((order.has(a.providerId) ? order.get(a.providerId) : 1e9) - (order.has(b.providerId) ? order.get(b.providerId) : 1e9)) || String(a.baseId).localeCompare(String(b.baseId)));
+    const overrides = rows.filter((r) => r.source === 'override').length;
+    const unknown = rows.filter((r) => !r.known).length;
+    $('ctxSum').textContent = rows.length ? (rows.length + ' 个模型 · ' + overrides + ' 个覆盖' + (unknown ? ' · ' + unknown + ' 个窗口未知' : '')) : '--';
+    $('ctxResetAll').disabled = !overrides;
+    if (!rows.length) { host.innerHTML = '<div class="empty small">还没有已勾选的模型——在「模型」页勾选后，这里按渠道列出每个模型的上下文窗口。</div>'; return; }
+    let curPid = null;
+    for (const r of rows) {
+      if (r.providerId !== curPid) { curPid = r.providerId; const h = document.createElement('div'); h.className = 'cseghead'; h.textContent = providerNameOf(curPid); host.appendChild(h); }
+      const row = document.createElement('div'); row.className = 'crow';
+      const lt = document.createElement('div'); lt.className = 'ltext';
+      const ln = document.createElement('div'); ln.className = 'ln';
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = r.baseId; nm.title = r.kiroId; ln.appendChild(nm);
+      if (!r.known) { const t = document.createElement('span'); t.className = 'tag err'; t.textContent = '窗口未知'; t.title = '渠道、厂商表、models.dev 都没有这个模型的窗口记录，按默认 200K；常被上游拒收长输入就手动选小一档'; ln.appendChild(t); }
+      if (r.source === 'override') { const t = document.createElement('span'); t.className = 'tag ov'; t.textContent = '覆盖'; t.title = '自动值 ' + fmtCtx(r.resolved) + '（' + (CTX_SRC[r.resolvedSource] || r.resolvedSource) + '）'; ln.appendChild(t); }
+      lt.appendChild(ln);
+      const ls = document.createElement('div'); ls.className = 'ls';
+      ls.textContent = '生效 ' + fmtCtx(r.effective) + ' · ' + ctxWho(r) + (r.known && r.max !== r.effective ? ' · 已知最大 ' + fmtCtx(r.max) : '');
+      ls.title = ls.textContent;
+      lt.appendChild(ls);
+      row.appendChild(lt);
+      const act = document.createElement('div'); act.className = 'lact';
+      act.appendChild(ctxCardSelect(r));
+      const rb = document.createElement('button'); rb.className = 'iconbtn'; rb.title = '重置为自动'; rb.setAttribute('aria-label', '重置为自动'); rb.innerHTML = ICON_TRASH; rb.disabled = r.source !== 'override';
+      rb.addEventListener('click', () => ctxApply(r, null));
+      act.appendChild(rb);
+      row.appendChild(act);
+      host.appendChild(row);
+    }
+  }
+  function renderSteering(files) {
+    const host = $('ctxSteer'); if (!host) return;
+    host.innerHTML = '';
+    const list = files || [];
+    const head = document.createElement('div'); head.className = 'cseghead';
+    head.textContent = 'Steering（只读，' + list.length + ' 个文件）';
+    host.appendChild(head);
+    if (!list.length) { const e = document.createElement('div'); e.className = 'muted'; e.style.cssText = 'font-size:11px;padding:2px 8px 4px;'; e.textContent = '~/.kiro/steering 与工作区 .kiro/steering 里还没有 .md；Kiro 也会读工作区根的 AGENTS.md。'; host.appendChild(e); return; }
+    for (const f of list) {
+      const row = document.createElement('div'); row.className = 'srow';
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = f.rel; nm.title = f.filePath; row.appendChild(nm);
+      const meta = document.createElement('span'); meta.className = 'muted'; meta.textContent = (f.scope === 'user' ? '用户级' : f.scope === 'agentsmd' ? 'AGENTS.md' : '工作区级') + ' · ' + (f.inclusion || 'always') + ' · ' + fmtBytes(f.size); row.appendChild(meta);
+      const open = document.createElement('button'); open.className = 'iconbtn'; open.title = '在 Kiro 中打开'; open.setAttribute('aria-label', '在 Kiro 中打开'); open.innerHTML = ICON_SQPEN;
+      open.addEventListener('click', () => vscode.postMessage({ type: 'agentOpen', filePath: f.filePath, steering: true }));
+      row.appendChild(open);
+      host.appendChild(row);
+    }
+  }
+  function fmtBytes(n) { n = Number(n) || 0; return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
+  $('ctxResetAll').addEventListener('click', () => confirmModal({
+    icon: '上', iconId: 'glyph:layers-iso', title: '全部重置为自动？', desc: '清除所有模型的上下文覆盖，回到跟随渠道 / 厂商表 / models.dev 的解析值；Kiro 右侧选择器随即同步。', okText: '全部重置', danger: true,
+    onOk: () => vscode.postMessage({ type: 'ctxResetAll', confirmed: true }),
+  }));
+
+
   // 每条宿主消息各自 try/catch：某一条的渲染异常只记一条带消息类型的 console.error（不吞、不静默），
   // 不影响其它消息与后续刷新。4.13.40–4.13.52 的 renderUsage TypeError 就是以未捕获异常的形式把
   // 「按渠道明细 / 最近请求」两卡整段跳过的。
@@ -6765,6 +8393,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       lastVendors = m.oauthVendors || [];
       renderProviders(lastProviders);
       renderModels();
+      renderCtxCard();
       if (oauthModal) oauthModal.onState();
       // 编辑弹窗开着：key 池列表跟着新状态重画（冷却 / 计数 / 新加的 key 立刻出现）
       if (editModal && editModal.pool) {
@@ -6781,6 +8410,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       renderModels();
       renderAddModelModal(); // 弹窗开着就同步刷新候选池
       renderEditModalModels(); // 编辑弹窗开着就同步刷新能力标签（真实判定覆盖乐观值）
+    } else if (m.type === 'ctxWindows') {
+      ctxRows = {};
+      for (const r of (m.rows || [])) if (r && r.kiroId) ctxRows[String(r.kiroId).toLowerCase()] = r;
+      renderModels();
+      renderCtxCard();
     } else if (m.type === 'usage') {
       renderUsage(m);
     } else if (m.type === 'prompts') {
@@ -6797,6 +8431,28 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       onCcSwitchResult(m);
     } else if (m.type === 'ccswitchDone') {
       closeModal(); selectTab('providers');
+    } else if (m.type === 'mcp') {
+      mcpState = m; renderMcp();
+    } else if (m.type === 'mcpServer') {
+      if (mcpPendingEdit && mcpPendingEdit.name === m.name && mcpPendingEdit.scope === m.scope) { mcpPendingEdit = null; openMcpModal(m.scope, { name: m.name, server: m.server || {} }); }
+    } else if (m.type === 'mcpCcResult') {
+      onMcpCcResult(m);
+    } else if (m.type === 'mcpImportDone') {
+      onMcpImportDone(m);
+    } else if (m.type === 'agents') {
+      agentData = { roots: m.roots || { user: '', workspaces: [] }, entries: m.entries || [], mcpServers: m.mcpServers || [], builtinIds: m.builtinIds || [], steering: m.steering || [] };
+      if (m.listError) toast('error', '读取 .kiro/agents 失败：' + m.listError);
+      renderAgents();
+      renderSteering(agentData.steering);
+    } else if (m.type === 'agentSaveResult') {
+      if (agentModal && agentModal.modal && agentModal.modal.isConnected) {
+        if (m.ok) closeModal();
+        else {
+          agentModal.err.textContent = m.error || '保存失败';
+          agentModal.save.disabled = false;
+          agentModal.save.textContent = agentModal.save.textContent.replace(/中…$/, '') || '保存';
+        }
+      }
     } else if (m.type === 'pickedJsonContent') {
       const ta = document.querySelector('.omodeFields textarea[data-key="jsonText"]')
               || document.querySelector('.omodeFields textarea[data-key="json"]')

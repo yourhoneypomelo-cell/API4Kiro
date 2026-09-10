@@ -2,7 +2,7 @@
   "name": "api2kiro-dual",
   "displayName": "API4Kiro",
   "description": "把多家 API 聚合接入 Kiro：厂商账号登录（Kimi / Codex / xAI / Antigravity / Anthropic / Kiro 官方多账号）、第三方 Key、自定义端点（Anthropic Messages / Chat Completions / Responses / Gemini 四种格式）；按模型自动路由、模型测活、用量统计、提示词注入。",
-  "version": "4.13.54",
+  "version": "4.13.57",
   "publisher": "api2kiro-dual",
   "license": "MIT",
   "icon": "assets/icon.png",
@@ -71,6 +71,24 @@
         "command": "api2kiroDual.refreshActiveSession",
         "title": "刷新活跃会话模型列表",
         "category": "API4Kiro"
+      },
+      {
+        "command": "api2kiroDual.openGitHub",
+        "title": "GitHub 项目主页",
+        "category": "API4Kiro",
+        "icon": "$(github)"
+      },
+      {
+        "command": "api2kiroDual.checkUpdate",
+        "title": "检查更新",
+        "category": "API4Kiro",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "api2kiroDual.installUpdate",
+        "title": "有新版本，点击下载安装",
+        "category": "API4Kiro",
+        "icon": "$(cloud-download)"
       }
     ],
     "viewsContainers": {
@@ -87,7 +105,32 @@
         {
           "type": "webview",
           "id": "api2kiroDual.panel",
-          "name": "控制面板"
+          "name": "API4Kiro"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "api2kiroDual.openGitHub",
+          "when": "view == api2kiroDual.panel",
+          "group": "navigation@1"
+        },
+        {
+          "command": "api2kiroDual.checkUpdate",
+          "when": "view == api2kiroDual.panel && !api2kiroDual.updateAvailable",
+          "group": "navigation@2"
+        },
+        {
+          "command": "api2kiroDual.installUpdate",
+          "when": "view == api2kiroDual.panel && api2kiroDual.updateAvailable",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "api2kiroDual.installUpdate",
+          "when": "api2kiroDual.updateAvailable"
         }
       ]
     },
@@ -500,6 +543,17 @@
           },
           "default": [],
           "description": "已知不支持图片输入的模型 ID。发往这些模型的请求会自动剥离图片（包括对话历史里的，否则一张图会让整个对话永久 400），并在回复前提示。此外扩展会自动学习：某模型因图片被上游拒绝时会被记住，无需手填。Kiro 的附件按钮不按模型能力禁用，所以只能在代理层兜底。"
+        },
+        "api2kiroDual.contextWindowOverrides": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 4096,
+            "maximum": 10000000
+          },
+          "default": {},
+          "scope": "machine",
+          "description": "按模型覆盖上下文窗口（tokens）：键是 Kiro 模型选择器里的模型 id（同名模型在多个渠道都勾了时，第二个起为「id@渠道id」），值是窗口大小。代理把它作为 tokenLimits.maxInputTokens 报给 Kiro，Kiro 据此计算上下文百分比、80% 自动摘要与 95% 截断——中转站实际窗口比官方标称小时把它调低，可让 Kiro 提前压缩而不是撞 400。通常不必手填：在侧边栏模型页每个已勾选模型行的「上下文」下拉或 Kiro 聊天框里的「上下文」下拉选择即可写入。删掉一项即回到自动（渠道字段 → 厂商目录 → models.dev → 默认 200000）。"
         },
         "codewhisperer.config.krsEndpoints": {
           "type": [

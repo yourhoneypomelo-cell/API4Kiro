@@ -9,9 +9,11 @@ import {
   updateSetting,
 } from "./config";
 import { syncGroupHeaderStyle, triggerKiroModelRefresh, type StyleSyncResult } from "./selectorStyle";
-import { checkForUpdate } from "./updateChecker";
+import { CTX_CONFIG_ID, decodeCtxConfigValue } from "./contextWindow";
+import { checkForUpdate, GITHUB_URL, installLatestFromGitHub } from "./updateChecker";
+import { openInBrowser } from "./openBrowser";
 import { getActiveProviders } from "./providers";
-import { initLog, showLog, info, error } from "./log";
+import { initLog, showLog, info, error, warn } from "./log";
 import { KrsProxyServer } from "./krsServer";
 import { CpsProxyServer } from "./cpsServer";
 import { applyOverrides, restoreAll, initEndpoints } from "./endpoints";
@@ -73,6 +75,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   registerCommands(context);
+  registerSessionConfigHook(context);
 
   // 启动后静默查一次 GitHub 最新 Release（24h 一次、同版本不重复弹）；异步不阻塞激活，失败静默。
   void checkForUpdate(context, { manual: false });
@@ -133,11 +136,13 @@ async function onConfigChanged(context: vscode.ExtensionContext, e: vscode.Confi
   // 不 await：Kiro 重拉列表要 1–3 秒，卡住配置回调链会让下一次勾选的 1.5 秒自写窗口过期，
   // 被误判成外部改动而多做一轮全量 /models 拉取。promptReload 自带 2 秒防抖，异步结算即可。
   const listAffecting = e.affectsConfiguration(`${CONFIG_NS}.providers`);
-  if (listAffecting && !enableChanged && isEnabled()) {
+  // 上下文挡位覆盖（4.13.55）同样改变广播：tokenLimits.maxInputTokens 与 description 第 5 位都随它变。
+  const ctxAffecting = e.affectsConfiguration(`${CONFIG_NS}.contextWindowOverrides`);
+  if ((listAffecting || ctxAffecting) && !enableChanged && isEnabled()) {
     const pending = sidebar?.channelAResult() ?? triggerKiroModelRefresh();
     void pending.then((refreshed) => {
       if (!refreshed) {
-        promptReload("已更新 provider");
+        promptReload(listAffecting ? "已更新 provider" : "已更新上下文挡位");
       }
     });
   }
@@ -392,6 +397,80 @@ function registerCommands(context: vscode.ExtensionContext): void {
         }
       }
       return refreshed;
+    }),
+    vscode.commands.registerCommand("api2kiroDual.openGitHub", async () => {
+      const ok = await openInBrowser(GITHUB_URL);
+      if (!ok) {
+        await vscode.env.clipboard.writeText(GITHUB_URL);
+        void vscode.window.showWarningMessage("API4Kiro：没能打开浏览器，链接已复制到剪贴板。");
+      }
+    }),
+    vscode.commands.registerCommand("api2kiroDual.checkUpdate", async () => {
+      await (sidebar?.checkUpdate() ?? installLatestFromGitHub(context, {}));
+    }),
+    vscode.commands.registerCommand("api2kiroDual.installUpdate", async () => {
+      await (sidebar?.checkUpdate() ?? installLatestFromGitHub(context, {}));
     })
   );
+}
+
+type SessionConfigHook = (configId: unknown, value: unknown, sessionId: unknown) => void;
+type HookHost = { __a2kSessionConfigOption?: SessionConfigHook };
+
+/**
+ * 聊天框「上下文」下拉 → 本扩展（4.13.55，目标 A5）。
+ *
+ * kiro-agent `dist/extension.js` 的 `setSessionConfigOption` 宿主入口打了一句转发（selectorStyle CTX_HOST_HOOK_TEMPLATE）：
+ * configId 以 `a2k:` 开头的调用先交给 `globalThis.__a2kSessionConfigOption(configId, value, sessionId)`，然后照旧落到
+ * agent（agent 对未知 configId 无副作用、原样返回当前列表）。本扩展与 kiro-agent 同扩展宿主（extensionDependencies），
+ * `globalThis` 共享。载体 `a2k:ctx` 的 value 是 `"<Kiro 模型 id>|<tokens>"`；写入用户覆盖后走通道 A 让 Kiro 重拉列表，
+ * 下一轮起 `maxInputTokens` 与弹层「/ 窗口」即用新值。连续快速改动只写最后一次（250ms 防抖）。
+ */
+function registerSessionConfigHook(context: vscode.ExtensionContext): void {
+  const host = globalThis as unknown as HookHost;
+  let timer: NodeJS.Timeout | undefined;
+  let pending: { modelId: string; tokens: number } | undefined;
+  const flush = (): void => {
+    timer = undefined;
+    const p = pending;
+    pending = undefined;
+    if (!p || !sidebar) {
+      return;
+    }
+    void sidebar.applyContextWindowOverride(p.modelId, p.tokens, "chat").then(
+      (r) => {
+        if (!r.settingsOk) {
+          warn("context window override from chat not persisted:", r.error || "");
+        }
+      },
+      (e) => warn("context window override from chat failed:", (e as Error).message)
+    );
+  };
+  const hook: SessionConfigHook = (configId, value) => {
+    if (configId !== CTX_CONFIG_ID) {
+      return;
+    }
+    const decoded = decodeCtxConfigValue(value);
+    if (!decoded) {
+      warn("ignored malformed a2k:ctx carrier:", String(value).slice(0, 80));
+      return;
+    }
+    info(`chat context selector: ${decoded.modelId} → ${decoded.tokens}`);
+    pending = decoded;
+    if (timer) {
+      clearTimeout(timer);
+    }
+    timer = setTimeout(flush, 250);
+  };
+  host.__a2kSessionConfigOption = hook;
+  context.subscriptions.push({
+    dispose: () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (host.__a2kSessionConfigOption === hook) {
+        delete host.__a2kSessionConfigOption;
+      }
+    },
+  });
 }

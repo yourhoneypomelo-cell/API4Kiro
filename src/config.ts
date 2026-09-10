@@ -127,6 +127,51 @@ export async function updateSetting(
   }
 }
 
+const CTX_OVERRIDES_KEY = "contextWindowOverrides";
+
+/**
+ * 上下文窗口用户覆盖（4.13.55，R24）：Kiro 选择器里的模型 id → tokens。只取用户级值（`scope: machine`），
+ * 写入失败退回 globalState 兜底（与其它设置同一套 updateSetting）。非法值（非正整数 / 越界）在读取时丢弃。
+ */
+export function getContextWindowOverrides(): Record<string, number> {
+  const fb = extCtx?.globalState.get<Record<string, unknown>>(FB_PREFIX + CTX_OVERRIDES_KEY);
+  const raw = fb && typeof fb === "object" ? fb : cfg().get<Record<string, unknown>>(CTX_OVERRIDES_KEY, {});
+  const out: Record<string, number> = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+      if (k && Number.isFinite(n) && n >= 4096 && n <= 10_000_000) {
+        out[k] = Math.floor(n);
+      }
+    }
+  }
+  return out;
+}
+
+export function getContextWindowOverride(modelId: string): number | undefined {
+  return getContextWindowOverrides()[modelId];
+}
+
+/** tokens 为 undefined / null / 0 = 清除该模型的覆盖（回到自动）。返回值同 updateSetting。 */
+export async function setContextWindowOverride(modelId: string, tokens: number | null | undefined): Promise<{ settingsOk: boolean; error?: string }> {
+  const id = String(modelId || "").trim();
+  if (!id) {
+    return { settingsOk: false, error: "empty model id" };
+  }
+  const next: Record<string, number> = { ...getContextWindowOverrides() };
+  if (tokens && Number.isFinite(tokens) && tokens > 0) {
+    next[id] = Math.floor(tokens);
+  } else {
+    delete next[id];
+  }
+  return updateSetting(CTX_OVERRIDES_KEY, next);
+}
+
+/** 清除全部上下文覆盖（设置页「全部重置为自动」）。返回值同 updateSetting。 */
+export async function clearContextWindowOverrides(): Promise<{ settingsOk: boolean; error?: string }> {
+  return updateSetting(CTX_OVERRIDES_KEY, {});
+}
+
 /**
  * 是否启用代理。
  *

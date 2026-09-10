@@ -24,10 +24,24 @@
  */
 
 import * as vscode from "vscode";
-import { ContextBreakdown } from "./contextParser";
+import {
+  AnyContextBreakdown,
+  ContextBreakdown,
+  NormalizedBreakdown,
+  breakdownSum,
+  emptyNormalized,
+  normalizeBreakdown,
+} from "./contextParser";
 import { debug } from "./log";
 
-export { ContextBreakdown };
+export { ContextBreakdown, AnyContextBreakdown, NormalizedBreakdown };
+export {
+  normalizeBreakdown,
+  isLegacyBreakdown,
+  isSixBreakdown,
+  emptyNormalized,
+  breakdownSum,
+} from "./contextParser";
 export interface UsageRecord {
   /** 请求结束时间戳（ms）。 */
   ts: number;
@@ -54,7 +68,7 @@ export interface UsageRecord {
   ok: boolean;
   error?: string;
   conversationId?: string;
-  contextBreakdown?: ContextBreakdown;
+  contextBreakdown?: AnyContextBreakdown;
 }
 
 /** 小时桶：(provider, model, hour) 维度的累计。 */
@@ -79,6 +93,13 @@ export interface HourBucket {
   ctxToolsTokens?: number;
   ctxRulesTokens?: number;
   ctxInputTokens?: number;
+  ctxUserPromptsTokens?: number;
+  ctxKiroResponsesTokens?: number;
+  ctxSessionFilesTokens?: number;
+  ctxBuiltinToolsTokens?: number;
+  ctxMcpToolsTokens?: number;
+  ctxSteeringTokens?: number;
+  ctxLegacyTokens?: number;
 }
 
 /** 按凭证的累计（provider, credential）→ 请求数 / 失败数 / token / 最近一次。给编辑弹窗的 key 列表看。 */
@@ -208,14 +229,16 @@ function addToBucket(r: UsageRecord): void {
   b.cacheWriteTokens += r.cacheWriteTokens;
   b.latencySumMs += r.latencyMs;
   if (r.contextBreakdown) {
-    b.ctxFilesTokens = (b.ctxFilesTokens || 0) + (r.contextBreakdown.filesTokens || 0);
-    b.ctxHistoryTokens = (b.ctxHistoryTokens || 0) + (r.contextBreakdown.historyTokens || 0);
-    b.ctxToolsTokens = (b.ctxToolsTokens || 0) + (r.contextBreakdown.toolsTokens || 0);
-    b.ctxRulesTokens = (b.ctxRulesTokens || 0) + (r.contextBreakdown.rulesTokens || 0);
-    b.ctxInputTokens = (b.ctxInputTokens || 0) + (r.contextBreakdown.currentInputTokens || 0);
+    const n = normalizeBreakdown(r.contextBreakdown);
+    b.ctxUserPromptsTokens = (b.ctxUserPromptsTokens || 0) + n.userPromptsTokens;
+    b.ctxKiroResponsesTokens = (b.ctxKiroResponsesTokens || 0) + n.kiroResponsesTokens;
+    b.ctxSessionFilesTokens = (b.ctxSessionFilesTokens || 0) + n.sessionFilesTokens;
+    b.ctxBuiltinToolsTokens = (b.ctxBuiltinToolsTokens || 0) + n.builtinToolsTokens;
+    b.ctxMcpToolsTokens = (b.ctxMcpToolsTokens || 0) + n.mcpToolsTokens;
+    b.ctxSteeringTokens = (b.ctxSteeringTokens || 0) + n.steeringTokens;
+    b.ctxLegacyTokens = (b.ctxLegacyTokens || 0) + n.legacyTokens;
   } else if (r.inputTokens > 0) {
-    // 与明细路径的兜底口径一致：无细分的输入全部归「当前输入」，桶五项之和才等于桶的 inputTokens
-    b.ctxInputTokens = (b.ctxInputTokens || 0) + r.inputTokens;
+    b.ctxLegacyTokens = (b.ctxLegacyTokens || 0) + r.inputTokens;
   }
   if (typeof r.firstTokenMs === "number" && r.firstTokenMs >= 0) {
     b.firstTokenCount += 1;
@@ -706,11 +729,56 @@ export interface UsageAnalyticsStats {
   longestStreakDays: number;
 }
 
+export const SANKEY_LAYER_IDS = ["provider", "credential", "model", "status", "tokenType", "context"] as const;
+export type SankeyLayerId = (typeof SANKEY_LAYER_IDS)[number];
+export const SANKEY_LAYERS_TOKEN: readonly SankeyLayerId[] = SANKEY_LAYER_IDS;
+export const SANKEY_LAYERS_REQUESTS: readonly SankeyLayerId[] = SANKEY_LAYER_IDS.slice(0, 4);
+export const SANKEY_LAYER_LABELS: Record<SankeyLayerId, string> = {
+  provider: "渠道",
+  credential: "凭证",
+  model: "模型",
+  status: "状态",
+  tokenType: "Token 类型",
+  context: "上下文类别",
+};
+
+export interface SankeyLayersState {
+  tokens: SankeyLayerId[];
+  requests: SankeyLayerId[];
+}
+
 export interface SankeyData {
-  nodes: Array<{ id: string; name: string; layer: number; color?: string }>;
+  nodes: Array<{ id: string; name: string; layer: number; layerId?: SankeyLayerId; color?: string }>;
   links: Array<{ source: string; target: string; tokens: number; requests: number }>;
   /** 范围内的明细已被裁掉一部分，图改由小时桶聚合（少凭证层）；UI 可据此提示，本字段只增不改既有结构。 */
   detailTruncated: boolean;
+  /** 实际出现的层（压缩后的 layer 号按此表）。 */
+  layers: SankeyLayerId[];
+  /** 启用了但数据里没有的层（桶降级时的 credential）。 */
+  unavailableLayers: SankeyLayerId[];
+}
+
+export function normalizeLayers(layers: unknown, dim: "tokens" | "requests" = "tokens"): SankeyLayerId[] {
+  const catalog = dim === "requests" ? SANKEY_LAYERS_REQUESTS : SANKEY_LAYERS_TOKEN;
+  const allowed = new Set<string>(catalog);
+  const seen = new Set<SankeyLayerId>();
+  if (Array.isArray(layers)) {
+    for (const x of layers) {
+      if (typeof x === "string" && allowed.has(x) && !seen.has(x as SankeyLayerId)) {
+        seen.add(x as SankeyLayerId);
+      }
+    }
+  }
+  const out = catalog.filter((id) => seen.has(id));
+  return out.length < 2 ? [...catalog] : out;
+}
+
+export function readSankeyLayersState(raw: unknown): SankeyLayersState {
+  const o = raw && typeof raw === "object" ? (raw as { tokens?: unknown; requests?: unknown }) : {};
+  return {
+    tokens: normalizeLayers(o.tokens, "tokens"),
+    requests: normalizeLayers(o.requests, "requests"),
+  };
 }
 
 export interface ModelUsageRatio {
@@ -887,16 +955,20 @@ export function getModelUsageRatios(range: Range): ModelUsageRatio[] {
 
 export interface ContextBreakdownStats {
   totalInputTokens: number;
-  filesTokens: number;
-  historyTokens: number;
-  toolsTokens: number;
-  rulesTokens: number;
-  currentInputTokens: number;
-  filesPct: number;
-  historyPct: number;
-  toolsPct: number;
-  rulesPct: number;
-  currentPct: number;
+  userPromptsTokens: number;
+  kiroResponsesTokens: number;
+  sessionFilesTokens: number;
+  builtinToolsTokens: number;
+  mcpToolsTokens: number;
+  steeringTokens: number;
+  legacyTokens: number;
+  userPromptsPct: number;
+  kiroResponsesPct: number;
+  sessionFilesPct: number;
+  builtinToolsPct: number;
+  mcpToolsPct: number;
+  steeringPct: number;
+  legacyPct: number;
   /** 范围内的明细已被 2000 条 / 30 天上限裁掉一部分，本结果改由小时桶聚合而来（UI 可据此提示）。 */
   detailTruncated: boolean;
 }
@@ -916,75 +988,375 @@ function detailTruncatedIn(range: Range, detailCount: number): boolean {
   return bucketRequests > detailCount;
 }
 
+function bucketHasNewCtx(b: HourBucket): boolean {
+  return (
+    b.ctxUserPromptsTokens !== undefined ||
+    b.ctxKiroResponsesTokens !== undefined ||
+    b.ctxSessionFilesTokens !== undefined ||
+    b.ctxBuiltinToolsTokens !== undefined ||
+    b.ctxMcpToolsTokens !== undefined ||
+    b.ctxSteeringTokens !== undefined ||
+    b.ctxLegacyTokens !== undefined
+  );
+}
+
+function bucketHasOldCtx(b: HourBucket): boolean {
+  return (
+    b.ctxFilesTokens !== undefined ||
+    b.ctxHistoryTokens !== undefined ||
+    b.ctxToolsTokens !== undefined ||
+    b.ctxRulesTokens !== undefined ||
+    b.ctxInputTokens !== undefined
+  );
+}
+
+function normalizeBucketCtx(b: HourBucket): NormalizedBreakdown {
+  if (bucketHasNewCtx(b)) {
+    return {
+      userPromptsTokens: b.ctxUserPromptsTokens || 0,
+      kiroResponsesTokens: b.ctxKiroResponsesTokens || 0,
+      sessionFilesTokens: b.ctxSessionFilesTokens || 0,
+      builtinToolsTokens: b.ctxBuiltinToolsTokens || 0,
+      mcpToolsTokens: b.ctxMcpToolsTokens || 0,
+      steeringTokens: b.ctxSteeringTokens || 0,
+      legacyTokens: b.ctxLegacyTokens || 0,
+    };
+  }
+  if (bucketHasOldCtx(b)) {
+    return {
+      userPromptsTokens: 0,
+      kiroResponsesTokens: 0,
+      sessionFilesTokens: b.ctxFilesTokens || 0,
+      builtinToolsTokens: 0,
+      mcpToolsTokens: 0,
+      steeringTokens: b.ctxRulesTokens || 0,
+      legacyTokens: (b.ctxHistoryTokens || 0) + (b.ctxToolsTokens || 0) + (b.ctxInputTokens || 0),
+    };
+  }
+  const z = emptyNormalized();
+  z.legacyTokens = b.inputTokens || 0;
+  return z;
+}
+
+function pctOf(part: number, total: number): number {
+  return total > 0 ? (part / total) * 100 : 0;
+}
+
 export function getContextBreakdownStats(range: Range): ContextBreakdownStats {
-  let filesTokens = 0;
-  let historyTokens = 0;
-  let toolsTokens = 0;
-  let rulesTokens = 0;
-  let currentInputTokens = 0;
+  const acc = emptyNormalized();
 
   const filtered = records.filter((r) => r.ts >= range.from && r.ts <= range.to);
   const detailTruncated = detailTruncatedIn(range, filtered.length);
   if (filtered.length > 0 && !detailTruncated) {
     for (const r of filtered) {
-      if (r.contextBreakdown) {
-        filesTokens += r.contextBreakdown.filesTokens || 0;
-        historyTokens += r.contextBreakdown.historyTokens || 0;
-        toolsTokens += r.contextBreakdown.toolsTokens || 0;
-        rulesTokens += r.contextBreakdown.rulesTokens || 0;
-        currentInputTokens += r.contextBreakdown.currentInputTokens || 0;
-      } else if (r.inputTokens > 0) {
-        // 无细分时兜底
-        currentInputTokens += r.inputTokens;
-      }
+      const n = r.contextBreakdown
+        ? normalizeBreakdown(r.contextBreakdown)
+        : { ...emptyNormalized(), legacyTokens: r.inputTokens > 0 ? r.inputTokens : 0 };
+      acc.userPromptsTokens += n.userPromptsTokens;
+      acc.kiroResponsesTokens += n.kiroResponsesTokens;
+      acc.sessionFilesTokens += n.sessionFilesTokens;
+      acc.builtinToolsTokens += n.builtinToolsTokens;
+      acc.mcpToolsTokens += n.mcpToolsTokens;
+      acc.steeringTokens += n.steeringTokens;
+      acc.legacyTokens += n.legacyTokens;
     }
   } else {
     for (const b of bucketsIn(range)) {
-      const hasCtx =
-        b.ctxFilesTokens !== undefined ||
-        b.ctxHistoryTokens !== undefined ||
-        b.ctxToolsTokens !== undefined ||
-        b.ctxRulesTokens !== undefined ||
-        b.ctxInputTokens !== undefined;
-      filesTokens += b.ctxFilesTokens || 0;
-      historyTokens += b.ctxHistoryTokens || 0;
-      toolsTokens += b.ctxToolsTokens || 0;
-      rulesTokens += b.ctxRulesTokens || 0;
-      // 只有完全没有细分字段的老桶才把 inputTokens 整体当「当前输入」；有细分但 ctxInputTokens 为 0 时不能再叠一份
-      currentInputTokens += hasCtx ? b.ctxInputTokens || 0 : b.inputTokens || 0;
+      const n = normalizeBucketCtx(b);
+      acc.userPromptsTokens += n.userPromptsTokens;
+      acc.kiroResponsesTokens += n.kiroResponsesTokens;
+      acc.sessionFilesTokens += n.sessionFilesTokens;
+      acc.builtinToolsTokens += n.builtinToolsTokens;
+      acc.mcpToolsTokens += n.mcpToolsTokens;
+      acc.steeringTokens += n.steeringTokens;
+      acc.legacyTokens += n.legacyTokens;
     }
   }
 
-  const total = filesTokens + historyTokens + toolsTokens + rulesTokens + currentInputTokens;
+  const total = breakdownSum(acc);
   return {
     totalInputTokens: total,
-    filesTokens,
-    historyTokens,
-    toolsTokens,
-    rulesTokens,
-    currentInputTokens,
-    filesPct: total > 0 ? (filesTokens / total) * 100 : 0,
-    historyPct: total > 0 ? (historyTokens / total) * 100 : 0,
-    toolsPct: total > 0 ? (toolsTokens / total) * 100 : 0,
-    rulesPct: total > 0 ? (rulesTokens / total) * 100 : 0,
-    currentPct: total > 0 ? (currentInputTokens / total) * 100 : 0,
+    userPromptsTokens: acc.userPromptsTokens,
+    kiroResponsesTokens: acc.kiroResponsesTokens,
+    sessionFilesTokens: acc.sessionFilesTokens,
+    builtinToolsTokens: acc.builtinToolsTokens,
+    mcpToolsTokens: acc.mcpToolsTokens,
+    steeringTokens: acc.steeringTokens,
+    legacyTokens: acc.legacyTokens,
+    userPromptsPct: pctOf(acc.userPromptsTokens, total),
+    kiroResponsesPct: pctOf(acc.kiroResponsesTokens, total),
+    sessionFilesPct: pctOf(acc.sessionFilesTokens, total),
+    builtinToolsPct: pctOf(acc.builtinToolsTokens, total),
+    mcpToolsPct: pctOf(acc.mcpToolsTokens, total),
+    steeringPct: pctOf(acc.steeringTokens, total),
+    legacyPct: pctOf(acc.legacyTokens, total),
     detailTruncated,
   };
 }
 
-export function getSankeyData(range: Range): SankeyData {
+const TOKEN_META = {
+  cache_read: { tokenId: "t:cache_read", tokenName: "缓存命中读取 (Cache Read)", ctxId: "out:cache_read", ctxName: "缓存读 · 直通", color: "#10b981" },
+  cache_write: { tokenId: "t:cache_write", tokenName: "缓存创建写入 (Cache Write)", ctxId: "out:cache_write", ctxName: "缓存写 · 直通", color: "#a855f7" },
+  input: { tokenId: "t:input", tokenName: "常规输入 (Prompt Input)", ctxId: "", ctxName: "", color: "#38bdf8" },
+  output: { tokenId: "t:output", tokenName: "模型生成 (Completion Output)", ctxId: "out:completion", ctxName: "本轮输出 · 直通", color: "#f59e0b" },
+} as const;
+
+const CTX_META: Array<{ id: string; name: string; color: string; key: keyof NormalizedBreakdown }> = [
+  { id: "ctx:userPrompts", name: "用户提示 (Your prompts)", color: "#60a5fa", key: "userPromptsTokens" },
+  { id: "ctx:kiroResponses", name: "Kiro 回复 (Kiro responses)", color: "#c084fc", key: "kiroResponsesTokens" },
+  { id: "ctx:sessionFiles", name: "会话文件 (Session files)", color: "#fbbf24", key: "sessionFilesTokens" },
+  { id: "ctx:builtinTools", name: "内置工具 (Built-in tools)", color: "#34d399", key: "builtinToolsTokens" },
+  { id: "ctx:mcpTools", name: "MCP 工具 (MCP tools)", color: "#f472b6", key: "mcpToolsTokens" },
+  { id: "ctx:steering", name: "Steering 文件 (Steering files)", color: "#fb7185", key: "steeringTokens" },
+  { id: "ctx:legacy", name: "旧记录未细分", color: "#6b7280", key: "legacyTokens" },
+];
+
+interface SankeyFlow {
+  tokenId: string;
+  tokenName: string;
+  ctxId: string;
+  ctxName: string;
+  color: string;
+  v: number;
+}
+
+interface PathRec {
+  providerId: string;
+  providerName: string;
+  credentialId?: string;
+  model: string;
+  ok: boolean;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  ctx: NormalizedBreakdown;
+}
+
+function largestRemainder(weights: number[], total: number): number[] {
+  if (total <= 0) return weights.map(() => 0);
+  const wsum = weights.reduce((a, b) => a + b, 0);
+  if (wsum <= 0) {
+    const out = weights.map(() => 0);
+    out[out.length - 1] = total;
+    return out;
+  }
+  const raw = weights.map((w) => (w / wsum) * total);
+  const floors = raw.map(Math.floor);
+  let rem = total - floors.reduce((a, b) => a + b, 0);
+  const order = raw.map((v, i) => ({ i, frac: v - Math.floor(v) })).sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (let k = 0; k < rem; k++) floors[order[k].i] += 1;
+  return floors;
+}
+
+function scaleCtx(src: NormalizedBreakdown, inputShare: number): NormalizedBreakdown {
+  const keys: Array<keyof NormalizedBreakdown> = [
+    "userPromptsTokens",
+    "kiroResponsesTokens",
+    "sessionFilesTokens",
+    "builtinToolsTokens",
+    "mcpToolsTokens",
+    "steeringTokens",
+    "legacyTokens",
+  ];
+  const parts = largestRemainder(
+    keys.map((k) => src[k]),
+    inputShare
+  );
+  const out = emptyNormalized();
+  keys.forEach((k, i) => {
+    out[k] = parts[i];
+  });
+  return out;
+}
+
+function credName(credentialId?: string): string {
+  if (!credentialId) return "默认凭证";
+  return credentialId.length > 12 ? credentialId.slice(0, 10) + "…" : credentialId;
+}
+
+function recordFlows(r: PathRec): SankeyFlow[] {
+  const flows: SankeyFlow[] = [];
+  if (r.cacheReadTokens > 0) {
+    const m = TOKEN_META.cache_read;
+    flows.push({ tokenId: m.tokenId, tokenName: m.tokenName, ctxId: m.ctxId, ctxName: m.ctxName, color: m.color, v: r.cacheReadTokens });
+  }
+  if (r.cacheWriteTokens > 0) {
+    const m = TOKEN_META.cache_write;
+    flows.push({ tokenId: m.tokenId, tokenName: m.tokenName, ctxId: m.ctxId, ctxName: m.ctxName, color: m.color, v: r.cacheWriteTokens });
+  }
+  if (r.inputTokens > 0) {
+    const m = TOKEN_META.input;
+    let leftover = r.inputTokens;
+    for (const c of CTX_META) {
+      const part = r.ctx[c.key] || 0;
+      if (part <= 0) continue;
+      leftover -= part;
+      flows.push({ tokenId: m.tokenId, tokenName: m.tokenName, ctxId: c.id, ctxName: c.name, color: c.color, v: part });
+    }
+    if (leftover > 0) {
+      flows.push({
+        tokenId: m.tokenId,
+        tokenName: m.tokenName,
+        ctxId: "ctx:legacy",
+        ctxName: "旧记录未细分",
+        color: "#6b7280",
+        v: leftover,
+      });
+    }
+  }
+  if (r.outputTokens > 0) {
+    const m = TOKEN_META.output;
+    flows.push({ tokenId: m.tokenId, tokenName: m.tokenName, ctxId: m.ctxId, ctxName: m.ctxName, color: m.color, v: r.outputTokens });
+  }
+  return flows;
+}
+
+function pathNode(layerId: SankeyLayerId, r: PathRec, flow?: SankeyFlow): { id: string; name: string; color?: string } | undefined {
+  switch (layerId) {
+    case "provider":
+      return { id: `p:${r.providerId}`, name: r.providerName || r.providerId };
+    case "credential":
+      return { id: `c:${r.providerId}:${r.credentialId || "main"}`, name: credName(r.credentialId) };
+    case "model":
+      return { id: `m:${r.model}`, name: r.model };
+    case "status":
+      return {
+        id: r.ok ? "s:success" : "s:failed",
+        name: r.ok ? "调用成功 200" : "异常重试 / 失败",
+        color: r.ok ? "var(--green)" : "var(--red)",
+      };
+    case "tokenType":
+      return flow ? { id: flow.tokenId, name: flow.tokenName, color: flow.tokenId === "t:input" ? TOKEN_META.input.color : flow.color } : undefined;
+    case "context":
+      return flow ? { id: flow.ctxId, name: flow.ctxName, color: flow.color } : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function appearingLayers(wanted: SankeyLayerId[], bucketPath: boolean): { appearing: SankeyLayerId[]; unavailable: SankeyLayerId[] } {
+  const catalog = wanted.every((id) => (SANKEY_LAYERS_REQUESTS as readonly string[]).includes(id)) && !wanted.includes("tokenType") && !wanted.includes("context")
+    ? SANKEY_LAYERS_REQUESTS
+    : SANKEY_LAYERS_TOKEN;
+  const unavailable: SankeyLayerId[] = bucketPath && wanted.includes("credential") ? ["credential"] : [];
+  let appearing = wanted.filter((id) => !unavailable.includes(id));
+  if (appearing.length < 2) {
+    for (const id of catalog) {
+      if (id === "credential" && bucketPath) continue;
+      if (!appearing.includes(id)) appearing.push(id);
+      if (appearing.length >= 2) break;
+    }
+  }
+  return { appearing, unavailable };
+}
+
+function emitPath(recs: PathRec[], appearing: SankeyLayerId[], addNode: (id: string, name: string, layer: number, layerId: SankeyLayerId, color?: string) => void, addLink: (s: string, t: string, tokens: number, requests: number) => void): void {
+  const rank = new Map(appearing.map((id, i) => [id, i]));
+  const isTokLayer = (id: SankeyLayerId) => id === "tokenType" || id === "context";
+  for (const r of recs) {
+    const totalTok = (r.inputTokens || 0) + (r.outputTokens || 0) + (r.cacheReadTokens || 0) + (r.cacheWriteTokens || 0);
+    const flows = recordFlows(r);
+    for (let i = 0; i < appearing.length - 1; i++) {
+      const a = appearing[i];
+      const b = appearing[i + 1];
+      if (!isTokLayer(b)) {
+        const na = pathNode(a, r);
+        const nb = pathNode(b, r);
+        if (!na || !nb) continue;
+        addNode(na.id, na.name, rank.get(a)!, a, na.color);
+        addNode(nb.id, nb.name, rank.get(b)!, b, nb.color);
+        addLink(na.id, nb.id, totalTok, r.requests);
+      } else {
+        for (const flow of flows) {
+          if (flow.v <= 0) continue;
+          const na = pathNode(a, r, flow);
+          const nb = pathNode(b, r, flow);
+          if (!na || !nb) continue;
+          addNode(na.id, na.name, rank.get(a)!, a, na.color);
+          addNode(nb.id, nb.name, rank.get(b)!, b, nb.color);
+          addLink(na.id, nb.id, flow.v, 0);
+        }
+      }
+    }
+  }
+}
+
+function recordToPath(r: UsageRecord): PathRec {
+  return {
+    providerId: r.providerId,
+    providerName: r.providerName,
+    credentialId: r.credentialId,
+    model: r.model,
+    ok: r.ok,
+    requests: 1,
+    inputTokens: r.inputTokens || 0,
+    outputTokens: r.outputTokens || 0,
+    cacheReadTokens: r.cacheReadTokens || 0,
+    cacheWriteTokens: r.cacheWriteTokens || 0,
+    ctx: r.contextBreakdown ? normalizeBreakdown(r.contextBreakdown) : { ...emptyNormalized(), legacyTokens: r.inputTokens || 0 },
+  };
+}
+
+function bucketToPaths(b: HourBucket): PathRec[] {
+  const inTok = b.inputTokens || 0;
+  const outTok = b.outputTokens || 0;
+  const readTok = b.cacheReadTokens || 0;
+  const writeTok = b.cacheWriteTokens || 0;
+  const totalTok = inTok + outTok + readTok + writeTok;
+  const succReq = Math.max(0, b.requests - b.failures);
+  const failReq = Math.max(0, b.requests - succReq);
+  if (b.requests <= 0 && totalTok <= 0) return [];
+  const shareOk = (v: number) => (succReq > 0 ? (failReq > 0 ? Math.round((v * succReq) / b.requests) : v) : 0);
+  const src = normalizeBucketCtx(b);
+  const out: PathRec[] = [];
+  const push = (ok: boolean, req: number, input: number, output: number, read: number, write: number) => {
+    if (req <= 0 && input + output + read + write <= 0) return;
+    out.push({
+      providerId: b.providerId,
+      providerName: b.providerName,
+      model: b.model,
+      ok,
+      requests: req,
+      inputTokens: input,
+      outputTokens: output,
+      cacheReadTokens: read,
+      cacheWriteTokens: write,
+      ctx: scaleCtx(src, input),
+    });
+  };
+  if (succReq > 0) {
+    push(true, succReq, shareOk(inTok), shareOk(outTok), shareOk(readTok), shareOk(writeTok));
+  }
+  if (failReq > 0) {
+    const okIn = succReq > 0 ? shareOk(inTok) : 0;
+    const okOut = succReq > 0 ? shareOk(outTok) : 0;
+    const okRead = succReq > 0 ? shareOk(readTok) : 0;
+    const okWrite = succReq > 0 ? shareOk(writeTok) : 0;
+    push(false, failReq, inTok - okIn, outTok - okOut, readTok - okRead, writeTok - okWrite);
+  }
+  return out;
+}
+
+export function getSankeyData(range: Range, layers?: readonly string[]): SankeyData {
   const filteredRecords = records.filter((r) => r.ts >= range.from && r.ts <= range.to);
   const detailTruncated = detailTruncatedIn(range, filteredRecords.length);
+  const bucketPath = !(filteredRecords.length > 0 && !detailTruncated);
+  const dim: "tokens" | "requests" = layers && layers.length > 0 && layers.every((id) => (SANKEY_LAYERS_REQUESTS as readonly string[]).includes(id)) && !(layers as string[]).includes("tokenType") && !(layers as string[]).includes("context")
+    ? "requests"
+    : "tokens";
+  const wanted = normalizeLayers(layers ?? (dim === "requests" ? SANKEY_LAYERS_REQUESTS : SANKEY_LAYERS_TOKEN), dim);
+  const { appearing, unavailable } = appearingLayers(wanted, bucketPath);
 
-  const nodeMap = new Map<string, { id: string; name: string; layer: number; color?: string }>();
+  const nodeMap = new Map<string, { id: string; name: string; layer: number; layerId?: SankeyLayerId; color?: string }>();
   const linkMap = new Map<string, { source: string; target: string; tokens: number; requests: number }>();
 
-  const addNode = (id: string, name: string, layer: number, color?: string) => {
+  const addNode = (id: string, name: string, layer: number, layerId: SankeyLayerId, color?: string) => {
     if (!nodeMap.has(id)) {
-      nodeMap.set(id, { id, name, layer, color });
+      nodeMap.set(id, { id, name, layer, layerId, color });
     }
   };
-
   const addLink = (source: string, target: string, tokens: number, requests: number) => {
     const key = `${source}-->${target}`;
     let cur = linkMap.get(key);
@@ -996,122 +1368,17 @@ export function getSankeyData(range: Range): SankeyData {
     cur.requests += requests;
   };
 
-  if (filteredRecords.length > 0 && !detailTruncated) {
-    for (const r of filteredRecords) {
-      const pId = `p:${r.providerId}`;
-      const pName = r.providerName || r.providerId;
-      const cId = `c:${r.providerId}:${r.credentialId || "main"}`;
-      const cName = r.credentialId ? (r.credentialId.length > 12 ? r.credentialId.slice(0, 10) + "…" : r.credentialId) : "默认凭证";
-      const mId = `m:${r.model}`;
-      const mName = r.model;
-      const sId = r.ok ? "s:success" : "s:failed";
-      const sName = r.ok ? "调用成功 200" : "异常重试 / 失败";
-
-      const inTok = r.inputTokens || 0;
-      const outTok = r.outputTokens || 0;
-      const readTok = r.cacheReadTokens || 0;
-      const writeTok = r.cacheWriteTokens || 0;
-      const totalTok = inTok + outTok + readTok + writeTok;
-
-      // Layer 0 ~ 3: 渠道 -> 凭证 -> 模型 -> 状态 (请求数严格为整数 1)
-      addNode(pId, pName, 0);
-      addNode(cId, cName, 1);
-      addNode(mId, mName, 2);
-      addNode(sId, sName, 3, r.ok ? "var(--green)" : "var(--red)");
-
-      addLink(pId, cId, totalTok, 1);
-      addLink(cId, mId, totalTok, 1);
-      addLink(mId, sId, totalTok, 1);
-
-      // Layer 4: 缓存命中与 Token 细分流向 (仅承载 Token 分流，requests 设为 0，防止把 1 次请求在多个 Token 门重复计算或产出小数)
-      if (readTok > 0) {
-        const id = "t:cache_read";
-        addNode(id, "缓存命中读取 (Cache Read)", 4, "#10b981");
-        addLink(sId, id, readTok, 0);
-      }
-      if (writeTok > 0) {
-        const id = "t:cache_write";
-        addNode(id, "缓存创建写入 (Cache Write)", 4, "#a855f7");
-        addLink(sId, id, writeTok, 0);
-      }
-      if (inTok > 0) {
-        const id = "t:input";
-        addNode(id, "常规输入 (Prompt Input)", 4, "#38bdf8");
-        addLink(sId, id, inTok, 0);
-
-      }
-      if (outTok > 0) {
-        const id = "t:output";
-        addNode(id, "模型生成 (Completion Output)", 4, "#f59e0b");
-        addLink(sId, id, outTok, 0);
-      }
-    }
-  } else {
-    // 降级使用 buckets（范围内明细为空或被裁掉一部分时）：拓扑少凭证层——渠道 → 模型 → 状态 → Token 门；
-    // 与总览卡同一组桶，Token 门之和 === summarize(range).totalTokens
-    for (const b of bucketsIn(range)) {
-      const pId = `p:${b.providerId}`;
-      const pName = b.providerName || b.providerId;
-      const mId = `m:${b.model}`;
-      const mName = b.model;
-      const sOkId = "s:success";
-      const sFailId = "s:failed";
-
-      const inTok = b.inputTokens || 0;
-      const outTok = b.outputTokens || 0;
-      const readTok = b.cacheReadTokens || 0;
-      const writeTok = b.cacheWriteTokens || 0;
-      const totalTok = inTok + outTok + readTok + writeTok;
-      const succReq = Math.max(0, b.requests - b.failures);
-      const failReq = Math.max(0, b.requests - succReq);
-      if (b.requests <= 0 && totalTok <= 0) {
-        continue;
-      }
-
-      addNode(pId, pName, 0);
-      addNode(mId, mName, 1);
-      if (succReq > 0) addNode(sOkId, "调用成功 200", 2, "var(--green)");
-      if (failReq > 0) addNode(sFailId, "异常重试 / 失败", 2, "var(--red)");
-
-      addLink(pId, mId, totalTok, b.requests);
-
-      // 桶里成功与失败混在一起时，把每类 Token 按成功占比切给成功态、其余给失败态；
-      // 状态节点的入流定义为「它分到的四类之和」，这样每个状态的入流 === 出流，与明细路径一样守恒。
-      const shareOk = (v: number) => (succReq > 0 ? (failReq > 0 ? Math.round((v * succReq) / b.requests) : v) : 0);
-      const parts: Array<[string, string, string, number]> = [
-        ["t:cache_read", "缓存命中读取 (Cache Read)", "#10b981", readTok],
-        ["t:cache_write", "缓存创建写入 (Cache Write)", "#a855f7", writeTok],
-        ["t:input", "常规输入 (Prompt Input)", "#38bdf8", inTok],
-        ["t:output", "模型生成 (Completion Output)", "#f59e0b", outTok],
-      ];
-      let okIn = 0;
-      let failIn = 0;
-      for (const [id, name, color, v] of parts) {
-        if (v <= 0) {
-          continue;
-        }
-        const ok = succReq > 0 ? shareOk(v) : 0;
-        const fail = failReq > 0 ? v - ok : 0;
-        addNode(id, name, 3, color);
-        if (ok > 0) {
-          addLink(sOkId, id, ok, 0);
-          okIn += ok;
-        }
-        if (fail > 0) {
-          addLink(sFailId, id, fail, 0);
-          failIn += fail;
-        }
-      }
-      // 没有失败请求时全部 Token 归成功态（反之亦然），四类之和恒等于 totalTok
-      if (succReq > 0) addLink(mId, sOkId, failReq > 0 ? okIn : totalTok, succReq);
-      if (failReq > 0) addLink(mId, sFailId, succReq > 0 ? failIn : totalTok, failReq);
-    }
-  }
+  const recs = bucketPath
+    ? [...bucketsIn(range)].flatMap(bucketToPaths)
+    : filteredRecords.map(recordToPath);
+  emitPath(recs, appearing, addNode, addLink);
 
   return {
     nodes: [...nodeMap.values()],
     links: [...linkMap.values()],
     detailTruncated,
+    layers: appearing,
+    unavailableLayers: unavailable,
   };
 }
 
