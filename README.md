@@ -8,7 +8,7 @@
   <a href="https://github.com/yourhoneypomelo-cell/API4Kiro/releases/latest"><img src="https://img.shields.io/github/v/release/yourhoneypomelo-cell/API4Kiro?label=release&color=7c3aed" alt="Release"></a>
   <a href="https://github.com/yourhoneypomelo-cell/API4Kiro/actions/workflows/ci.yml"><img src="https://github.com/yourhoneypomelo-cell/API4Kiro/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yourhoneypomelo-cell/API4Kiro/releases"><img src="https://img.shields.io/github/downloads/yourhoneypomelo-cell/API4Kiro/total?color=7c3aed" alt="Downloads"></a>
-  <img src="https://img.shields.io/badge/Kiro-1.0.411%20%E2%80%93%201.1.14-7c3aed" alt="Kiro">
+  <img src="https://img.shields.io/badge/Kiro-1.0.411%20%E2%80%93%201.2.56-7c3aed" alt="Kiro">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/yourhoneypomelo-cell/API4Kiro" alt="License"></a>
 </p>
 
@@ -60,7 +60,7 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 
 之后增删模型、调整顺序都会静默同步到 Kiro 右侧的模型选择器，不再需要重载。
 
-> 需要 Kiro IDE（本扩展声明依赖内置的 `kiro.kiroAgent`），纯 VS Code 中不会激活。已在 Kiro 1.0.411 / 1.0.437 / 1.1.14 上验证（1.1.14 起 Kiro 把聊天界面拆到 `kiro-ui-session-details`，两份 chunk 各自独立压缩，补丁逐份覆盖）。
+> 需要 Kiro IDE（本扩展声明依赖内置的 `kiro.kiroAgent`），纯 VS Code 中不会激活。已在 Kiro 1.0.411 / 1.0.437 / 1.1.14 / 1.2.56 上验证（1.1.14 起 Kiro 把聊天界面拆到 `kiro-ui-session-details`，两份 chunk 各自独立压缩，补丁逐份覆盖；1.2 起模型选择器改为带搜索的模型面板，补丁按两代结构分别适配）。
 
 ## 接入方式
 
@@ -115,7 +115,7 @@ Kiro 视图标题栏最右侧有两枚命令图标（4.13.56）：**GitHub 标**
 - **每轮页脚**（`showTokenUsage`）：在 Kiro 回答页脚标注本轮消耗的 Est. Input / Output Tokens；工具循环里的多次请求会累计成一轮后再上报，避免 Kiro 重复聚合。
 - **本地账本**：每个请求的 token 由本扩展自己记账，不依赖中转站的用量接口；用量页的趋势、Sankey、汇总都来自这份账本。也可填 `usagePath` 走中转站的额度接口（kiro2cc-proxy 风格或 New-API 风格）。
 - **Context Usage 弹层**：Kiro 底栏的 Context Usage 悬停弹层显示**真实模型窗口**（来自 CPS 报给 Kiro 的 `tokenLimits.maxInputTokens`，例如 1M）与六类分项占用（Your prompts / Kiro responses / Session files / Built-in tools / MCP tools / Steering files），不再是反推出来的假窗口。
-- **上下文挡位**（4.13.55）：每个已勾选模型按渠道字段 / 厂商目录 / models.dev / 用户覆盖算出「已知最大 / 候选挡位 / 当前生效」。聊天框 Effort 右侧有「Ctx」下拉，面板模型页每行、设置页「上下文」卡是同一套数据；选小一档后 Kiro 按新窗口算 80% / 95% 压缩阈值。覆盖写在用户级设置 `api2kiroDual.contextWindowOverrides`。
+- **上下文挡位**（4.13.55）：每个已勾选模型按渠道字段 / 厂商目录 / models.dev / 用户覆盖算出「已知最大 / 候选挡位 / 当前生效」。聊天框 Effort 右侧（Kiro 1.2 起在模型触发器右侧）有「Ctx」下拉，面板模型页每行、设置页「上下文」卡是同一套数据；选小一档后 Kiro 按新窗口算 80% / 95% 压缩阈值。覆盖写在用户级设置 `api2kiroDual.contextWindowOverrides`。
   - **（4.13.61）修一处口径分歧**：原先 CPS 广播、侧边栏下拉、流式占用百分比三条路径各算各的窗口 —— 流式那条只查 models.dev，**不看**用户覆盖 / 厂商目录 / Codex 订阅口径。于是 Codex 系模型上 CPS 报 272K、百分比却按目录的 1.05M 算（差 3.86 倍），永远到不了 80% 阈值 → 上下文无界增长。现在三条路径统一走 `modelStore.resolveWindowForGroup()`，同名重复函数已删除。
   - **（4.13.63）修「某些视图没有 Ctx 下拉」**：1.1.14 把聊天界面拆到 `kiro-ui-session-details`，那份 bundle 独立压缩，两个锚点写死在旧压缩名上 —— 该 chunk 的名字助手是 `o(` 而不是 `a(`（`useSessionConfig` 恒判未命中），且模板自带局部 `const k` 恰好撞上那份的 jsx 运行时名 `k`。两个原因都会让整条注入被拒，于是那个视图的聊天框**完全没有**「上下文」下拉。现在反查助手名按结构走、模板自有标识符全部 `a2k` 前缀化，两份 chunk 都能注入（`dev/verify-selector-patch.js` P15 逐份守卫，含「注入段真能渲染」）。
   - **（4.13.63）补丁状态逐 package 记账**：同一份 chunk 在各 package 各一份、各自独立压缩，所以「成没成」逐份回答 —— 任一承载 package 没打上就报 `unavailable` 并点名落地 / 漏掉的 package（不再出现「一个视图有、另一个没有」却报成功），`CARD_CSS` 也只给拿到补丁的那份加；弹层的 displayName 助手名改为按结构捕获（此前写死 `a`，真机叫 `o` 时整条弹层补丁静默失效）；调用处的 store 名改成 `typeof` 兜底（被压缩器改名时退回原生三项视图，而不是让弹层崩掉）。
@@ -142,8 +142,10 @@ Kiro 视图标题栏最右侧有两枚命令图标（4.13.56）：**GitHub 标**
 | 靶文件 | 作用 |
 | --- | --- |
 | `extensions/kiro.kiro-agent/packages/*/dist/style.css` | 模型选择器分组标题 / 卡片样式、弹层样式、Ctx 下拉样式（逐份：CSS 只作用于同一个 webview 文档） |
-| `extensions/kiro.kiro-agent/packages/*/dist/assets/mermaid-*.js` | 模型选择器组头渲染、Context Usage 弹层、聊天框 Effort 旁「Ctx」下拉 |
+| `extensions/kiro.kiro-agent/packages/*/dist/assets/mermaid-*.js` | 模型选择器组头 / 能力徽章（1.1 选项行；1.2 模型面板行）、Context Usage 弹层、Ctx 下拉（1.1 在 Effort 旁，1.2 在模型触发器旁） |
 | `extensions/kiro.kiro-agent/dist/extension.js` | 模型刷新钩子（「通道 A」静默刷新）、`a2k:ctx` 挡位转发钩子 |
+
+> **（4.13.64）适配 Kiro 1.2.56**：后端钩子、端点重定向、CPS / KRS 在 1.2.56 上照常工作，坏的全在 webview 补丁，三个成因互相独立：① 模型选择器被整个重写成带搜索框 / 勾选列 / Effort 滑条的模型面板（`ModelPanel` / `ModelOptionRow`），1.1 代的选项行 / 菜单 / ref 锚点全部消失，补丁全有或全无地放弃，于是 `__A2K_GRP__|…` / `__A2K_MDL__|…` 微格式直接显示在面板的描述行里；现在新增 1.2 代路径，只改行组件的 props（分组标题不可选中、描述换成卡片头 / 能力徽章），并在 `writeModel` 入口拦下分组标题。② `EffortSelector` 组件被删（Effort 挪进面板），「Ctx」下拉改挂在模型触发器右边。③ 结构匹配器把成员访问的属性名（`ne.c(30)` 的 `.c`）也当成可改名标识符，1.2.56 恰好把局部 `c` / `u` 对调，弹层函数 0 命中；属性名现按字面量处理。**session-details 那份的 Context Usage 弹层在 1.2.56 上保持原生**（jsx 运行时名不是 `b`，见 ARCHITECTURE「已知限制」）。**与 `kiro-proxy.kiro-api-proxy` 同时启用会争抢 `codewhisperer.config.*Endpoints`，两者也改同一份 chunk 与 `extension.js`**，请只开一个。
 
 > **1.1.14 起是「按内容认靶点、逐 package 覆盖」**：聊天界面被拆到 `kiro-ui-session-details`，承载模型选择器的同一个 chunk（同名 base `mermaid-GHXKKRXX`、不同 hash）在各 package 下各有一份，而且**各自独立压缩**。所以：① 用类名字面量 `chat-input-popup-option` 按**内容**挑 chunk，不按文件名（`mermaid-*` 优先，一份都不命中时回退扫该 package 的全部 `assets/*.js`）；② 每个 package 的 chunk 与它自己的 `style.css` 逐份处理，任一份漏掉就是「用户看到的那份没有补丁」。
 

@@ -337,7 +337,10 @@ export class KrsProxyServer {
           // 会被路由到这里。本地就地应答一个合法的 JSON-RPC 结果。
           this.handleMcpJsonRpc(res, body);
         } else {
-          info("KRS unhandled:", method, path);
+          // 诊断（4.13.64）：Kiro 1.2.56 实测有一次 `POST /` 落到这里，内容不明；带上 x-amz(n)-target 以便下次定位
+          const target = (req.headers["x-amz-target"] || req.headers["x-amzn-target"] || "") as string;
+          if (target) info("KRS unhandled:", method, path, "target=" + target);
+          else info("KRS unhandled:", method, path);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end("{}");
         }

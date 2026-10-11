@@ -110,14 +110,24 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 | 靶文件（相对 Kiro 安装目录） | 补丁内容 |
 | --- | --- |
 | `extensions/kiro.kiro-agent/packages/*/dist/style.css` | 分组标题 / 卡片 / 弹层 / Ctx 下拉样式（全部限定在扩展自己的类名作用域内；CSS 只作用于同一个 webview 文档，所以逐 package 各落一份） |
-| `extensions/kiro.kiro-agent/packages/*/dist/assets/mermaid-*.js` | 选择器组头渲染；Context Usage 弹层改为读 description 里的真实窗口；Effort 旁「Ctx」挡位下拉 |
+| `extensions/kiro.kiro-agent/packages/*/dist/assets/mermaid-*.js` | 选择器组头 / 能力徽章渲染（1.1 选项行；1.2 模型面板行）；Context Usage 弹层改为读 description 里的真实窗口；「Ctx」挡位下拉（1.1 在 Effort 旁，1.2 在模型触发器旁） |
 | `extensions/kiro.kiro-agent/dist/extension.js` | 在模型配置 provider 的 setter 上挂钩子，暴露给同宿主的本扩展，用于「通道 A」静默刷新；`a2k:ctx` 挡位转发 |
 
 **靶点发现（1.1.14 起）**：按**内容**而不是文件名认 chunk —— Kiro 1.1.14 把聊天界面拆到 `kiro-ui-session-details`，承载模型选择器的同一个 chunk（同名 base `mermaid-GHXKKRXX`、不同 hash、大小 1.87 MB vs 2.22 MB）在各 package 下各有一份且**独立压缩**。`selectorPackages()` 先用类名字面量 `chat-input-popup-option` 筛 `mermaid-*`，该 package 一份都不命中时**回退扫全部 `assets/*.js`**（文件名是 Kiro 内部的偶然命名，换名时不该整组静默失效），随后 chunk 与同 package 的 `style.css` 逐份处理。
 
+**1.2.56 起两代靶点**（4.13.64）：Kiro 1.2.56 把模型选择器重写成 `ModelPanel` / `ModelOptionRow` / `useModelSelector`，1.1 代锚点全部消失。`applySelectorScript` 先试 1.1 代（`applyOptionRowV1`：选项行 / 菜单 / ref），不中再试 1.2 代（`applyModelPanelRow`，v2）；两代锚点不会同时出现，1.1.x 上的行为逐字不变。v2 不改 React Compiler 的记忆化组件体，只做三处纯插入，全有或全无：
+
+| 插入点 | 锚点 | 内容 |
+| --- | --- | --- |
+| 行组件函数头之后 | `function <Row>(<p>){`（`<Row>` 由 `<h>(<Row>,"ModelOptionRow");` 唯一反查） | `<p>=a2kRowFix(<p>);`——唯一的 hook `ne.c(47)` 调用次序不变 |
+| 行组件标签之后 | `<h>(<Row>,"ModelOptionRow");` | `a2kRowFix` 定义：`__A2K_GRP__` 行换成不可交互（`aria-disabled` / `data-a2k-grp` / 阻断点击）+ 卡片头描述；`__A2K_MDL__` 行描述换成能力徽章（无徽章为空）；其余行原样返回 |
+| `useModelSelector` 的 writeModel 回调头 | 唯一字面量 `},"writeModel")` 往前 400 字符内最后一个 `<x>(<g>=>{`，且紧跟 `<g>!==` | `if(typeof <g>==="string"&&<g>.startsWith("a2k-group:"))return;`——键盘 Home+Enter 也选不中分组标题 |
+
+三段都用 `/*a2k-row:start*/…/*a2k-row:end*/` 定界，还原 = 删段（`restoreModelPanelRow`，排在 `restoreSelectorScript` 最后）。v2 不打菜单宽度 / resize / 选中居中：面板自己管宽度与 `revealRow` 滚动。「Ctx」下拉在 `EffortSelector` 标签 0 命中时改挂 `ModelSelector`（调用形状同为 `<jsx>.jsx(<fn>,{disabled:<v>})`），模板与还原正则照用。
+
 约束与机制：
 
-- **结构匹配，不写死压缩名**。Kiro 自动升级会改变压缩后的标识符（1.0.411 → 1.0.437 → 1.1.14 每次都重排），补丁模板把标识符换成正则捕获组按结构匹配；调用处以捕获到的名字渲染。三处靶点**全有或全无**：任一漂移或写入失败则三处都不写，不留半套。
+- **结构匹配，不写死压缩名**。Kiro 自动升级会改变压缩后的标识符（1.0.411 → 1.0.437 → 1.1.14 每次都重排），补丁模板把标识符换成正则捕获组按结构匹配；调用处以捕获到的名字渲染。三处靶点**全有或全无**：任一漂移或写入失败则三处都不写，不留半套。成员访问的属性名（`ne.c(30)` 的 `.c`）按字面量处理、不参与改名映射（4.13.64：1.2.56 把局部 `c` / `u` 对调，旧分词把属性 `.c` 与局部 `c` 算成同一个名字，弹层函数 0 命中）。
 - **逐 package 记账，半套不许报成功**（4.13.63）。1.1.14 起同一份 chunk 在多个 package 各有一份、各自独立压缩，所以「成没成」逐份回答：任一承载 package 没打上就报 `unavailable` 并**点名**落地 / 漏掉的 package；`CARD_CSS` 也逐份决定（只给拿到补丁的那份加），一份漂移不牵连另一份，也不会留下「改了外观没功能」的半套。可选组（Ctx 下拉）同理：一份不全中就不报 `applied`。
 - **连名字助手也不能写死**。`resolveTaggedName` 原先按 `a(<压缩名>,"<原名>")` 反查，而 1.1.14 的 session-details 那份是 `o(C1,"useSessionConfig")` —— 该视图的 Ctx 下拉因此整体不注入。现在先按历史形态找、不中再放宽到任意助手名（仍要求唯一命中）。
 - **注入段自带标识符必须与压缩名不可能相撞**。`namesCollide` 会在真机名与模板里任一**代码**标识符同名时拒绝整条补丁（防遮蔽 / TDZ；字符串 / 注释里的词不参与判定）。所以 A2kContextSelector 模板里属于扩展自己的标识符（含内部对象键）一律 `a2k` 前缀：压缩器只产出 `a–z / A–Z / aa…` 形态，`a2k*` 永不出现。
@@ -134,7 +144,9 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 ## 已知限制
 
 - 只在 Kiro 内运行（依赖内置 `kiro.kiroAgent`），纯 VS Code 不激活。
-- 补丁针对 Kiro 1.0.411 / 1.0.437 / **1.1.14** 的文件结构验证（`dev/verify-selector-patch.js` 对真机安装目录的只读副本跑 79 项：结构命中、唯一性、改名守卫、幂等、往返复原、多 package 覆盖、弹层「命中即可见」、Ctx 下拉逐份「能注入且真能渲染」）。Kiro 大改前端结构时补丁会因靶点不匹配而整体跳过（回到原生外观，功能不受影响），需要跟进新结构——1.1.14 已经发生过一轮（聊天界面拆 package + 整体重压缩）。
+- 补丁针对 Kiro 1.0.411 / 1.0.437 / 1.1.14 / **1.2.56** 的文件结构验证（`dev/verify-selector-patch.js` 对真机安装目录的只读副本跑结构命中、唯一性、改名守卫、幂等、往返复原、多 package 覆盖、弹层「命中即可见」、Ctx 下拉逐份「能注入且真能渲染」、v2 行改写与 writeModel 守卫；1.2.56 上 175 项，项数以脚本自报为准）。Kiro 大改前端结构时补丁会因靶点不匹配而整体跳过（回到原生外观，功能不受影响），需要跟进新结构——1.1.14（聊天界面拆 package + 整体重压缩）与 1.2.56（模型选择器重写为模型面板、EffortSelector 删除）各发生过一轮。
+- **1.2.56 的 session-details 那份 Context Usage 弹层保持原生**：它的 jsx 运行时名是 `x`（见下一条的 `b` 守卫），模板串插值里的名字也漂了；agent-chat 那份照常注入。
+- **1.1.x 本轮只有合成夹具回归**（P23：按 1.1.14 实测改名表把规范模板渲染成 1.1.x 形态，断言 v1 全链路能打上并逐字往返）。4.13.64 改到 v1 路径的只有分词（属性名按字面量），真实 1.1.14 bundle 上的回归没跑。
 - 补丁认 chunk 用内容判据（`chat-input-popup-option`），文件名只在 `mermaid-*` 这一轮优先；两者都不中才会整体跳过。
 - **Context Usage 弹层补丁还剩一处写死的压缩名**（选择器、Ctx 下拉与弹层的另外两处已全部结构匹配）：**jsx 运行时名**。模板与还原侧都以规范名 `b` 逐字落地，所以 `applyPopover` 先读命中段里的真机名，不是 `b` 就直接跳过（宁可这个视图退回原生外观，也不写出 `b.jsx(...)` 这种指向不存在标识符的代码）。要支持任意 jsx 名，得把真机名同时穿到写入侧与 `restorePatchedPopover` 的期望形态——只改一边会把另一种名字写进文件，比跳过更糟。
 - displayName 标签的**名字助手**已按结构捕获（4.13.63）：`findPopoverFactory` 贴着命中段末尾读 `<助手>(<函数名>,"ContextUsagePopover");`，写入与还原都用真机名。此前它拿规范名 `a` 逐字比对，真机助手叫别的名字（session-details 是 `o`）时整条弹层补丁静默不注入。

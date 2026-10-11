@@ -537,6 +537,19 @@ const CARD_CSS = `${START}
   pointer-events: none !important;
   opacity: 0.75 !important;
 }
+
+/* ==========================================================================
+   1.2 代模型面板（4.13.64，Kiro 1.2.56 起的 ModelPanel / ModelOptionRow）：只命中 a2kRowFix 打了
+   data-a2k-grp 的分组标题行与 .a2k-caps-box 徽章节点，与 1.1 代选项行的规则无交集。
+   卡片头内部（.a2k-card-head / .a2k-logo / .a2k-title / .a2k-count / .a2k-chev）与徽章（.a2k-cap*）沿用上面的规则。
+   面板自己管宽度与选中滚动，不打 1.1 代的菜单宽度 / resize / 居中补丁。
+   ========================================================================== */
+.kiro-model-panel-option[data-a2k-grp="1"]{cursor:default !important;margin:6px 4px 0 !important;padding:4px 8px !important;border-radius:8px 8px 0 0 !important;background:rgba(255,255,255,.035) !important;border:1px solid rgba(255,255,255,.11) !important;}
+.kiro-model-panel-option[data-a2k-grp="1"]:first-child{margin-top:2px !important;}
+.kiro-model-panel-option[data-a2k-grp="1"] .kiro-model-panel-option-check,
+.kiro-model-panel-option[data-a2k-grp="1"] .kiro-model-panel-option-header{display:none !important;}
+.kiro-model-panel-option[data-a2k-grp="1"] .kiro-model-panel-option-description{display:block !important;color:inherit !important;opacity:1 !important;}
+.kiro-model-panel-option-description > .a2k-caps-box{margin-top:2px !important;}
 ${END}`;
 
 const ORIG_JS_PATTERN =
@@ -830,6 +843,11 @@ type CodeToken = { isIdent: boolean; text: string; at: number };
  * 当成标识符选中（反引号不在 `[\w$]` 里，`(?<![\w$])` 放行），渲染时被替换成正则占位符，
  * 产出 `` v2{g}% `` 这种直接语法错误。字符串与注释里的字面量在压缩前后逐字不变，
  * 正好可以当成可靠的结构锚。
+ *
+ * 成员访问的属性名（`.` 之后的标识符，`...x` 展开除外）按**字面量**处理：压缩器从不改属性名，
+ * 它们不参与改名映射。4.13.64 修：Kiro 1.2.56 的 agent-chat 把弹层函数里的局部 `style:c` 压成
+ * `style:u`（`c`/`u` 对调），而 `ne.c(30)` 的 `.c` 是 React Compiler 运行时的属性；旧实现把 `.c`
+ * 也当成可改名标识符，verifyTokens 于是看到规范名 `c` 同时映到 `c`（属性）与 `u`（局部），判不一致 → 0 命中。
  */
 function codeTokens(text: string): CodeToken[] {
   const out: CodeToken[] = [];
@@ -840,7 +858,9 @@ function codeTokens(text: string): CodeToken[] {
     for (const m of text.slice(from, to).matchAll(IDENT_RE)) {
       const at = from + (m.index as number);
       if (at > prev) out.push({ isIdent: false, text: text.slice(prev, at), at: prev });
-      out.push({ isIdent: true, text: m[0], at });
+      // `a.b` / `a?.b` 的 b 是属性名（不可压缩）；`...b` 是展开，b 仍是标识符
+      const member = at > 0 && text[at - 1] === "." && !(at > 1 && text[at - 2] === ".");
+      out.push({ isIdent: !member, text: m[0], at });
       prev = at + m[0].length;
     }
     if (prev < to) out.push({ isIdent: false, text: text.slice(prev, to), at: prev });
@@ -862,6 +882,8 @@ function codeTokens(text: string): CodeToken[] {
  *   这条几乎排除了全部误命中）；
  * - 标识符 token 必须一一对应，且同一规范名必须始终对应同一实际名
  *   （压缩器不会把同一个名字在不同位置压成两个名字）。
+ * - 成员访问的属性名（`ne.c` 的 `.c`）由 codeTokens 归为字面量，必须逐字相同、不进映射
+ *   （4.13.64：1.2.56 的局部 `c`/`u` 对调曾让属性 `.c` 与局部 `c` 抢同一条映射）。
  *
  * 注意**不要**在这里检查「两个规范名映到同一实际名」：那是合法且常见的
  * （1.1.14 的弹层里规范名 `z` 与 `H` 都映到实际的 `H`）。真正会出问题的是
@@ -984,7 +1006,7 @@ function renderMatched(template: string, canonical: string, span: MaskedSpan): s
 /**
  * 按标识符边界替换名字，但**跳过字符串 / 模板串 / 注释**——模板串里的 `${g}%` 是代码，
  * 但反引号本身绝不能被当成标识符选中（否则会产出 `v2{g}%` 这种坏代码）。
- * 同一趟替换，不会链式改写。
+ * 同一趟替换，不会链式改写。成员访问的属性名（`.c`、`.jsx`）不可压缩，不参与改名（见 codeTokens）。
  */
 function renderIdentifierMap(template: string, canonNames: string[], actualNames: string[]): string {
   const map = new Map<string, string>();
@@ -1403,7 +1425,7 @@ const CTX_SEGMENT_RE = /\/\*a2k-ctx:start\*\/[\s\S]*?\/\*a2k-ctx:end\*\//g;
 const CTX_SEGMENT_MAX = 12000;
 
 /**
- * A2kContextSelector：EffortSelector 右侧的「上下文」下拉。规范名 `b`（jsx 运行时）、`l0`（useSessionConfig）；函数名固定 a2kCtxSel。
+ * A2kContextSelector：EffortSelector 右侧（1.2 起 ModelSelector 触发器右侧）的「上下文」下拉。规范名 `b`（jsx 运行时）、`l0`（useSessionConfig）；函数名固定 a2kCtxSel。
  * 数据全部来自 Kiro 自己的 useSessionConfig：category==="model" 的 select 里当前选项的 description（CPS 私有微格式
  * `__A2K_MDL__|推理|图片|窗口|挡位表|末行`，第 5 位 = `候选,候选,…~来源~已知~解析值`）。不足 6 位（本扩展未运行 / 旧版 CPS /
  * Kiro 官方列表）→ 返回 null，聊天框与出厂一致。选中项变化 → `setter("a2k:ctx","<modelId>|<tokens>")`：webview 现成的
@@ -1430,6 +1452,7 @@ const CTX_SEL_CANON = ["b", "l0"];
  * EffortSelector 调用处（chat-input-bottom-row-left 里唯一一处 `<b>.jsx(<EffortSelector>,{disabled:<v>})`）：
  * 出厂 → 包一层 Fragment 同时渲染 A2kContextSelector。规范名 `b`（jsx 运行时）、`a0e`（EffortSelector，1.0.437 压缩名；
  * 1.0.411 为 e0e）、`M`（disabled 变量）。React Compiler 的 memo 槽只缓存这个元素，子组件仍按自己的 hook 状态重渲染。
+ * 1.2 起 EffortSelector 被删，`a0e` 位置换成 ModelSelector（同一调用形状，见 CTX_MODEL_SELECTOR_TAG_RE），模板与还原正则照用。
  */
 const CTX_CALL_ORIG_TEMPLATE = "b.jsx(a0e,{disabled:M})";
 const CTX_CALL_PATCHED_TEMPLATE = "b.jsxs(b.Fragment,{children:[b.jsx(a0e,{disabled:M}),b.jsx(a2kCtxSel,{disabled:M})]})";
@@ -1439,6 +1462,13 @@ const CTX_CALL_RESTORE_RE =
   /(?<![\w$])([A-Za-z_$][\w$]*)\.jsxs\(\1\.Fragment,\{children:\[(\1\.jsx\([A-Za-z_$][\w$]*,\{disabled:([A-Za-z_$][\w$]*)\}\)),\1\.jsx\(a2kCtxSel,\{disabled:\3\}\)\]\}\)/g;
 /** `<tagger>(<fn>,"EffortSelector");`——Kiro 给组件打的 displayName 标签，全文恰好一处。函数插在标签之后。 */
 const CTX_EFFORT_TAG_RE = /(?<![\w$])([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),"EffortSelector"\);/g;
+/**
+ * 1.2 起的回退锚点（4.13.64）：Kiro 1.2.56 删掉了 EffortSelector 组件（Effort 挪进模型面板），
+ * 「上下文」下拉改挂在 ModelSelector 触发器右边。调用处形状不变：`<jsx>.jsx(<ModelSelector>,{disabled:<v>})`，
+ * 在 chat-input-bottom-row-left 里全文唯一（实测 agent-chat `b.jsx(rve,{disabled:ue})`、session-details `x.jsx(jje,{disabled:de})`）。
+ * 只在 EffortSelector 标签 0 命中时启用，1.1.x 行为逐字不变。
+ */
+const CTX_MODEL_SELECTOR_TAG_RE = /(?<![\w$])([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),"ModelSelector"\);/g;
 
 /**
  * 宿主 `setSessionConfigOption` 入口（1.0.437 压缩名 zas；1.0.411 为 fas）：`async function <fn>(<sessionId>,<configId>,<value>){`
@@ -1456,9 +1486,14 @@ type EffortSelectorHit = { fn: string; tagger: string; tagEnd: number };
 type EffortCallHit = { start: number; end: number; text: string; jsx: string; disabled: string };
 type HostFnHit = { fn: string; params: [string, string, string]; bodyStart: number };
 
-/** EffortSelector 组件名 + 标签结束位置；标签必须全文恰好一处。 */
+/**
+ * 「上下文」下拉的挂载组件名 + 标签结束位置；标签必须全文恰好一处。
+ * 先找 EffortSelector（1.0.x / 1.1.x）；**只有它 0 命中时**才回退到 ModelSelector（1.2 起，见 CTX_MODEL_SELECTOR_TAG_RE）。
+ * EffortSelector 多命中仍返回 null（有歧义，宁可不打），不回退。
+ */
 function findEffortSelector(content: string): EffortSelectorHit | null {
-  const hits = [...content.matchAll(CTX_EFFORT_TAG_RE)];
+  let hits = [...content.matchAll(CTX_EFFORT_TAG_RE)];
+  if (hits.length === 0) hits = [...content.matchAll(CTX_MODEL_SELECTOR_TAG_RE)];
   if (hits.length !== 1) return null;
   const m = hits[0];
   return { fn: m[2], tagger: m[1], tagEnd: (m.index as number) + m[0].length };
@@ -1550,6 +1585,101 @@ function applyCtxHostHook(content: string): string {
 function ctxStatus(enabled: boolean, before: boolean, after: boolean): TargetStatus {
   if (enabled) return after ? (before ? "unchanged" : "applied") : "unavailable";
   return before ? "removed" : "unchanged";
+}
+
+// ============================================================================
+// 1.2 代模型面板（4.13.64，v2）：Kiro 1.2.56 把模型选择器整个重写成 ModelPanel / ModelOptionRow / useModelSelector
+// （带搜索框、勾选列、Effort 滑条），1.1 代的选项行 / 菜单 / ref 三个锚点全部消失。v2 不改 React Compiler 的记忆化
+// 组件体，只改它的 props：行组件函数头后插 `<p>=a2kRowFix(<p>);`（唯一的 hook `ne.c(47)` 调用次序不变），
+// `a2kRowFix` 定义插在 `<h>(<Row>,"ModelOptionRow");` 之后，useModelSelector 的 writeModel 入口加一条守卫，
+// 让分组标题（modelId 以 `a2k-group:` 开头，= src/modelStore.ts 的 GROUP_HEADER_PREFIX）选不中。
+// 三处都是纯插入，用 /*a2k-row:start*/…/*a2k-row:end*/ 定界，还原 = 删段；三处全中才写（全有或全无）。
+// 只认 displayName 标签、函数头、jsx 运行时名与唯一字面量 `},"writeModel")`，不依赖任何局部压缩名。
+// ============================================================================
+
+const ROW_START = "/*a2k-row:start*/";
+const ROW_END = "/*a2k-row:end*/";
+/** 注入到 mermaid 的 props 改写函数名——出厂 bundle 里绝不出现，同时也是「补丁已在位」的判定标记。 */
+const ROW_FIX_FN = "a2kRowFix";
+const ROW_SEGMENT_RE = /\/\*a2k-row:start\*\/[\s\S]*?\/\*a2k-row:end\*\//g;
+const ROW_SEGMENT_MAX = 12000;
+/** `<tagger>(<Row>,"ModelOptionRow");`——行组件的 displayName 标签，全文恰好一处。 */
+const ROW_TAG_RE = /(?<![\w$.])([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),"ModelOptionRow"\);/g;
+/** useModelSelector 里 writeModel 回调的尾巴（displayName 字面量），全文恰好一处。 */
+const WRITE_MODEL_TAG = '},"writeModel")';
+/** 函数头 → 标签的最大距离（1.2.56 实测约 2.3 KB）。 */
+const ROW_FN_MAX_SPAN = 20000;
+/** writeModel 回调头的回看窗口（实测 `a(At=>{At!==R&&(…)},"writeModel")` 约 120 字符）。 */
+const WRITE_MODEL_WINDOW = 400;
+const ROW_FIX_CANON = ["b"];
+/**
+ * 行 props 改写（规范名 `b` = jsx 运行时）。只认 description 以 `__A2K_` 开头的行，其余原样返回同一对象：
+ * - `__A2K_GRP__|名称|数量|字母|图标id|图标base64`：itemProps 换成不可交互（aria-disabled、阻断点击），
+ *   description 换成卡片头节点（沿用 1.1 的 .a2k-card-head / .a2k-logo / .a2k-title / .a2k-count / .a2k-chev 样式）；
+ * - `__A2K_MDL__|推理|图片|…`：description 换成能力徽章节点，没有徽章就是 void 0（不再显示微格式）。
+ * 自有标识符全部带 `a2k` 前缀（namesCollide 判据，见 CTX_SEL_FN_TEMPLATE 的说明）。
+ * **不许出现正则字面量**：codeTokens 不识别正则，里面的引号会打乱分词；HTML 转义用 split/join。
+ */
+const ROW_FIX_TEMPLATE = `function a2kRowFix(a2kP){try{const a2kItem=a2kP&&a2kP.item,a2kOpt=a2kItem&&a2kItem.option,a2kD=a2kOpt&&a2kOpt.description;if(typeof a2kD!=="string"||!a2kD.startsWith("__A2K_"))return a2kP;const a2kEsc=a2kS=>String(a2kS==null?"":a2kS).split("&").join("&amp;").split("<").join("&lt;").split(">").join("&gt;").split('"').join("&quot;");const a2kParts=a2kD.split("|");if(a2kParts[0]==="__A2K_GRP__"){let a2kLogo="";try{if(a2kParts[5])a2kLogo='<span class="a2k-logo">'+atob(a2kParts[5])+"</span>"}catch(a2kE){}if(!a2kLogo)a2kLogo=a2kParts[4]==="openai"?'<span class="a2k-logo">${SVG_OPENAI}</span>':'<span class="a2k-logo">'+a2kEsc(a2kParts[3]||"P")+"</span>";return{...a2kP,isSelected:!1,isActive:!1,itemProps:{"aria-disabled":"true","data-a2k-grp":"1",onClick:a2kEv=>{a2kEv&&a2kEv.preventDefault&&a2kEv.preventDefault();a2kEv&&a2kEv.stopPropagation&&a2kEv.stopPropagation()}},item:{...a2kItem,option:{...a2kOpt,description:b.jsx("span",{className:"a2k-card-head",dangerouslySetInnerHTML:{__html:'<span class="a2k-chev">▼</span>'+a2kLogo+'<span class="a2k-title">'+a2kEsc(a2kParts[1])+'</span><span class="a2k-count">'+a2kEsc(a2kParts[2])+" ↑</span>"}})}}}}if(a2kParts[0]==="__A2K_MDL__"){const a2kCaps=(a2kParts[1]==="1"?'<span class="a2k-cap a2k-cap-reason" title="推理">${SVG_BRAIN}</span>':"")+(a2kParts[2]==="1"?'<span class="a2k-cap a2k-cap-vision" title="图片">${SVG_IMAGE}</span>':"");return{...a2kP,item:{...a2kItem,option:{...a2kOpt,description:a2kCaps?b.jsx("span",{className:"a2k-caps-box",dangerouslySetInnerHTML:{__html:a2kCaps}}):void 0}}}}return a2kP}catch(a2kErr){return a2kP}}`;
+/** writeModel 守卫：分组标题的 modelId 前缀（与 src/modelStore.ts 的 GROUP_HEADER_PREFIX 一致；不 import，本模块只依赖 fs/path/vscode/log）。 */
+const ROW_GUARD_PREFIX = "a2k-group:";
+
+type ModelPanelRowHit = { fn: string; param: string; jsx: string; bodyStart: number; tagEnd: number; guardAt: number; guardParam: string };
+
+/** 1.2 代模型面板的三处插入点；任一条件不满足返回 null。 */
+function findModelPanelRow(content: string): ModelPanelRowHit | null {
+  const tags = [...content.matchAll(ROW_TAG_RE)];
+  if (tags.length !== 1) return null;
+  const fn = tags[0][2];
+  const tagAt = tags[0].index as number;
+  const tagEnd = tagAt + tags[0][0].length;
+  const heads = [...content.matchAll(new RegExp(`(?<![\\w$.])function ${escapeRe(fn)}\\((${IDENT_SRC})\\)\\{`, "g"))];
+  if (heads.length !== 1) return null;
+  const headAt = heads[0].index as number;
+  if (headAt >= tagAt || tagAt - headAt > ROW_FN_MAX_SPAN) return null;
+  const param = heads[0][1];
+  const bodyStart = headAt + heads[0][0].length;
+  const body = content.slice(bodyStart, tagAt);
+  if (!body.includes('className:"chat-input-popup-option')) return null;
+  const receivers = new Set([...body.matchAll(new RegExp(`(?<![\\w$.])(${IDENT_SRC})\\.jsxs?\\(`, "g"))].map((m) => m[1]));
+  if (receivers.size !== 1) return null;
+  const jsx = [...receivers][0];
+  const w = content.indexOf(WRITE_MODEL_TAG);
+  if (w < 0 || content.indexOf(WRITE_MODEL_TAG, w + 1) >= 0) return null;
+  const winStart = Math.max(0, w - WRITE_MODEL_WINDOW);
+  const guards = [...content.slice(winStart, w).matchAll(new RegExp(`(?<![\\w$.])${IDENT_SRC}\\((${IDENT_SRC})=>\\{`, "g"))];
+  if (guards.length === 0) return null;
+  const g = guards[guards.length - 1];
+  const guardParam = g[1];
+  const guardAt = winStart + (g.index as number) + g[0].length;
+  if (!content.startsWith(`${guardParam}!==`, guardAt)) return null;
+  return { fn, param, jsx, bodyStart, tagEnd, guardAt, guardParam };
+}
+
+/** writeModel 守卫段（逐字，由 applyModelPanelRow 写入；P22 用它断言）。 */
+function modelPanelGuardText(g: string): string {
+  return `${ROW_START}if(typeof ${g}==="string"&&${g}.startsWith("${ROW_GUARD_PREFIX}"))return;${ROW_END}`;
+}
+
+/** 在出厂内容上打 v2 三处；三处全中且无撞名才写，否则 null。 */
+function applyModelPanelRow(content: string): string | null {
+  const hit = findModelPanelRow(content);
+  if (!hit) return null;
+  if (namesCollide(ROW_FIX_TEMPLATE, ROW_FIX_CANON, [hit.jsx])) return null;
+  const spans = [
+    { at: hit.tagEnd, text: ROW_START + renderTemplate(ROW_FIX_TEMPLATE, ROW_FIX_CANON, [hit.jsx]) + ROW_END },
+    { at: hit.bodyStart, text: `${ROW_START}${hit.param}=${ROW_FIX_FN}(${hit.param});${ROW_END}` },
+    { at: hit.guardAt, text: modelPanelGuardText(hit.guardParam) },
+  ].sort((x, y) => y.at - x.at);
+  let out = content;
+  for (const s of spans) out = out.slice(0, s.at) + s.text + out.slice(s.at);
+  return out;
+}
+
+/** 删掉所有 v2 定界段（任何版本打的都一样），超长段视为误命中不动。 */
+function restoreModelPanelRow(content: string): string {
+  if (!content.includes(ROW_START)) return content;
+  return content.replace(ROW_SEGMENT_RE, (m) => (m.length <= ROW_SEGMENT_MAX ? "" : m));
 }
 
 /** 选项行补丁各历史变体共有的尾巴：ORIG_JS_PATTERN 里 children: 之后原样保留的兜底分支。 */
@@ -1708,6 +1838,8 @@ function restoreSelectorScript(content: string): string {
   out = out.replace(/,a2kUsage:(?:typeof [A-Za-z_$][\w$]*==="undefined"\?void 0:)?[A-Za-z_$][\w$]*\}\)/g, "})");
   // 7. 聊天框「上下文」下拉（4.13.55）：删定界函数段 + 调用处拆包
   out = restoreCtxSelector(out);
+  // 8. 1.2 代模型面板（4.13.64）：删 a2k-row 定界段（函数头 / 标签后 / writeModel 三处）
+  out = restoreModelPanelRow(out);
   return out;
 }
 
@@ -1766,27 +1898,40 @@ function applyPopover(content: string): string | null {
  *
  * 4.13.59 起三处选择器靶点改用结构匹配（见 scanMasked）：Kiro 重新压缩 webview bundle
  * 只会改标识符，规范模板除压缩名外逐字不变，因此不再依赖 1.0.411 / 1.0.437 的压缩名。
+ * 4.13.64 起选择器分两代：1.1 代（applyOptionRowV1）不中时试 1.2 代模型面板（applyModelPanelRow），
+ * 两代都不中才整个文件一字不写。
  */
 function applySelectorScript(content: string): string {
+  // 两代模型选择器（4.13.64）：先试 1.1 代（选项行 / 菜单 / ref），不中再试 1.2 代模型面板（v2）。
+  // 两代锚点不会同时出现：1.1.x 上 v1 命中、行为与以前逐字一样；1.2.56 上 v1 0 命中。
+  const rows = applyOptionRowV1(content) ?? applyModelPanelRow(content);
+  if (rows === null) return content;
+  const out = applyPopover(rows) ?? rows;
+  // 可选组（4.13.55）：聊天框「上下文」下拉——锚点不命中就不打，不影响上面几处
+  return applyCtxSelector(out) ?? out;
+}
+
+/** 1.1 代选项行 / 菜单容器 / 选中项居中三处（全有或全无）；任一不命中返回 null。 */
+function applyOptionRowV1(content: string): string | null {
   // 选项行：结构匹配 → 用真机压缩名渲染补丁
   const jsSpan = matchMasked(content, ORIG_JS_PATTERN);
-  if (!jsSpan) return content;
+  if (!jsSpan) return null;
   const patchedJs = renderMatched(PATCHED_JS_CODE, ORIG_JS_PATTERN, jsSpan);
-  if (!patchedJs) return content;
+  if (!patchedJs) return null;
   // 菜单容器
   const menuSpan = matchMasked(content, ORIG_MENU_PATTERN);
-  if (!menuSpan) return content;
+  if (!menuSpan) return null;
   const patchedMenu = renderMatched(PATCHED_MENU_CODE, ORIG_MENU_PATTERN, menuSpan);
-  if (!patchedMenu) return content;
+  if (!patchedMenu) return null;
   // 选中项居中滚动 ref：该写法是通用形态（bundle 里出现多处的
   // `ref:a(X=>{arr.current[i]=X},"ref")`），必须限定作用域。实测 1.1.14 里目标 ref
   // 紧挨在 `className:"chat-input-popup-option"` 之前约 40 字符，这里留 2000 字符窗口，
   // 并要求窗口内唯一命中，避免撞上上下文拾取器 / 智能体列表的同形 ref。
   const refWindowStart = Math.max(0, jsSpan.start - REF_SCOPE_CHARS);
   const refSpan = matchMasked(content.slice(refWindowStart, jsSpan.start), ORIG_REF_PATTERN);
-  if (!refSpan) return content;
+  if (!refSpan) return null;
   const patchedRef = renderMatched(PATCHED_REF_CODE, ORIG_REF_PATTERN, refSpan);
-  if (!patchedRef) return content;
+  if (!patchedRef) return null;
 
   // 三处互不重叠；从后往前拼，前一段的偏移不受影响
   const spans = [
@@ -1796,9 +1941,7 @@ function applySelectorScript(content: string): string {
   ].sort((a, b) => b.start - a.start);
   let out = content;
   for (const s of spans) out = out.slice(0, s.start) + s.text + out.slice(s.end);
-  out = applyPopover(out) ?? out;
-  // 可选组（4.13.55）：聊天框「上下文」下拉——锚点不命中就不打，不影响上面几处
-  return applyCtxSelector(out) ?? out;
+  return out;
 }
 
 /**
@@ -1816,7 +1959,7 @@ function applySelectorScript(content: string): string {
  * 只认「类名 / 注入函数名」这类**字符串字面量**：压缩器一个字符都不动字面量，
  * 出厂文件也绝不含 `a2k-`（见 stripBlock 的注释）。
  */
-const SELECTOR_PATCH_MARKS = ["a2k-model-name-box", "a2k-card-head", "a2k-exclusive-model-option"];
+const SELECTOR_PATCH_MARKS = ["a2k-model-name-box", "a2k-card-head", "a2k-exclusive-model-option", ROW_FIX_FN];
 
 /**
  * mermaid-*.js 的写入计划（只读盘、不写）。
@@ -1868,7 +2011,7 @@ async function planModelSelectorScript(enabled: boolean, pkgs: SelectorPackage[]
       detail:
         landed.length > 0
           ? `model selector patch landed in ${landed.join(", ")} but not in ${missed.join(", ")} — that view's factory structure differs in this Kiro build (not just minified names), so it keeps showing the raw model-list microformat`
-          : `model selector targets not found in ${missed.length ? missed.join(", ") : "any carrier package"} — this Kiro build changed the factory structure (not just minified names)`,
+          : `model selector targets not found in ${missed.length ? missed.join(", ") : "any carrier package"} — 选项行（1.1 形态）与模型面板行（1.2 形态 ModelOptionRow）均未命中; this Kiro build changed the factory structure (not just minified names)`,
     };
   }
   if (files.length > 0) return { ...base, status: enabled ? "applied" : "removed" };
@@ -2101,7 +2244,7 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
     // （不是「重新压缩」）。同时别再让用户去查目录权限：写失败会带 detail 走上一分支。
     status = "unavailable";
     detail =
-      "model selector targets not found in mermaid-*.js; this Kiro build changed the factory structure (not just minified names), so the patch was skipped and no style was applied";
+      "model selector targets not found in mermaid-*.js (选项行（1.1 形态）与模型面板行（1.2 形态 ModelOptionRow）均未命中); this Kiro build changed the factory structure (not just minified names), so the patch was skipped and no style was applied";
   } else if (Object.values(targets).some((s) => s === "applied")) {
     status = "applied";
   } else if (Object.values(targets).some((s) => s === "removed")) {
@@ -2162,10 +2305,20 @@ export const __selectorStyleInternals = {
     CTX_SEGMENT_RE,
     CTX_CALL_RESTORE_RE,
     CTX_EFFORT_TAG_RE,
+    CTX_MODEL_SELECTOR_TAG_RE,
     CTX_HOST_LITERAL,
     CTX_SEL_CANON,
     CTX_CALL_CANON,
     CTX_HOST_CANON,
+    /** 4.13.64 1.2 代模型面板（v2） */
+    findModelPanelRow,
+    applyModelPanelRow,
+    restoreModelPanelRow,
+    modelPanelGuardText,
+    ROW_START,
+    ROW_END,
+    ROW_FIX_FN,
+    ROW_SEGMENT_RE,
   },
   patterns: {
     ORIG_JS_PATTERN,
@@ -2187,6 +2340,7 @@ export const __selectorStyleInternals = {
     CTX_CALL_ORIG_TEMPLATE,
     CTX_CALL_PATCHED_TEMPLATE,
     CTX_HOST_HOOK_TEMPLATE,
+    ROW_FIX_TEMPLATE,
   },
   legacy: LEGACY_POPOVER_VARIANTS,
   legacySelector: LEGACY_SELECTOR_VARIANTS,

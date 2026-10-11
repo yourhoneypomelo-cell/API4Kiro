@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 /**
- * API4Kiro 选择器补丁：结构锚定验证脚本（4.13.59）
+ * API4Kiro 选择器补丁：结构锚定验证脚本（4.13.59 起；4.13.64 起覆盖两代模型选择器）
  *
  * 背景：Kiro 1.1.14 把 webview bundle 整体重新压缩，1.0.411 / 1.0.437 压缩名写死的锚点全数失配，
  * 选择器补丁静默不生效（控制面板报 "model selector target not found in mermaid-*.js"）。
  * 修复方式：靶点定位改成「非标识符逐字 + 标识符各自通配」的结构匹配（见 src/selectorStyle.ts）。
+ * Kiro 1.2.56 又把模型选择器整个重写成模型面板（ModelPanel / ModelOptionRow）：脚本按代判定，
+ * 1.1.x（v1：选项行 / 菜单 / ref）与 1.2.x（v2：模型面板行 + writeModel 守卫）各跑各的断言；
+ * P23 用合成的 1.1.x 夹具守住 v1 全链路（本机没有 1.1.x 安装时也能跑）。
  *
- * 本脚本把编译产物跑在**真机 Kiro 1.1.14 的只读副本**上，验证：
+ * 本脚本把编译产物跑在**真机 Kiro 的只读副本**上，验证：
  *   P1 跨压缩名等价   P2 唯一命中   P3 映射守卫   P4 不误伤
  *   P5 幂等           P6 往返复原   P7 历史变体   P8/P9/P10 端到端
  *
@@ -119,29 +122,37 @@ function main() {
   const mermaidFile = chatPkg.chunk;
   const factoryMermaid = chatPkg.factoryChunk;
   const factoryStyle = chatPkg.factoryStyle;
+  /** 模型选择器的代：v1 = 1.1 代选项行 / 菜单 / ref；v2 = 1.2 代模型面板（ModelOptionRow）。 */
+  const gen = (t) => (M.matchMasked(t, P.ORIG_JS_PATTERN) ? "v1" : M.findModelPanelRow(t) ? "v2" : "none");
+  /** 选择器补丁已在位（任一代）。 */
+  const isPatched = (t) => t.includes("a2k-model-name-box") || t.includes(M.ROW_FIX_FN);
+  for (const pk of fx.packages) console.log(`      · ${pk.pkg} 模型选择器代：${gen(pk.factoryChunk)}`);
 
-  section("P1 跨压缩名等价：六处靶点全部结构命中（真机 1.1.14 factory 文本）");
+  section("P1 跨压缩名等价：靶点全部结构命中（真机 factory 文本）");
   check("fixture 已归一为未打补丁的 factory 文本", !factoryMermaid.includes("a2k-"), "restore 后 mermaid 仍含 a2k-");
-  const pairs = [
-    ["选项行", P.ORIG_JS_PATTERN],
-    ["菜单容器", P.ORIG_MENU_PATTERN],
-    ["弹层调用处", P.ORIG_POPOVER_CALL_PATTERN],
-  ];
+  const pairs = [["弹层调用处", P.ORIG_POPOVER_CALL_PATTERN]];
+  if (gen(factoryMermaid) === "v1") pairs.unshift(["选项行", P.ORIG_JS_PATTERN], ["菜单容器", P.ORIG_MENU_PATTERN]);
+  else check("v2 模型面板行三处插入点命中", !!M.findModelPanelRow(factoryMermaid), "findModelPanelRow 返回 null");
   for (const [label, canon] of pairs) {
     const hits = M.scanMasked(factoryMermaid, canon);
     check(`${label} 结构命中 1 次`, hits.length === 1, `实际 ${hits.length} 次`);
   }
   const fac = M.findPopoverFactory(factoryMermaid);
-  check("弹层函数命中且读出真机名", !!fac && fac.names.fn === "n2e" && fac.names.warn === "t2e", fac ? JSON.stringify(fac.names) : "null");
+  check("弹层函数命中", !!fac, "null");
+  if (fac) console.log(`      · 弹层真机名：${JSON.stringify(fac.names)} tagger=${fac.tagger}`);
   const eff = M.findEffortSelector(factoryMermaid);
   const effCall = eff ? M.findEffortSelectorCall(factoryMermaid, eff.fn) : null;
-  check("EffortSelector 调用处命中", !!effCall, eff ? `fn=${eff.fn}` : "tag not found");
+  check("EffortSelector/ModelSelector 调用处命中", !!effCall, eff ? `fn=${eff.fn}` : "tag not found");
 
   section("P1b 每个承载模型选择器的 package 都必须能结构命中（它们各自独立压缩）");
   for (const pk of fx.packages) {
-    const cur = M.scanMasked(pk.factoryChunk, P.ORIG_JS_PATTERN);
-    check(`${pk.pkg} 选项行结构命中 1 次`, cur.length === 1, `实际 ${cur.length} 次`);
-    check(`${pk.pkg} 菜单容器命中`, !!M.matchMasked(pk.factoryChunk, P.ORIG_MENU_PATTERN), "null");
+    if (gen(pk.factoryChunk) === "v1") {
+      const cur = M.scanMasked(pk.factoryChunk, P.ORIG_JS_PATTERN);
+      check(`${pk.pkg} 选项行结构命中 1 次`, cur.length === 1, `实际 ${cur.length} 次`);
+      check(`${pk.pkg} 菜单容器命中`, !!M.matchMasked(pk.factoryChunk, P.ORIG_MENU_PATTERN), "null");
+    } else {
+      check(`${pk.pkg} 模型面板行（v2）命中`, !!M.findModelPanelRow(pk.factoryChunk), "两代锚点都不中");
+    }
   }
   // 选项行 + 菜单容器是「模型列表不再直接显示 __A2K_ 微格式」的充分条件，每个 package 都必须命中（上面）。
   // 弹层是可选组，按「宁可不打」处理结构差异：session-details 这一版把它重构成了
@@ -186,6 +197,10 @@ function main() {
       I.patterns.CTX_SEL_FN_TEMPLATE,
       I.patterns.CTX_CALL_PATCHED_TEMPLATE,
       I.patterns.CTX_HOST_HOOK_TEMPLATE,
+      I.patterns.ROW_FIX_TEMPLATE,
+      M.ROW_START,
+      M.ROW_END,
+      M.modelPanelGuardText("g"),
       "/*a2k-orig:*/",
     ].join("\n");
     const known = new Set([...consts.matchAll(/a2k-[A-Za-z0-9_-]+/g)].map((m) => m[0]));
@@ -195,7 +210,7 @@ function main() {
 
     section("P13 多 package：每一份 chunk 与它自己那份 style.css 都要覆盖到");
     for (const pk of fx.packages) {
-      check(`P13 ${pk.pkg} chunk 已打补丁`, read(pk.chunk).includes("a2k-model-name-box"), "仍是工厂态（该视图会直接显示 __A2K_ 微格式）");
+      check(`P13 ${pk.pkg} chunk 已打补丁`, isPatched(read(pk.chunk)), "仍是工厂态（该视图会直接显示 __A2K_ 微格式）");
       check(`P13 ${pk.pkg} style.css 上了 CARD_CSS`, read(pk.style).includes("a2k-model-row"), "该 package 的 style.css 没有 a2k CSS");
       // 拼接式注入（函数插在标签后、调用处替换、弹层整函数替换）出错时整个 webview 会加载失败，
       // 而上面两条 `includes` 断言照样 PASS。用 node --check 解析一次打补丁后的 chunk。
@@ -222,12 +237,16 @@ function main() {
       check("P14 单参调用不得导致整条改名被拒", !!span && M.renderMatched(template, canonical, span) !== null, "守卫仍把 (X) 误判成参数声明");
     }
     for (const pk of fx.packages) {
-      const span = M.matchMasked(pk.factoryChunk, P.ORIG_JS_PATTERN);
-      check(
-        `P14 ${pk.pkg} 选项行补丁可渲染`,
-        !!span && M.renderMatched(P.PATCHED_JS_CODE, P.ORIG_JS_PATTERN, span) !== null,
-        "该视图会直接显示 __A2K_ 微格式"
-      );
+      if (gen(pk.factoryChunk) === "v1") {
+        const span = M.matchMasked(pk.factoryChunk, P.ORIG_JS_PATTERN);
+        check(
+          `P14 ${pk.pkg} 选项行补丁可渲染`,
+          !!span && M.renderMatched(P.PATCHED_JS_CODE, P.ORIG_JS_PATTERN, span) !== null,
+          "该视图会直接显示 __A2K_ 微格式"
+        );
+      } else {
+        check(`P14 ${pk.pkg} 模型面板行补丁（v2）可渲染`, M.applyModelPanelRow(pk.factoryChunk) !== null, "该视图会直接显示 __A2K_ 微格式");
+      }
     }
 
     section("P15 每个承载模型选择器的 package 都必须能注入聊天框「上下文」下拉，且注入段能真的渲染");
@@ -385,7 +404,7 @@ function main() {
         factoryMermaid.slice(fac.end);
       const renamedOut = M.applySelectorScript(jsxRenamed);
       check("P16 工厂命中但 jsx≠b ⇒ 弹层跳过（不得写出 b.jsx 悬空引用）", !renamedOut.includes("a2k-cu-head"));
-      check("P16 弹层跳过不影响三处选择器补丁", renamedOut.includes("a2k-model-name-box"));
+      check("P16 弹层跳过不影响三处选择器补丁", isPatched(renamedOut));
     }
 
     section("P17 名字判定守卫的边界：字面量不算撞名、标签反查必须唯一且非成员调用");
@@ -438,7 +457,7 @@ function main() {
         for (const { pk, target } of renamed) {
           check(
             `P18 ${pk.pkg} 改名后的 chunk 仍带补丁`,
-            read(target).includes("a2k-model-name-box"),
+            isPatched(read(target)),
             "回退分支漏掉了整个视图（会显示 __A2K_ 微格式、也没有 Ctx 下拉）"
           );
         }
@@ -508,15 +527,18 @@ function main() {
       {
         const missedPkg = fx.packages[fx.packages.length - 1];
         const keptPkg = fx.packages[0];
-        const broken = missedPkg.factoryChunk.replace('className:"chat-input-popup-option"', 'className:"chat-input-popup-optionX"');
-        check("P20 前置：破坏靶点后确实打不上", !M.applySelectorScript(broken).includes("a2k-model-name-box"));
+        const broken =
+          gen(missedPkg.factoryChunk) === "v1"
+            ? missedPkg.factoryChunk.replace('className:"chat-input-popup-option"', 'className:"chat-input-popup-optionX"')
+            : missedPkg.factoryChunk.replace('"ModelOptionRow"', '"ModelOptionRowX"');
+        check("P20 前置：破坏靶点后确实打不上", !isPatched(M.applySelectorScript(broken)));
         fs.writeFileSync(missedPkg.chunk, broken, "utf8");
         try {
           const st = await S.syncGroupHeaderStyle(true);
           check("P20 chunk 级半套：状态不得是 applied", st.status !== "applied", JSON.stringify({ status: st.status, detail: st.detail }));
           check("P20 chunk 级半套：detail 点名漏掉的那份", !!st.detail && st.detail.includes(missedPkg.pkg), String(st.detail));
           check("P20 chunk 级半套：detail 点名落地的那份", !!st.detail && st.detail.includes(keptPkg.pkg), String(st.detail));
-          check("P20 落地那份仍带补丁", read(keptPkg.chunk).includes("a2k-model-name-box"));
+          check("P20 落地那份仍带补丁", isPatched(read(keptPkg.chunk)));
           check("P20 落地那份保留 CARD_CSS", read(keptPkg.style).includes("a2k-model-row"));
           check("P20 漏掉那份不落 CARD_CSS（不留半套外观）", !read(missedPkg.style).includes("a2k-model-row"));
         } finally {
@@ -528,13 +550,15 @@ function main() {
       // A（可选组级）：一个 package 拿不到 Ctx 注入 ⇒ extras 不得报 applied（本次事故正是这形态被报成成功）
       {
         const missedPkg = fx.packages[fx.packages.length - 1];
-        const broken = missedPkg.factoryChunk.replace('"EffortSelector"', '"EffortSelectorRenamed"');
+        const broken = missedPkg.factoryChunk
+          .replace('"EffortSelector"', '"EffortSelectorRenamed"')
+          .replace('"ModelSelector"', '"ModelSelectorRenamed"');
         check("P20 前置：改名后该 package 注入不了 Ctx", !M.applyCtxSelector(broken));
         fs.writeFileSync(missedPkg.chunk, broken, "utf8");
         try {
           const st = await S.syncGroupHeaderStyle(true);
           check("P20 Ctx 半套注入：extras.ctxSelector 不得报 applied", st.extras.ctxSelector !== "applied", JSON.stringify(st.extras));
-          check("P20 Ctx 半套注入：其余三处靶点仍算落地", read(fx.packages[0].chunk).includes("a2k-model-name-box"));
+          check("P20 Ctx 半套注入：其余三处靶点仍算落地", isPatched(read(fx.packages[0].chunk)));
         } finally {
           fs.writeFileSync(missedPkg.chunk, missedPkg.factoryChunk, "utf8");
           await S.syncGroupHeaderStyle(true);
@@ -549,11 +573,11 @@ function main() {
       const st = read(fx.style);
       const mm = read(mermaidFile);
       check("P11 前置：style.css 带 a2k CSS", st.includes("a2k-model-row"), "第一次开启后 CSS 就不在");
-      check("P11 前置：mermaid 带补丁", mm.includes("a2k-model-name-box"));
+      check("P11 前置：mermaid 带补丁", isPatched(mm));
       const second = await S.syncGroupHeaderStyle(true);
       check("P11 第二次开启不报 unavailable", second.targets.selectorScript !== "unavailable", JSON.stringify(second.targets));
       check("P11 第二次开启后 style.css 仍有 a2k CSS", read(fx.style).includes("a2k-model-row"), "CSS 被剥掉了（模型卡片失去样式）");
-      check("P11 第二次开启后 mermaid 仍有补丁", read(mermaidFile).includes("a2k-model-name-box"), "JS 补丁被抹掉了");
+      check("P11 第二次开启后 mermaid 仍有补丁", isPatched(read(mermaidFile)), "JS 补丁被抹掉了");
     }
 
     section("P9 关闭：还原到与 factory 逐字一致");
@@ -602,7 +626,13 @@ function main() {
       // 构造「出厂结构被改写、靶点确实不该打」的真机形态：先归一出厂，再改掉选项行的结构锚。
       // 每个 package 都要破坏——只要还有一份带补丁，patchedPresent 就为真，整体会被判成 unchanged。
       for (const pk of fx.packages) {
-        const broken = I.matchers.restoreSelectorScript(read(pk.chunk)).split('"chat-input-popup-option"').join('"chat-input-popup-option-broken"');
+        // 两代锚点都要破坏：v1 认 "chat-input-popup-option" 选项行，v2 认 "ModelOptionRow" 标签
+        const broken = I.matchers
+          .restoreSelectorScript(read(pk.chunk))
+          .split('"chat-input-popup-option"')
+          .join('"chat-input-popup-option-broken"')
+          .split('"ModelOptionRow"')
+          .join('"ModelOptionRow-broken"');
         fs.writeFileSync(pk.chunk, broken, "utf8");
       }
       globalThis.__a2kInfo = [];
@@ -616,6 +646,107 @@ function main() {
       // 复原现场
       for (const pk of fx.packages) fs.writeFileSync(pk.chunk, pk.factoryChunk, "utf8");
       await S.syncGroupHeaderStyle(false);
+    }
+
+    section("P21 v2 行 props 改写（a2kRowFix）：普通行原样、分组标题不可交互且转义、徽章节点正确");
+    {
+      const jsxStub = { jsx: (type, props, key) => ({ type, props: props || {}, key }), Fragment: Symbol("Fragment") };
+      jsxStub.jsxs = jsxStub.jsx;
+      const v2Pkgs = fx.packages.filter((pk) => gen(pk.factoryChunk) === "v2");
+      if (v2Pkgs.length === 0) console.log("      · 本 fixture 没有 v2 package，跳过");
+      for (const pk of v2Pkgs) {
+        const hit = M.findModelPanelRow(pk.factoryChunk);
+        const applied = M.applyModelPanelRow(pk.factoryChunk);
+        const head = M.ROW_START + "function a2kRowFix(";
+        const at = applied ? applied.indexOf(head) : -1;
+        const end = at >= 0 ? applied.indexOf(M.ROW_END, at) : -1;
+        check(`P21 ${pk.pkg} 定界段可取`, at >= 0 && end > at);
+        if (!(at >= 0 && end > at)) continue;
+        const seg = applied.slice(at + M.ROW_START.length, end);
+        const fix = new Function(hit.jsx, `${seg}\nreturn a2kRowFix;`)(jsxStub);
+        const mk = (description) => ({ item: { option: { value: "m", name: "m", ...(description === undefined ? {} : { description }) }, matches: [] }, rowId: "r", isSelected: true, isActive: true, itemProps: { onClick() {} } });
+        const plainEmpty = mk("");
+        const plainNone = mk(undefined);
+        const plainText = mk("Kiro official model");
+        check(`P21 ${pk.pkg} 普通行（description 空串）原样返回同一对象`, fix(plainEmpty) === plainEmpty);
+        check(`P21 ${pk.pkg} 普通行（无 description）原样返回同一对象`, fix(plainNone) === plainNone);
+        check(`P21 ${pk.pkg} 普通行（官方描述）原样返回同一对象`, fix(plainText) === plainText);
+        const grp = fix(mk("__A2K_GRP__|<img onerror=x>|3|O|openai|"));
+        check(`P21 ${pk.pkg} 分组标题 aria-disabled`, grp.itemProps && grp.itemProps["aria-disabled"] === "true", JSON.stringify(grp.itemProps));
+        check(`P21 ${pk.pkg} 分组标题 data-a2k-grp`, grp.itemProps && grp.itemProps["data-a2k-grp"] === "1");
+        check(`P21 ${pk.pkg} 分组标题不显示选中 / 高亮`, grp.isSelected === false && grp.isActive === false);
+        const grpNode = grp.item.option.description;
+        check(`P21 ${pk.pkg} 分组标题 description 是 a2k-card-head 节点`, !!grpNode && grpNode.props.className === "a2k-card-head");
+        const html = grpNode && grpNode.props.dangerouslySetInnerHTML ? grpNode.props.dangerouslySetInnerHTML.__html : "";
+        check(`P21 ${pk.pkg} 分组名 HTML 已转义`, html.includes("&lt;img") && !html.includes("<img onerror"), html.slice(0, 200));
+        check(`P21 ${pk.pkg} openai 图标走内置 SVG`, html.includes('<span class="a2k-logo"><svg'));
+        const calls = [];
+        grp.itemProps.onClick({ preventDefault: () => calls.push("pd"), stopPropagation: () => calls.push("sp") });
+        check(`P21 ${pk.pkg} 分组标题点击被阻断`, calls.includes("pd") && calls.includes("sp"), JSON.stringify(calls));
+        const mdl = fix(mk("__A2K_MDL__|1|0|272000|32768~codex~1~272000~codex|0"));
+        const mdlNode = mdl.item.option.description;
+        check(`P21 ${pk.pkg} 推理模型 description 是 a2k-caps-box 节点`, !!mdlNode && mdlNode.props.className === "a2k-caps-box");
+        const capsHtml = mdlNode ? mdlNode.props.dangerouslySetInnerHTML.__html : "";
+        check(`P21 ${pk.pkg} 徽章含推理、不含图片`, capsHtml.includes("a2k-cap-reason") && !capsHtml.includes("a2k-cap-vision"));
+        check(
+          `P21 ${pk.pkg} 模型行保留原 itemProps / 选中态（可选中）`,
+          typeof mdl.itemProps.onClick === "function" && mdl.itemProps["aria-disabled"] === undefined && mdl.isSelected === true
+        );
+        const bare = fix(mk("__A2K_MDL__|0|0|272000|32768~codex~1~272000~codex|0"));
+        check(`P21 ${pk.pkg} 无徽章模型 description 为 undefined（不显示微格式）`, bare.item.option.description === undefined);
+      }
+    }
+
+    section("P22 v2 writeModel 守卫：分组标题的 modelId 写不进会话");
+    {
+      for (const pk of fx.packages.filter((p) => gen(p.factoryChunk) === "v2")) {
+        const hit = M.findModelPanelRow(pk.factoryChunk);
+        const applied = M.applyModelPanelRow(pk.factoryChunk) || "";
+        const g = hit.guardParam;
+        const want = `${g}=>{${M.modelPanelGuardText(g)}${g}!==`;
+        const i = applied.indexOf(want);
+        const w = applied.indexOf('},"writeModel")');
+        check(`P22 ${pk.pkg} 守卫紧贴 writeModel 回调头（${g}）`, i >= 0 && w > i && w - i < 600, `i=${i} w=${w}`);
+        check(`P22 ${pk.pkg} 往返还原逐字一致`, M.restoreModelPanelRow(applied) === pk.factoryChunk);
+        // 守卫语义：插入段本身可执行，分组 id 直接 return，模型 id 放行
+        const guardFn = new Function(g, `${M.modelPanelGuardText(g)}return "pass";`);
+        check(`P22 ${pk.pkg} 分组 id 被拦下`, guardFn("a2k-group:p1") === undefined);
+        check(`P22 ${pk.pkg} 普通模型 id 放行`, guardFn("gpt-5.6-terra") === "pass");
+      }
+    }
+
+    section("P23 合成 1.1.x 夹具：v1 全链路（选项行 / 菜单 / ref / 弹层 / Ctx）仍能打上并逐字往返");
+    {
+      const RN = ["E", "R", "O"];
+      const RA = ["w", "I", "N"];
+      const row = M.renderTemplate(P.ORIG_JS_PATTERN, RN, RA);
+      const menu = M.renderTemplate(P.ORIG_MENU_PATTERN, RN, RA);
+      const ref = M.renderTemplate(P.ORIG_REF_PATTERN, RN, RA);
+      const popover = M.renderTemplate(
+        P.ORIG_POPOVER_PATTERN,
+        ["Bde", "re", "Pde", "E", "R", "O", "I", "B", "z"],
+        ["n2e", "ne", "t2e", "w", "I", "N", "R", "$", "H"]
+      );
+      const call = M.renderTemplate(P.ORIG_POPOVER_CALL_PATTERN, ["Bde", "Y"], ["n2e", "q"]);
+      // 调用处不能紧贴在 EffortSelector 标签后面：applyCtxSelector 在标签末尾插函数、在调用处做替换，
+      // 两段起点相同时会互相踩（真机 bundle 里两者相隔很远，不会出现）。这里把调用处放在标签前。
+      const tags = 'b.jsx(x2e,{disabled:K});a(E0,"useSessionConfig");a(x2e,"EffortSelector");';
+      const syn = `${menu},${ref},${row};${popover};${call};${tags}`;
+      check("P23 合成夹具判为 v1", gen(syn) === "v1", gen(syn));
+      const applied = M.applySelectorScript(syn);
+      for (const mark of ["a2k-model-name-box", "a2k-model-selector-menu", "a2kScrolled", "a2k-cu-head", "a2kCtxSel"]) {
+        check(`P23 v1 补丁含 ${mark}`, applied.includes(mark));
+      }
+      check("P23 v1 夹具不打 v2（无 a2kRowFix）", !applied.includes(M.ROW_FIX_FN));
+      const restored = M.restoreSelectorScript(applied);
+      check("P23 restore(apply(syn)) === syn", restored === syn);
+      check("P23 apply(restore(apply(syn))) === apply(syn)", M.applySelectorScript(restored) === applied);
+
+      // 1.2.56 回归：局部 `c`/`u` 对调、`ne.c(30)` 的 `.c` 是属性（D6：属性名不参与改名）
+      const v12 = M.renderTemplate(P.ORIG_POPOVER_PATTERN, ["Bde", "re", "Pde", "u", "c"], ["Ake", "ne", "Cke", "c", "u"]);
+      check("P23 1.2.56 形态：属性 .c 不被改名、局部 style:u", v12.includes("ne.c(30)") && v12.includes("style:u,"), v12.slice(0, 260));
+      const f12 = M.findPopoverFactory(`${v12};`);
+      check("P23 1.2.56 形态弹层函数可命中（fn=Ake）", !!f12 && f12.names.fn === "Ake", f12 ? JSON.stringify(f12.names) : "null");
     }
 
     console.log(`\n${pass} passed, ${fail} failed  (workdir ${WORK})`);
