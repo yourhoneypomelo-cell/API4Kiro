@@ -50,7 +50,7 @@ import {
   tokenKeyOf,
 } from "./providers";
 import { clearCooldown, credentialRuntimes, forgetCredential, poolStatus, reasonText } from "./credentialPool";
-import { maskKey, error, warn } from "./log";
+import { maskKey, error, info, warn } from "./log";
 import { RelayModel, capabilitySource, contextWindowRows, fetchAllModels, fetchProviderModels, resolveModelImage, resolveModelReasoning, seedProviderModels } from "./modelStore";
 import { catalogSize, onCatalogChanged, refreshCatalog } from "./modelCatalog";
 import {
@@ -105,7 +105,7 @@ import {
 } from "./mcpConfig";
 import { readTable } from "./sqliteReader";
 import { isHttpUrl, openInBrowser } from "./openBrowser";
-import { copyToken, deleteProviderTokens, deleteToken, getToken, moveToken, onTokensChanged, setToken } from "./oauth/tokenStore";
+import { copyToken, deleteProviderTokens, deleteToken, getToken, moveToken, onTokensChanged, reloadTokens, setToken, tokenStoreLoadError } from "./oauth/tokenStore";
 
 /** 某 provider 某把凭证的 token（键规则见 tokenKeyOf）。 */
 function getTokenFor(providerId: string, credentialId: string) {
@@ -334,10 +334,36 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
     view.onDidChangeVisibility(() => {
       if (view.visible) {
+        this.retryTokenStoreRead();
         this.postAll();
       }
     });
+    this.retryTokenStoreRead();
     this.postAll();
+  }
+
+  /**
+   * 钥匙串读失败（`loadError`）的**用户侧自救入口**（4.13.66）：打开 / 切回面板时重读一次。
+   *
+   * 为什么接在这里而不是加定时重试：读失败后 `loadError` 在本会话内不会被重置，而 key 类渠道的凭据
+   * 是在**每次读取时**从钥匙串取的（`keyPlaceholder` 的占位解析），所以一次读失败会让所有 key 类渠道
+   * 整会话不可用（面板显示「未配置」）。用户回到面板就是想看看怎么了——这时重读一次最自然，
+   * 既没有无限重试、也不阻塞激活。重读成功由 `TokenStore.adopt()` 清掉 `loadError` 并 emit（面板跟着刷新），
+   * 失败则保留 `loadError`、只记一行原因（不含任何 key 值），用户重载窗口即可。
+   */
+  private retryTokenStoreRead(): void {
+    const le = tokenStoreLoadError();
+    if (!le) {
+      return;
+    }
+    info(`oauth token store: 面板打开时重试读取钥匙串（上次失败：${le.code}）`);
+    void reloadTokens()
+      .then(() => {
+        if (this.view?.visible) {
+          this.postAll();
+        }
+      })
+      .catch((e) => error("oauth token store: 重试读取钥匙串失败:", (e as Error)?.message || String(e)));
   }
 
   reveal(): void {
