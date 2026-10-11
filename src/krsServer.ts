@@ -47,6 +47,7 @@ import {
   overrideFor,
   providerMissing,
   resolveApiUrl,
+  splitQualifiedModelId,
   tokenKeyOf,
 } from "./providers";
 import { NeedsLoginError, ensureAccessToken, vendorOf } from "./oauth";
@@ -62,6 +63,8 @@ import {
   getMaxRetries,
   getShowTokenUsage,
   getOpenaiThoughtDedupe,
+  getDefaultModel,
+  getOpenaiDefaultModel,
 } from "./config";
 import { debug, error, info } from "./log";
 import { serveIdentity } from "./proxyIdentity";
@@ -233,6 +236,36 @@ function hasToolResults(req: CwRequest): boolean {
   const results =
     req.conversationState?.currentMessage?.userInputMessage?.userInputMessageContext?.toolResults;
   return Array.isArray(results) && results.length > 0;
+}
+
+/** Kiro 的「Auto」（自动选模型）：裸 id 去空白后忽略大小写等于 auto。 */
+export function isAutoModelId(id: string): boolean {
+  return bareModelId(String(id || "")).trim().toLowerCase() === "auto";
+}
+
+/** 只有 Kiro 官方后端（请求体原样转发）认 auto；第三方上游一律不认。 */
+export function supportsAutoModel(p: ProviderConfig): boolean {
+  return p.protocol === "kiro" || p.oauthVendor === "kiro";
+}
+
+/**
+ * Auto 落到不支持它的渠道时，改用该渠道的哪个真实模型：
+ *  1. 渠道自己的兜底模型；旧双通道迁移来的渠道再看对应通道的全局默认模型；
+ *  2. 该渠道勾选的第一个模型；
+ *  3. 合并缓存里属于该渠道的第一个模型。
+ * 都没有返回 undefined（调用方提示用户）。
+ */
+export function autoFallbackModel(p: ProviderConfig): string | undefined {
+  const usable = (id: string | undefined): id is string => !!id && !!id.trim() && !isAutoModelId(id);
+  const legacyDefault =
+    p.id === "legacy-anthropic" ? getDefaultModel() : p.id === "legacy-openai" ? getOpenaiDefaultModel() : undefined;
+  for (const id of [p.defaultModel, legacyDefault, ...(p.enabledModels || [])]) {
+    if (usable(id)) {
+      return id.trim();
+    }
+  }
+  const cached = getCachedModels().find((m) => m.providerId === p.id && usable(m.id));
+  return cached?.id;
 }
 
 export class KrsProxyServer {
@@ -476,6 +509,15 @@ export class KrsProxyServer {
       return active[0];
     }
 
+    // Kiro 的 Auto（自动选模型）只有 Kiro 官方后端认：有启用的 Kiro 官方渠道就优先交给它。
+    // 带了 @providerId 限定的按限定走，不在这里抢。
+    if (isAutoModelId(kiroModel) && !splitQualifiedModelId(kiroModel).providerId) {
+      const native = active.find(supportsAutoModel);
+      if (native) {
+        return native;
+      }
+    }
+
     // 冷启动/上次拉取失败时缓存为空，先补一次（60s 缓存，代价可忽略）。
     if (getCachedModels().length === 0) {
       await fetchAllModels(false);
@@ -572,6 +614,31 @@ export class KrsProxyServer {
     if (!provider) {
       this.writeSetupMessage(res, convId, "⚠️ 没有可用的 provider，请在面板中配置。");
       return;
+    }
+
+    // Kiro 的 Auto（自动选模型）：第三方上游不认 "auto"（400 Model "auto" is not supported），
+    // 选中的渠道不原生支持时回落到该渠道的真实模型；与分组标题回落一样，请求体里的 modelId 一并改写。
+    // 用户在该渠道 modelMapping 里显式映射了 auto 的，交给 resolveModelForProvider 按映射走，不在这里改写。
+    const autoMapped = !!(provider.modelMapping?.[kiroModelRaw] || provider.modelMapping?.[bareModelId(kiroModelRaw)]);
+    if (isAutoModelId(kiroModelRaw) && !supportsAutoModel(provider) && !autoMapped) {
+      const fallback = autoFallbackModel(provider);
+      if (!fallback) {
+        this.writeSetupMessage(
+          res,
+          convId,
+          `ℹ️ 当前渠道「${provider.name}」不支持 Kiro 的 Auto 模型。\n\n请在模型选择器里选择具体模型，或在面板里给该渠道勾选模型 / 配置默认模型。`
+        );
+        return;
+      }
+      info(`[KRS] Kiro 选的是 Auto，渠道「${provider.name}」不支持，回落到「${fallback}」`);
+      kiroModelRaw = fallback;
+      const state = parsed.conversationState;
+      for (const item of [...(state.history || []), ...(state.currentMessage ? [state.currentMessage] : [])]) {
+        const uim = item.userInputMessage;
+        if (uim && typeof uim.modelId === "string" && isAutoModelId(uim.modelId)) {
+          uim.modelId = fallback;
+        }
+      }
     }
     const kiroModel = bareModelId(kiroModelRaw);
 
