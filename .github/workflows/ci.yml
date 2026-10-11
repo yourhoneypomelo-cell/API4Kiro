@@ -31,10 +31,9 @@ jobs:
         run: node dev/verify-selector-patch.js --synthetic
       - name: Verify startup race
         run: node dev/verify-startup-race.js
+      # Public Release / CI vsix must not embed Antigravity client secret.
+      # Do not set A2K_ANTIGRAVITY_CLIENT_SECRET (env or Actions secret).
       - name: Bundle & package VSIX
-        env:
-          # Public Release / CI vsix must not embed Antigravity client secret.
-          # Do not set A2K_ANTIGRAVITY_CLIENT_SECRET (env or Actions secret).
         run: npm run package
       - name: Public VSIX must not embed Antigravity client secret
         run: |
