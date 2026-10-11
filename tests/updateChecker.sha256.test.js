@@ -19,8 +19,8 @@ test("parseSha256：纯 hex / 大写 / sha256sum 行 / * 标记；长度不对�
   const hex = "a".repeat(64);
   assert.equal(U.parseSha256(`${hex}\n`), hex);
   assert.equal(U.parseSha256(hex.toUpperCase()), hex, "大小写不敏感");
-  assert.equal(U.parseSha256(`${hex}  api2kiro-dual-4.13.66.vsix\n`), hex);
-  assert.equal(U.parseSha256(`${hex} *api2kiro-dual-4.13.66.vsix`), hex);
+  assert.equal(U.parseSha256(`${hex}  api2kiro-dual-4.13.67.vsix\n`), hex);
+  assert.equal(U.parseSha256(`${hex} *api2kiro-dual-4.13.67.vsix`), hex);
   assert.equal(U.parseSha256(`\n\n${hex}  x\n`), hex, "跳过空行");
   assert.equal(U.parseSha256("a".repeat(63)), undefined);
   assert.equal(U.parseSha256("a".repeat(65)), undefined);
@@ -32,19 +32,19 @@ test("parseSha256：纯 hex / 大写 / sha256sum 行 / * 标记；长度不对�
 
 test("pickSha256Asset：只认「实际要安装的那份资产名 + .sha256」", () => {
   const assets = [
-    { name: "api2kiro-dual-4.13.66-custom.vsix", url: "http://x/a", size: 10 },
-    { name: "api2kiro-dual-4.13.66-custom.vsix.sha256", url: "http://x/a.sha256", size: 66 },
-    { name: "api2kiro-dual-4.13.66-custom.vsix.sha256.asc", url: "http://x/a.asc", size: 66 },
+    { name: "api2kiro-dual-4.13.67-custom.vsix", url: "http://x/a", size: 10 },
+    { name: "api2kiro-dual-4.13.67-custom.vsix.sha256", url: "http://x/a.sha256", size: 66 },
+    { name: "api2kiro-dual-4.13.67-custom.vsix.sha256.asc", url: "http://x/a.asc", size: 66 },
   ];
   // MEDIUM-4 夹具：资产名与版本推导名不一致，但精确同名摘要存在 ⇒ 必须走「下载并比对摘要」
-  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.66-custom.vsix").url, "http://x/a.sha256");
+  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.67-custom.vsix").url, "http://x/a.sha256");
   // 只传版本推导名 ⇒ 找不到（实际资产名不同，判定必须按实际名来，不能模糊猜测）
-  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.66.vsix"), undefined);
-  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.66.vsix.sha256"), undefined, "不得再叠一层后缀");
+  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.67.vsix"), undefined);
+  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.67.vsix.sha256"), undefined, "不得再叠一层后缀");
   // 名字相近的干扰项（.asc / 同名但后缀不同）不会被误选
-  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.66-custom.vsix.sha256.asc"), undefined);
-  assert.equal(U.pickSha256Asset([], "api2kiro-dual-4.13.66.vsix"), undefined);
-  assert.equal(U.pickSha256Asset(undefined, "api2kiro-dual-4.13.66.vsix"), undefined);
+  assert.equal(U.pickSha256Asset(assets, "api2kiro-dual-4.13.67-custom.vsix.sha256.asc"), undefined);
+  assert.equal(U.pickSha256Asset([], "api2kiro-dual-4.13.67.vsix"), undefined);
+  assert.equal(U.pickSha256Asset(undefined, "api2kiro-dual-4.13.67.vsix"), undefined);
   assert.equal(U.pickSha256Asset(assets, ""), undefined);
 });
 
@@ -212,8 +212,8 @@ async function run(version, vsix, shaText, opts = {}) {
 }
 
 test("AC-31 一致：摘要匹配 ⇒ 走结构校验并安装", async () => {
-  const vsix = makeVsix("4.13.66");
-  const { res, vsixPath } = await run("4.13.66", vsix, sha(vsix));
+  const vsix = makeVsix("4.13.67");
+  const { res, vsixPath } = await run("4.13.67", vsix, sha(vsix));
   assert.equal(res.status, "installed", JSON.stringify(res));
   assert.equal(installCalls().length, 1, "应调用安装命令");
   assert.ok(fs.existsSync(vsixPath), "已安装时应留下安装包（清理目录时保留刚装的那份）");
@@ -221,8 +221,8 @@ test("AC-31 一致：摘要匹配 ⇒ 走结构校验并安装", async () => {
 });
 
 test("AC-31 不一致：摘要不匹配 ⇒ 拒绝安装 + 删掉已下载文件 + 文案不含「可手动安装」", async () => {
-  const vsix = makeVsix("4.13.66");
-  const { res, vsixPath } = await run("4.13.66", vsix, "b".repeat(64));
+  const vsix = makeVsix("4.13.67");
+  const { res, vsixPath } = await run("4.13.67", vsix, "b".repeat(64));
   assert.equal(res.status, "failed", JSON.stringify(res));
   assert.equal(installCalls().length, 0, "不得调用安装命令");
   assert.ok(!fs.existsSync(vsixPath), "已下载的文件必须被删掉");
@@ -233,20 +233,20 @@ test("AC-31 不一致：摘要不匹配 ⇒ 拒绝安装 + 删掉已下载文件
 });
 
 test("AC-31 边界：摘要文件下载失败 / 畸形 / 长度不对 ⇒ 一律拒绝安装", async () => {
-  const vsix = makeVsix("4.13.66");
+  const vsix = makeVsix("4.13.67");
   // ① 畸形（不是 hex）
-  let r = await run("4.13.66", vsix, "not-a-hex-digest\n");
+  let r = await run("4.13.67", vsix, "not-a-hex-digest\n");
   assert.equal(r.res.status, "failed", JSON.stringify(r.res));
   assert.equal(installCalls().length, 0);
   assert.ok(!fs.existsSync(r.vsixPath));
 
   // ② 长度不对（63 位）
-  r = await run("4.13.66", vsix, "a".repeat(63));
+  r = await run("4.13.67", vsix, "a".repeat(63));
   assert.equal(r.res.status, "failed");
   assert.equal(installCalls().length, 0);
 
   // ③ 摘要资产存在但下载 404
-  const { files, release, name } = releaseWithSha("4.13.66", vsix, sha(vsix));
+  const { files, release, name } = releaseWithSha("4.13.67", vsix, sha(vsix));
   delete files[`/${name}.sha256`];
   await withFakeGitHub(files, release, async (g) => {
     U._resetUpdateStateForTest();
@@ -265,8 +265,8 @@ test("AC-31 边界：摘要文件下载失败 / 畸形 / 长度不对 ⇒ 一律
 });
 
 test("LOW-4：在 `.sha256` 下载期间点「取消」⇒ 报「已取消更新」，不得报成摘要校验失败（安全告警 + Release 页）", async () => {
-  const vsix = makeVsix("4.13.66");
-  const { files, release, name } = releaseWithSha("4.13.66", vsix, sha(vsix));
+  const vsix = makeVsix("4.13.67");
+  const { files, release, name } = releaseWithSha("4.13.67", vsix, sha(vsix));
   await withFakeGitHub(files, release, async (g) => {
     U._resetUpdateStateForTest();
     for (const a of release.assets) a.browser_download_url = `${g.base}/${a.name}`;
@@ -315,12 +315,12 @@ test("LOW-4：在 `.sha256` 下载期间点「取消」⇒ 报「已取消更新
 });
 
 test("AC-31 旧 Release（无 .sha256）：模态二次确认，默认取消", async () => {
-  const vsix = makeVsix("4.13.66");
-  const name = `${U.EXTENSION_NAME}-4.13.66.vsix`;
+  const vsix = makeVsix("4.13.67");
+  const name = `${U.EXTENSION_NAME}-4.13.67.vsix`;
   const files = { [`/${name}`]: vsix };
   const release = {
-    tag_name: "v4.13.66",
-    html_url: "https://github.com/example/releases/tag/v4.13.66",
+    tag_name: "v4.13.67",
+    html_url: "https://github.com/example/releases/tag/v4.13.67",
     assets: [{ name, browser_download_url: `/${name}`, size: vsix.length }],
   };
   // ① 用户取消（confirm 返回 false）⇒ 删掉已下载文件、返回 cancelled、不安装
@@ -359,12 +359,12 @@ test("AC-31 旧 Release（无 .sha256）：模态二次确认，默认取消", a
 });
 
 test("MEDIUM-4 端到端：资产名与版本推导名不一致 + 同名 .sha256 ⇒ 走摘要校验（不是旧 Release 确认框）", async () => {
-  const vsix = makeVsix("4.13.66");
-  const custom = `${U.EXTENSION_NAME}-4.13.66-custom.vsix`;
+  const vsix = makeVsix("4.13.67");
+  const custom = `${U.EXTENSION_NAME}-4.13.67-custom.vsix`;
   const files = { [`/${custom}`]: vsix, [`/${custom}.sha256`]: Buffer.from(sha(vsix), "utf8") };
   const release = {
-    tag_name: "v4.13.66",
-    html_url: "https://github.com/example/releases/tag/v4.13.66",
+    tag_name: "v4.13.67",
+    html_url: "https://github.com/example/releases/tag/v4.13.67",
     assets: [
       { name: custom, browser_download_url: `/${custom}`, size: vsix.length },
       { name: `${custom}.sha256`, browser_download_url: `/${custom}.sha256`, size: Buffer.byteLength(sha(vsix)) },
@@ -388,6 +388,6 @@ test("MEDIUM-4 端到端：资产名与版本推导名不一致 + 同名 .sha256
     assert.equal(confirmAsked, false, "有同名摘要就必须走校验，不能降级成「没有 .sha256」的确认框");
     assert.equal(installCalls().length, 1);
     // 本地落盘名仍是版本推导名（既有行为不动）
-    assert.ok(fs.existsSync(path.join(ctx.globalStorageUri.fsPath, "updates", `${U.EXTENSION_NAME}-4.13.66.vsix`)));
+    assert.ok(fs.existsSync(path.join(ctx.globalStorageUri.fsPath, "updates", `${U.EXTENSION_NAME}-4.13.67.vsix`)));
   });
 });

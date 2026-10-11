@@ -11,7 +11,7 @@
  *
  * 不变量（I1，措辞见设计 §10）：本扩展在迁移之后**永不把新增的明文 key 写进 `settings.json`**
  * （含 `fallback.*` 兜底副本）；钥匙串不可用或写入失败时**保留原有明文**，**不得**用占位覆盖它。
- * 反向同理（4.13.66）：钥匙串读不出来时**不得把 settings 里的占位写成空串**（那会让钥匙串里的真值失联），
+ * 反向同理（4.13.67）：钥匙串读不出来时**不得把 settings 里的占位写成空串**（那会让钥匙串里的真值失联），
  * 见 `unresolvedPlaceholderSlots` / `mergeForWrite` 的 (a) 规则 / `reconcile` 的 I13 判据。
  */
 
@@ -264,7 +264,7 @@ function copyRawCredentials(raw: unknown): Credential[] | undefined {
  * 两种写法的差别就是防「删 c1 → c2 改名成 c1」在保存失败时把已删的 A 写回。
  * `previousRaw` 必须是 `slotIndexFor` 用的同一个原文数组。
  *
- * (a) 额外一层防护（4.13.66）：**钥匙串读不出来时**（`keychainUnreadable`），任何 key 字段都不许从
+ * (a) 额外一层防护（4.13.67）：**钥匙串读不出来时**（`keychainUnreadable`），任何 key 字段都不许从
  * 「原文是占位」降级成空串 —— 那条空值来自「占位解析不到真值」，写下去 settings 就再也指不回钥匙串了。
  * 只在读不出来时生效：钥匙串可读时占位解析为空 = 用户真的清了 Key，那时必须能写空串（否则 Key 永远清不掉）。
  */
@@ -520,7 +520,7 @@ export class ApiKeyVault {
    * 后端不是 `secrets` 时**一次 `setToken` 都不调**：`TokenStore` 在缺 SecretStorage 时不会抛错，
    * 而是静默改道 `globalState`，于是 settings 会被换成占位、key 却以明文落进插件的本地存储。
    *
-   * 4.13.66 起同时是**保存路径的后端闸**：`tokenStoreLoadError()` / `tokenStoreBackend()` 任一不满足
+   * 4.13.67 起同时是**保存路径的后端闸**：`tokenStoreLoadError()` / `tokenStoreBackend()` 任一不满足
    * 「钥匙串可读可写」时，Key 类字段一律不改（保留 settings 原文）并如实报出失败槽位，
    * 让调用方走「Key 变更未生效」而不是成功提示。metadata 不受影响，照常落盘。
    */
@@ -583,7 +583,7 @@ export class ApiKeyVault {
     const failed = new Set<string>();
     const keyProviders = list.filter((p) => isKeyType(p) && !reservedId(p.id));
     const expected = expectedSlots(this.port, list);
-    // I13 自我保护（4.13.66 起判据含**原文快照**）：`list` 是注水后的列表，占位在注入阶段就已被解析掉，
+    // I13 自我保护（4.13.67 起判据含**原文快照**）：`list` 是注水后的列表，占位在注入阶段就已被解析掉，
     // 挂在它上面这条保护在它本来要防的「钥匙串读不出来」场景里永远不会命中。两条并集：
     //  ① 调用方递进来的就是一份全占位列表（`withPlaceholders` 的产物）——既有语义；
     //  ② 钥匙串读不出来、而 settings 原文仍是占位 ⇒ 这个空集是「解析不到」而不是「用户清空了 Key」。

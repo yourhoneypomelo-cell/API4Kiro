@@ -3,7 +3,7 @@
  *
  * 为什么单独一个模块：提示文案由「本轮是不是全部跳过」「跳过哪几份」「哪几份旁边有出厂备份」共同决定，
  * 混在 `extension.ts#notifyStyleSync` 的 `showWarningMessage` 调用里就只能靠人读；抽成纯函数后单测能直接
- * 断言两种分支的输出（4.13.66 之前的缺陷正是「部分跳过」被说成「本次未写入任何 Kiro 文件」）。
+ * 断言两种分支的输出（逐文件粒度刚落地时，「部分跳过」曾被说成「本次未写入任何 Kiro 文件」）。
  */
 import type { StyleSyncResult } from "./selectorStyle";
 

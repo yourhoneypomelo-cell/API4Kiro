@@ -343,7 +343,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 钥匙串读失败（`loadError`）的**用户侧自救入口**（4.13.66）：打开 / 切回面板时重读一次。
+   * 钥匙串读失败（`loadError`）的**用户侧自救入口**（4.13.67）：打开 / 切回面板时重读一次。
    *
    * 为什么接在这里而不是加定时重试：读失败后 `loadError` 在本会话内不会被重置，而 key 类渠道的凭据
    * 是在**每次读取时**从钥匙串取的（`keyPlaceholder` 的占位解析），所以一次读失败会让所有 key 类渠道

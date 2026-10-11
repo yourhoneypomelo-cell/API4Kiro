@@ -26,7 +26,7 @@ export type StyleSyncResult = {
   status: TargetStatus;
   detail?: string;
   /**
-   * 前置闸动过的痕迹（4.13.66 起**逐文件**粒度）。只要本轮有文件因为
+   * 前置闸动过的痕迹（4.13.67 起**逐文件**粒度）。只要本轮有文件因为
    * kiro-proxy 残留（`kiroproxy-…`）被跳过就是 `"kiro-proxy"`——可能是部分跳过（其余文件照常打补丁），
    * 也可能是全部跳过（那时 `status` / `targets` 全是 unavailable、`allSkipped === true`，一个字节都没写）。
    * 区分这两者**只能**看 `allSkipped`：部分跳过时 `targets` 同样可能三个字段全 unavailable。
@@ -43,7 +43,7 @@ export type StyleSyncResult = {
   /**
    * **显式**回答「本轮是不是所有目标文件都带残留、一个字节都没写」。只有 `blockedBy === "kiro-proxy"` 的结果才设它：
    * 逐文件闸门下不得再由 `targets` 反推——部分跳过时被跳过的 chunk 与后端同样报 `unavailable`，
-   * 「三个字段都 unavailable」因此不再等于「什么也没写」（4.13.66 的误报来源）。
+   * 「三个字段都 unavailable」因此不再等于「什么也没写」（逐文件粒度落地时的误报正出在此）。
    * 全部跳过 ⇒ `true`；部分跳过 ⇒ `false`；其它情况 `undefined`。
    */
   allSkipped?: boolean;
@@ -2380,7 +2380,7 @@ const KIRO_PROXY_DETAIL =
   "检测到 kiro-proxy 的补丁残留（kiroproxy-…）：为避免两套注入互相覆盖，本轮未写入带残留的那些 Kiro 文件。";
 
 /**
- * 前置闸（4.13.66 起**逐文件**判定）：打补丁前先读目标文件，把带 kiro-proxy 残留的挑出来。
+ * 前置闸（4.13.67 起**逐文件**判定）：打补丁前先读目标文件，把带 kiro-proxy 残留的挑出来。
  *
  * 为什么逐文件而不是整轮拒绝：两套补丁只有落在**同一个文件**里才会互相覆盖（双方都按自己的标记段
  * 找段落，别人写进去的字节会让自己的锚点错位）。目标文件之间没有交叉依赖——`selectorStyle.ts` 的三处
@@ -2575,7 +2575,7 @@ export const __selectorStyleInternals = {
   START,
   END,
   CARD_CSS,
-  /** 「这个文件已带本扩展的补丁」的标记集合（4.13.66 起随 internals 暴露，供 verify 脚本断言还原干净）。 */
+  /** 「这个文件已带本扩展的补丁」的标记集合（4.13.67 起随 internals 暴露，供 verify 脚本断言还原干净）。 */
   SELECTOR_PATCH_MARKS,
   /** 结构匹配器：模板以 1.0.411 压缩名书写，名字按结构捕获 / 反查 / 渲染。 */
   matchers: {

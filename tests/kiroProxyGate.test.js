@@ -1,5 +1,5 @@
 "use strict";
-// kiro-proxy 前置闸（4.13.66 起**逐文件**）：带残留的文件跳过并在结果里点名，干净文件照常打补丁；
+// kiro-proxy 前置闸（4.13.67 起**逐文件**）：带残留的文件跳过并在结果里点名，干净文件照常打补丁；
 // 全部目标文件都带残留时退化成整轮拒绝。关闭路径只删自己的段（AC-9 / AC-15）。
 // 全部读写都在临时沙箱里，绝不碰真实 /Applications/Kiro.app。
 const test = require("node:test");
@@ -231,7 +231,7 @@ test("闸门只对开启路径生效：关闭态（factory 夹具）不读残留
   assert.ok(read(STYLE).includes("kiroproxy-ctxwin-wrap"), "关闭路径不碰别人的字节");
 });
 
-// 回归：本机 4.13.66 的真实布局（5 份目标文件，脏 3 份）。修复前 `allSkipped` 由 targets 反推，
+// 回归：本机真实布局（5 份目标文件，脏 3 份）。修复前 `allSkipped` 由 targets 反推，
 // 三个字段全 unavailable ⇒ 被当成「一个字节都没写」，用户看到「本次未写入任何 Kiro 文件」而实际
 // session-details 那一对照常打上了补丁。
 test("回归：部分跳过（脏 3 份 / 干净 2 份）必须报 allSkipped=false，且文案不得说「未写入任何」", async () => {

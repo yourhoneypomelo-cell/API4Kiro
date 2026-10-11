@@ -249,7 +249,7 @@ const styleSyncWarned = new Set<string>();
 function notifyStyleSync(result: StyleSyncResult): void {
   // 前置闸（kiro-proxy 残留）：必须放在下面那条 detail 判断**之前**——它带 detail，
   // 放后面会被通用文案吃掉（用户就看不出「为什么这次没写、要做什么」）。
-  // 4.13.66 起闸门是**逐文件**的：可能只是部分文件被跳过，文案要按实际清单说，并给出可操作的恢复步骤。
+  // 4.13.67 起闸门是**逐文件**的：可能只是部分文件被跳过，文案要按实际清单说，并给出可操作的恢复步骤。
   if (result.blockedBy === "kiro-proxy") {
     const skipped = result.skippedBy || [];
     const key = `kiro-proxy:${skipped.join("|")}`;

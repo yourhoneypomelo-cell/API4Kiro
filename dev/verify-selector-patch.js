@@ -890,7 +890,7 @@ function main() {
     }
     } // ← P4–P22（真机段落）到此结束
 
-    section("P24 kiro-proxy 前置闸（4.13.66 逐文件）：带残留的文件跳过并点名、干净文件照常打补丁；全部带残留才整轮拒绝");
+    section("P24 kiro-proxy 前置闸（4.13.67 逐文件）：带残留的文件跳过并点名、干净文件照常打补丁；全部带残留才整轮拒绝");
     {
       const backendFile = I.paths.kiroAgentBackendFile();
       const N = require(path.join(BUILD, "kiroProxyNotice.js"));
@@ -945,7 +945,7 @@ function main() {
         s2.blockedBy === "kiro-proxy" && s2.status === "unavailable",
         JSON.stringify(s2)
       );
-      // 回归（4.13.66 修复）：部分跳过时三个靶点字段也全是 unavailable，所以「是否全部跳过」
+      // 回归（部分跳过误报的修复）：部分跳过时三个靶点字段也全是 unavailable，所以「是否全部跳过」
       // 只能是显式字段，不能再从 targets 反推。
       check("P24② 部分跳过 ⇒ allSkipped=false（不得由三个 unavailable 反推成整轮拒绝）", s2.allSkipped === false, JSON.stringify(s2));
       {
