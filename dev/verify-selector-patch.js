@@ -1023,6 +1023,64 @@ function main() {
       check("P24③ 关闭路径不报 blockedBy", s3.blockedBy === undefined, JSON.stringify(s3));
       // 收尾：把夹具写回出厂态（P24 是最后一个依赖夹具的段落，留着残留会让人工排查误以为脚本写过东西）
       targetFiles.forEach((f, i) => fs.writeFileSync(f, factoryContents[i], "utf8"));
+
+      // ④ 只给**后端文件**注入残留（真机 1.2.56 的 extension.js 带 usage 锚点）⇒ 主钩子（通道 A）与
+      //    ctx 宿主钩子照旧跳过，但纯插入的 usage 重试钩子仍要写进去（4.13.68 豁免）。这正是真机
+      //    「给 CPS 端点发了 ECONNREFUSED、kiro-agent 弹 toast」的唯一可用修法：本机 extension.js 带残留。
+      const occur = (t, s) => t.split(s).length - 1;
+      const backendIdx = targetFiles.indexOf(backendFile);
+      const usageResidue = `\n/*kiroproxy-toolcard:r1*/var kiroproxyProbe4=1;/*kiroproxy-toolcard:end*/\n`;
+      if (!M.findUsageHook(factoryContents[backendIdx])) {
+        // 合成夹具的后端文件是自造的最小结构、没有 usage 锚点，豁免无从观察：整段跳过（真机段落）。
+        console.log("  SKIP  P24④ 合成夹具的后端文件没有 usage 锚点（本段只在真机 extension.js 上可验）");
+        skippedSections++;
+      } else {
+        fs.appendFileSync(backendFile, usageResidue, "utf8");
+        check("P24④ 前置：后端夹具的 usage 锚点可命中", !!M.findUsageHook(read(backendFile)));
+        const s4 = await S.syncGroupHeaderStyle(true);
+        check("P24④ 后端带残留 ⇒ usageRetry=applied（纯插入豁免生效）", s4.extras.usageRetry === "applied", JSON.stringify(s4.extras));
+        check("P24④ usage 段已写入后端文件（start/end 各 3 段）", occur(read(backendFile), M.USAGE_START) === 3, String(occur(read(backendFile), M.USAGE_START)));
+        check(
+          "P24④ 主钩子与 ctx 宿主钩子照旧跳过（targets.backend 仍 unavailable、两个钩子都不在文件里）",
+          s4.targets.backend === "unavailable" &&
+            s4.extras.ctxHost === "unavailable" &&
+            !read(backendFile).includes("__kiroModelConfigProvider=t") &&
+            !read(backendFile).includes("__a2kSessionConfigOption"),
+          JSON.stringify({ t: s4.targets, e: s4.extras })
+        );
+        check("P24④ 别人的 kiroproxy- 字节一个都没动", read(backendFile).includes("kiroproxyProbe4"));
+        check(
+          "P24④ 提示不再点名 dist/extension.js（那里写了钩子，不属于「放着没动」）",
+          !(s4.skippedBy || []).includes(short(backendFile)),
+          JSON.stringify(s4.skippedBy)
+        );
+        check("P24④ 只跳过后端时不再报 blockedBy（其余文件照常打补丁）", s4.blockedBy === undefined, JSON.stringify(s4.blockedBy));
+        const clean4 = [];
+        for (const pk of fx.packages) {
+          if (!marksAll.some((m) => read(pk.chunk).includes(m))) clean4.push(`${pk.pkg} chunk 无 a2k 标记`);
+          if (!read(pk.style).includes("a2k-card-head")) clean4.push(`${pk.pkg} style.css 无 CARD_CSS`);
+        }
+        check("P24④ 其余干净 package 照常打上 a2k 段", clean4.length === 0, clean4.join("; "));
+        const after4 = contents();
+        const s4b = await S.syncGroupHeaderStyle(true);
+        check(
+          "P24④ 再同步幂等：usageRetry=unchanged、所有目标文件逐字不变",
+          s4b.extras.usageRetry === "unchanged" && contents().every((t, i) => t === after4[i]),
+          JSON.stringify(s4b.extras)
+        );
+        await S.syncGroupHeaderStyle(false);
+        check(
+          "P24④ 关闭：usage 段与主钩子全部消失、kiroproxy- 字节仍在",
+          !read(backendFile).includes(M.USAGE_START) && !read(backendFile).includes("__kiroModelConfigProvider") && read(backendFile).includes(usageResidue.trim()),
+          read(backendFile).slice(0, 120)
+        );
+        check(
+          "P24④ 关闭后后端文件逐字回到「出厂 + 注入残留」（还原可逆）",
+          read(backendFile) === factoryContents[backendIdx] + usageResidue,
+          `len ${read(backendFile).length} vs ${factoryContents[backendIdx].length + usageResidue.length}`
+        );
+      }
+      targetFiles.forEach((f, i) => fs.writeFileSync(f, factoryContents[i], "utf8"));
     }
 
     section("P23 合成 1.1.x 夹具：v1 全链路（选项行 / 菜单 / ref / 弹层 / Ctx）仍能打上并逐字往返");

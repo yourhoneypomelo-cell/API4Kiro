@@ -33,11 +33,15 @@ export type StyleSyncResult = {
    * 既有构造点不传即 `undefined`，向后兼容。
    */
   blockedBy?: "kiro-proxy";
-  /** 被前置闸跳过的目标文件（`extensions/` 之后的短路径，逐文件）——提示里点名用。 */
+  /**
+   * 被前置闸跳过的目标文件（`extensions/` 之后的短路径，逐文件）——提示里点名用。
+   * 4.13.68 起不含「只豁免 usage 重试钩子」的后端文件：那里写了纯插入钩子，不算放着没动。
+   */
   skippedBy?: string[];
   /**
    * 被跳过的文件旁边检测到的 kiro-proxy 出厂备份（`<文件名>.kiroproxy-bak-<版本>`）的绝对路径。
    * 有值时提示文案里给出「可用它恢复该文件」的可操作指引（谁的备份归谁，不存在自动覆盖）。
+   * 清单与 `skippedBy` 同一集合（被豁免的后端文件不在其中）。
    */
   kiroProxyBackups?: string[];
   /**
@@ -1364,8 +1368,17 @@ function applyBackendHook(content: string): string {
   return content.slice(0, hook.start) + renderTemplate(PATCHED_QPE_PATTERN, BACKEND_CANON, actual) + content.slice(hook.end);
 }
 
-/** 后端钩子的写入计划（只读盘、不写）。文件不存在 / 不可读（非 Kiro 宿主）→ unavailable 且无文件。 */
-async function planKiroAgentBackend(enabled: boolean): Promise<TargetPlan> {
+/**
+ * 后端钩子的写入计划（只读盘、不写）。文件不存在 / 不可读（非 Kiro 宿主）→ unavailable 且无文件。
+ *
+ * `usageOnly`（4.13.68）：后端文件带 kiro-proxy 残留时**只**处理 usage 重试钩子。主钩子（通道 A）与 ctx 宿主钩子
+ * 都会替换 / 依赖出厂结构（`applyBackendHook` 整段替换 setter 函数体，`applyCtxHostHook` 要求通道 A 在位），
+ * 与别人的注入落在同一份文件里会互相破坏，所以照旧跳过；usage 重试钩子是**纯插入**——只插 / 删自己的
+ * `/*a2k-usage:start*​/…/*a2k-usage:end*​/` 定界段，从不改写任何不属于自己的字节，因此与 kiro-proxy 的注入不冲突。
+ * 这时 `status` 仍是 `unavailable`（`targets.backend` 按老口径只看主钩子 / ctx 宿主钩子），只有
+ * `extras.usageRetry` 上报这一处的真实结果。
+ */
+async function planKiroAgentBackend(enabled: boolean, usageOnly = false): Promise<TargetPlan> {
   const file = kiroAgentBackendFile();
   let original: string;
   try {
@@ -1375,12 +1388,16 @@ async function planKiroAgentBackend(enabled: boolean): Promise<TargetPlan> {
     return { status: "unavailable", files: [], extras: { usageRetry: "unchanged" } };
   }
   await sweepStaleTmp(file);
-  let content = restoreUsageHook(restoreCtxHostHook(restoreBackendHook(original)));
+  // usageOnly 下连自己的主钩子 / ctx 段都不还原（这里是「不读也不写别人的字节」的旧语义）：
+  // `restoreBackendHook` 会按出厂串整段回填，那正是带残留时不能做的事。
+  let content = usageOnly ? restoreUsageHook(original) : restoreUsageHook(restoreCtxHostHook(restoreBackendHook(original)));
   if (enabled) {
-    content = applyBackendHook(content);
-    // 可选组的宿主钩子只在主钩子（通道 A）打上时才打：没有通道 A，聊天框改挡位也到不了 Kiro 的下一轮列表；
-    // 主钩子漂移时文件一字不写，targets.backend 仍按老口径报 unavailable。
-    if (/__kiroModelConfigProvider=t/.test(content)) content = applyCtxHostHook(content);
+    if (!usageOnly) {
+      content = applyBackendHook(content);
+      // 可选组的宿主钩子只在主钩子（通道 A）打上时才打：没有通道 A，聊天框改挡位也到不了 Kiro 的下一轮列表；
+      // 主钩子漂移时文件一字不写，targets.backend 仍按老口径报 unavailable。
+      if (/__kiroModelConfigProvider=t/.test(content)) content = applyCtxHostHook(content);
+    }
     // usage 重试钩子与通道 A 无关（A2），独立打；锚点漂移只跳过自己。
     content = applyUsageHook(content);
   }
@@ -2393,6 +2410,13 @@ const KIRO_PROXY_DETAIL =
  * 本机真实 Kiro 就是「agent-chat 的 chunk + style.css + extension.js 带残留、session-details 干净」，
  * 整轮拒绝会让用户完全用不上补丁，而逐文件至少能保住干净的那几份。
  *
+ * **4.13.68 唯一豁免：`dist/extension.js` 上的 usage 重试钩子**。它不是「替换 / 依赖出厂结构」的补丁，
+ * 而是两处纯插入（`/*a2k-usage:start*​/…/*a2k-usage:end*​/` 定界，还原 = 删自己的段），从不改写任何不属于自己的
+ * 字节 —— 与 kiro-proxy 的注入落在同一份文件里也不会互相破坏。所以后端文件带残留时它仍会被写入
+ * （见 `planKiroAgentBackend(enabled, /* usageOnly *​/ true)`）。这是「kiro-agent 启动时先于本扩展打 CPS
+ * 端点、拿到 ECONNREFUSED 弹 toast」在真机上的**唯一**可用修法：本机的 extension.js 带残留，不豁免就永远打不上。
+ * 主钩子（通道 A）与 ctx 宿主钩子照旧跳过，`targets.backend` 的语义一字未改。
+ *
  * 逐文件 try/catch：读不到（ENOENT / EACCES）视为「该文件无标记」，让后续 planX 照常报 unavailable +
  * `code path` detail——普通 VS Code 宿主不该被报成「检测到了 kiro-proxy」。
  */
@@ -2487,10 +2511,11 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
   const skippedStyles = pkgs.some((p) => skippedSet.has(p.style));
   const skippedBackend = skippedSet.has(backendFile);
   const selectorScript = await planModelSelectorScript(enabled, activePkgs);
-  // 被跳过的后端文件**不读也不写**：这里不能走 planKiroAgentBackend(false)（那是还原路径，会删掉自己的段）。
-  const backend: TargetPlan = skippedBackend
-    ? { status: "unavailable", files: [], extras: { ctxHost: "unavailable", usageRetry: "unavailable" } }
-    : await planKiroAgentBackend(enabled);
+  // 被跳过的后端文件**不还原也不打主钩子 / ctx 宿主钩子**（这里是「不读也不写别人的字节」的旧语义：
+  // 不能走 planKiroAgentBackend(false)，那是还原路径，会按出厂串整段回填别人的文件）；但 usage 重试钩子是
+  // **纯插入**（4.13.68），带残留时仍然只打这一处 —— 见 planKiroAgentBackend 的 usageOnly。
+  // skippedBackend 只在 enabled 时为真（闸门只在开启路径跑），所以这里显式传 true。
+  const backend: TargetPlan = skippedBackend ? await planKiroAgentBackend(true, true) : await planKiroAgentBackend(enabled);
   // CSS 逐份决定：只给「本 package 的 chunk 确实拿到了补丁」的那些包加 CARD_CSS。
   // 否则就是「改了 IDE 外观却没有对应功能」的半补丁；反过来，一份靶点漂移也不该牵连
   // 另一份（打上的那份保留卡片样式）。关闭路径 / 靶点整体不命中 → patched 集合为空 → 全部剥掉。
@@ -2510,8 +2535,16 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
   const extras: SyncExtras = {
     ctxSelector: extraOf(selectorScript, committed.selectorScript, "ctxSelector", skippedChunks),
     ctxHost: extraOf(backend, committed.backend, "ctxHost", skippedBackend),
-    usageRetry: extraOf(backend, committed.backend, "usageRetry", skippedBackend),
+    // usageRetry **不**受 skippedBackend 影响：纯插入钩子在带残留的后端文件上照常写（4.13.68 豁免），
+    // 只有「本轮写失败 / 被全有或全无中止」才报 unavailable —— 那由 extraOf 的第二段判断覆盖。
+    usageRetry: extraOf(backend, committed.backend, "usageRetry", false),
   };
+  // 豁免生效时说明一句：用户在主面板看到「跳过后端文件」与「usageRetry=applied」并存时不至于以为矛盾。
+  if (skippedBackend && (extras.usageRetry === "applied" || extras.usageRetry === "unchanged")) {
+    info(
+      "usage-limits retry hook (optional): backend file carries a kiro-proxy residue — the main backend / ctx host hooks stay skipped, the pure-insertion usage retry hook is written anyway"
+    );
+  }
   // usage 重试钩子是可选组：锚点漂移只在整个宿主里记一次 info（写失败另有 error 日志，这里不重复）。
   if (enabled && extras.usageRetry === "unavailable" && !committed.backend.detail && !usageDriftLogged) {
     usageDriftLogged = true;
@@ -2552,14 +2585,17 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
   const out: StyleSyncResult = { status, targets, extras };
   // 有文件被前置闸跳过（部分跳过）：整轮报 unavailable + 一句可操作的中文说明，
   // 并带上跳过清单；调用方（extension.ts#notifyStyleSync）据此提示用户而不是当成成功。
-  if (skippedFiles.length > 0) {
-    const names = skippedFiles.map(shortTargetName);
+  // 带残留的后端文件若已写入 usage 重试钩子（纯插入豁免，4.13.68），它就不属于「本轮放着没动」的那一类：
+  // 提示里不再点名它 —— 否则用户会以为 extension.js 也被放弃、去按备份手工还原它（那会连带丢掉用量重试）。
+  const abandoned = skippedFiles.filter((f) => !(f === backendFile && (extras.usageRetry === "applied" || extras.usageRetry === "unchanged")));
+  if (abandoned.length > 0) {
+    const names = abandoned.map(shortTargetName);
     out.status = "unavailable";
     out.blockedBy = "kiro-proxy";
     out.skippedBy = names;
     // 走到这里说明目标文件只被跳过了一部分（全部跳过在上面早退分支里）：显式报 false。
     out.allSkipped = false;
-    const backups = await findKiroProxyBackups(skippedFiles);
+    const backups = await findKiroProxyBackups(abandoned);
     if (backups.length > 0) {
       out.kiroProxyBackups = backups;
     }

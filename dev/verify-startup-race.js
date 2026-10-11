@@ -342,6 +342,50 @@ async function main() {
     fs.writeFileSync(EXT_FILE, MAIN_FACTORY, "utf8");
   }
 
+  // ------------------------------------------------------------ K2
+  section("K2 kiro-proxy 残留豁免（4.13.68）：后端带残留 ⇒ 只写纯插入的 usage 重试钩子");
+  {
+    // 造一份**干净**的 package（假 chunk 带标记即可）：全部目标文件都带残留会走「整轮拒绝」早退分支，
+    // 而豁免生效的那条路径是「部分跳过」（真机就是这一个形态）。这里只要求它是干净的目标文件。
+    const pkgDist = path.join(ROOT, "extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat/dist");
+    fs.mkdirSync(path.join(pkgDist, "assets"), { recursive: true });
+    fs.writeFileSync(path.join(pkgDist, "assets/mermaid-k2.js"), 'x("chat-input-popup-option");', "utf8");
+    fs.writeFileSync(path.join(pkgDist, "style.css"), ":root{}\n", "utf8");
+    // 后端夹具取真机 dist/extension.js 的出厂归一文本（带 1.2.56 的 usage 锚点），再注入 kiro-proxy 残留。
+    const base = fs.existsSync(realFile) ? factoryNormalize(read(realFile)) : `${MAIN_FACTORY}\n${USAGE_FACTORY}`;
+    const residue = "/*kiroproxy-toolcard:r1*/var kiroproxyProbe=1;/*kiroproxy-toolcard:end*/";
+    fs.writeFileSync(EXT_FILE, `${base}\n${residue}\n`, "utf8");
+    const beforeK2 = read(EXT_FILE);
+    check("K2 前置：夹具的 usage 锚点可命中（否则本段无意义）", !!M.findUsageHook(base));
+    check("K2 前置：后端文件确实带 kiro-proxy 残留", beforeK2.includes("kiroproxy-"));
+    const k1 = await S.syncGroupHeaderStyle(true);
+    check("K2① 带残留的后端文件：usageRetry=applied（纯插入豁免生效）", k1.extras.usageRetry === "applied", JSON.stringify(k1.extras));
+    check(
+      "K2① usage 重试钩子已写入文件（start/end 各 3 段）",
+      count(read(EXT_FILE), M.USAGE_START) === 3 && count(read(EXT_FILE), M.USAGE_END) === 3,
+      `${count(read(EXT_FILE), M.USAGE_START)}/${count(read(EXT_FILE), M.USAGE_END)}`
+    );
+    check(
+      "K2① 主钩子（通道 A）照旧跳过：targets.backend=unavailable 且文件里没有主钩子",
+      k1.targets.backend === "unavailable" && !read(EXT_FILE).includes("__kiroModelConfigProvider=t"),
+      JSON.stringify(k1.targets)
+    );
+    check("K2① ctx 宿主钩子照旧跳过", k1.extras.ctxHost === "unavailable" && !read(EXT_FILE).includes("__a2kSessionConfigOption"), JSON.stringify(k1.extras));
+    check("K2① 别人的 kiroproxy- 字节一个都没动", read(EXT_FILE).includes(residue));
+    const afterK2 = read(EXT_FILE);
+    check("K2① 除 usage 段外文件逐字不变（主钩子 / 别人的字节都没被改写）", M.restoreUsageHook(afterK2) === beforeK2);
+    const k2 = await S.syncGroupHeaderStyle(true);
+    check("K2② 再同步幂等：usageRetry=unchanged、文件逐字不变", k2.extras.usageRetry === "unchanged" && read(EXT_FILE) === afterK2, JSON.stringify(k2.extras));
+    await S.syncGroupHeaderStyle(false);
+    check(
+      "K2③ 关闭：usage 段消失、kiroproxy- 字节仍在、文件逐字回到注入残留前",
+      !read(EXT_FILE).includes(M.USAGE_START) && read(EXT_FILE) === beforeK2,
+      read(EXT_FILE).slice(0, 120)
+    );
+    // 收尾：清掉本段造的 package
+    fs.rmSync(path.join(ROOT, "extensions/kiro.kiro-agent/packages/kiro-ui-agent-chat"), { recursive: true, force: true });
+  }
+
   // ------------------------------------------------------------ G
   section("G 激活闸");
   const G = require(path.join(BUILD, "activationGate.js"));
