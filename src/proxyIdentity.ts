@@ -96,6 +96,30 @@ export function hasIdentityKey(): boolean {
   return !!identityKey;
 }
 
+/**
+ * 密钥加载的「进行中」状态（早绑端口用）：激活时端口先于密钥绑定，密钥读盘期间到达的握手
+ * （探测 / 应答 / 让位）要等它落地，否则身份应答会缺 `sig`（≥ SIGNED_IDENTITY_SINCE 的对端会把我们当外部进程），
+ * 合法的签名让位也会被 403。没人调用 setIdentityKeyPending 时恒为就绪（测试 / 直接 setIdentityKey 的行为不变）。
+ */
+let keyReady: Promise<void> = Promise.resolve();
+let keyPending = false;
+
+export function setIdentityKeyPending(p: Promise<unknown>): void {
+  keyPending = true;
+  keyReady = p
+    .then(
+      () => undefined,
+      () => undefined
+    )
+    .finally(() => {
+      keyPending = false;
+    });
+}
+
+export function identityKeyReady(): Promise<void> {
+  return keyReady;
+}
+
 function hmacHex(payload: string): string | undefined {
   return identityKey ? crypto.createHmac("sha256", identityKey).update(payload).digest("hex") : undefined;
 }
@@ -202,6 +226,26 @@ export function serveIdentity(
     return false;
   }
 
+  // 密钥还在读盘（早绑端口后的几毫秒窗口）：路径判定仍同步返回 true，应答等密钥落地再发，
+  // 这样 sig 与让位验签都用得上真密钥。客户端已走则不再写。
+  if (keyPending) {
+    void keyReady.then(() => {
+      if (!res.destroyed && !res.writableEnded) {
+        answerIdentity(query, res, role, headers);
+      }
+    });
+    return true;
+  }
+  answerIdentity(query, res, role, headers);
+  return true;
+}
+
+function answerIdentity(
+  query: string | undefined,
+  res: http.ServerResponse,
+  role: string,
+  headers?: http.IncomingHttpHeaders
+): void {
   const mine = getExtensionVersion();
   const params = new URLSearchParams(query || "");
   const yieldTo = params.get("yieldTo");
@@ -229,7 +273,7 @@ export function serveIdentity(
     warn(`${role.toUpperCase()} 拒绝未鉴权的让位请求（yieldTo=${short(yieldTo)}）：${refusal}，端口不释放`);
     res.writeHead(403, { "Content-Type": "application/json" });
     res.end(JSON.stringify(body));
-    return true;
+    return;
   }
 
   res.writeHead(200, { "Content-Type": "application/json" });
@@ -239,7 +283,6 @@ export function serveIdentity(
     // 先让响应写出去再关服务器，否则对端可能收到 RST 而判定探测失败。
     setTimeout(() => yielders.get(role)?.(), 50);
   }
-  return true;
 }
 
 // ---------------------------------------------------------------- 探测端
@@ -290,7 +333,9 @@ function authenticPeer(id: ProxyIdentity, role: string, nonce: string, port: num
  * `yieldTo`：请求对方让位；`serverNonce` 是上一次探测应答里对方给的 nonce，有它（且本实例有密钥）
  * 让位请求才带签名头——旧版对端不给 nonce，也不看头，行为与之前一致。
  */
-export function probeIdentity(port: number, role: string, yieldTo?: string, serverNonce?: string): Promise<ProxyIdentity | null> {
+export async function probeIdentity(port: number, role: string, yieldTo?: string, serverNonce?: string): Promise<ProxyIdentity | null> {
+  // 早绑端口后密钥可能还在读盘：探测的验签 / 让位签名都要用它，所以在这里（而不是 bindOnce）才等。
+  await keyReady;
   const myNonce = crypto.randomBytes(16).toString("hex");
   const params = new URLSearchParams();
   if (yieldTo) {

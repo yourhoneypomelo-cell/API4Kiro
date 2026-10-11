@@ -143,7 +143,7 @@ Kiro 视图标题栏最右侧有两枚命令图标（4.13.56）：**GitHub 标**
 | --- | --- |
 | `extensions/kiro.kiro-agent/packages/*/dist/style.css` | 模型选择器分组标题 / 卡片样式、弹层样式、Ctx 下拉样式（逐份：CSS 只作用于同一个 webview 文档） |
 | `extensions/kiro.kiro-agent/packages/*/dist/assets/mermaid-*.js` | 模型选择器组头 / 能力徽章（1.1 选项行；1.2 模型面板行）、Context Usage 弹层、Ctx 下拉（1.1 在 Effort 旁，1.2 在模型触发器旁） |
-| `extensions/kiro.kiro-agent/dist/extension.js` | 模型刷新钩子（「通道 A」静默刷新）、`a2k:ctx` 挡位转发钩子 |
+| `extensions/kiro.kiro-agent/dist/extension.js` | 模型刷新钩子（「通道 A」静默刷新）、`a2k:ctx` 挡位转发钩子、usage-limits 启动重试钩子（本地端口 ECONNREFUSED 时重试并不弹 toast） |
 
 > **（4.13.64）适配 Kiro 1.2.56**：后端钩子、端点重定向、CPS / KRS 在 1.2.56 上照常工作，坏的全在 webview 补丁，三个成因互相独立：① 模型选择器被整个重写成带搜索框 / 勾选列 / Effort 滑条的模型面板（`ModelPanel` / `ModelOptionRow`），1.1 代的选项行 / 菜单 / ref 锚点全部消失，补丁全有或全无地放弃，于是 `__A2K_GRP__|…` / `__A2K_MDL__|…` 微格式直接显示在面板的描述行里；现在新增 1.2 代路径，只改行组件的 props（分组标题不可选中、描述换成卡片头 / 能力徽章），并在 `writeModel` 入口拦下分组标题。② `EffortSelector` 组件被删（Effort 挪进面板），「Ctx」下拉改挂在模型触发器右边。③ 结构匹配器把成员访问的属性名（`ne.c(30)` 的 `.c`）也当成可改名标识符，1.2.56 恰好把局部 `c` / `u` 对调，弹层函数 0 命中；属性名现按字面量处理。**session-details 那份的 Context Usage 弹层在 1.2.56 上保持原生**（jsx 运行时名不是 `b`，见 ARCHITECTURE「已知限制」）。**与 `kiro-proxy.kiro-api-proxy` 同时启用会争抢 `codewhisperer.config.*Endpoints`，两者也改同一份 chunk 与 `extension.js`**，请只开一个。
 
@@ -151,8 +151,8 @@ Kiro 视图标题栏最右侧有两枚命令图标（4.13.56）：**GitHub 标**
 
 设计约束：
 
-- **可逆**：每段补丁带 `a2k` 标记；被替换的函数原文以 base64 随身携带，复原时精确回填。关闭代理或关闭 `api2kiroDual.groupHeaderStyle` 即移除。
-- **不写死压缩名，也不写死名字助手**：Kiro 自动升级会改变压缩后的函数名，补丁按代码结构匹配、名字用正则捕获，全有或全无——任一靶点漂移则三处都不写，绝不留下半套。1.1.14 的两个实例说明这条要贯彻到底：`useSessionConfig` 的反查原先把名字助手写死成 `a(`，而 session-details 那份是 `o(`；注入段的模板自带短局部名（`const k`）又撞上那份的 jsx 运行时名 `k` —— 两者都会让整条补丁被拒。
+- **可逆**：每段补丁带 `a2k` 标记；被替换的函数原文以 base64 随身携带，复原时精确回填；插入型钩子用 `/*a2k-…:start*/…/*a2k-…:end*/` 定界、删段复原。关闭代理或关闭 `api2kiroDual.groupHeaderStyle` 即移除。
+- **不写死压缩名，也不写死名字助手**：Kiro 自动升级会改变压缩后的函数名，补丁按代码结构匹配、名字用正则捕获，全有或全无——任一靶点漂移则三处都不写（Ctx 下拉 / 宿主转发 / usage 重试为可选组，漂移只跳过自身），绝不留下半套。1.1.14 的两个实例说明这条要贯彻到底：`useSessionConfig` 的反查原先把名字助手写死成 `a(`，而 session-details 那份是 `o(`；注入段的模板自带短局部名（`const k`）又撞上那份的 jsx 运行时名 `k` —— 两者都会让整条补丁被拒。
 - **升级自愈**：Kiro 升级覆盖了靶文件后，下次激活自动重新打补丁并提示重载一次。
 - **停用后的状态**：为避免每次重载都把钩子抹掉（kiro-agent 先于本扩展加载磁盘文件），窗口关闭时三份文件保持补丁态；此时没有本扩展运行，补丁对 Kiro 原生行为无可见影响。
 - **验证**：`node dev/verify-selector-patch.js [Kiro appRoot]` 用**真机安装目录的只读副本**跑结构命中 / 唯一性 / 改名守卫 / 幂等 / 往返复原 / 多 package 覆盖 / Ctx 下拉逐份「能注入且真能渲染」（当前 100+ 项全过，脚本自报数字为准）。

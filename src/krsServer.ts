@@ -66,6 +66,7 @@ import {
 import { debug, error, info } from "./log";
 import { serveIdentity } from "./proxyIdentity";
 import { applyGuard } from "./requestGuard";
+import { holdUntilReady } from "./activationGate";
 import { addRequestUsage, beginTurn, takeTurnTotals } from "./turnLedger";
 import { StreamError, buildMeteringEvents, stopReasonEvent, streamErrorStatus, streamErrorText } from "./streamShared";
 import {
@@ -296,6 +297,12 @@ export class KrsProxyServer {
       return;
     }
 
+    // 早绑端口（activate 最前面就 listen）后，KRS 的全部路由都依赖后面才初始化的 token / 用量 / 提示词 / 端点等模块：
+    // 激活没跑完就扣住（请求体保持暂停），放行才派发；激活失败 / 超时回 503，不派发进半初始化状态。
+    holdUntilReady(req, res, () => this.dispatch(req, res, url, method));
+  }
+
+  private dispatch(req: http.IncomingMessage, res: http.ServerResponse, url: string, method: string): void {
     // 客户端断开要在这里就开始听：`close` 事件不重放，等上游回了头再挂监听就漏掉了「响应头之前」的取消。
     // 正常结束（我们先 end）也会发 close，用 writableEnded 区分开。
     const client: ClientLink = { closed: false };

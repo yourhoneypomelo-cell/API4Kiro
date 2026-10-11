@@ -7,6 +7,7 @@ import { getActiveProviders, getProvider, kiroModelIds, providerIconId } from ".
 import { debug, error, info } from "./log";
 import { serveIdentity } from "./proxyIdentity";
 import { applyGuard } from "./requestGuard";
+import { holdUntilReady } from "./activationGate";
 import {
   fetchRelayModels,
   groupModelsByEffort,
@@ -415,19 +416,23 @@ export class CpsProxyServer {
     // Model list
     if (op === "listavailablemodels" || pathKey.includes("availablemodels")) {
       req.resume();
-      const t0 = Date.now();
-      this.buildModelList()
-        .then((list) => {
-          // 这一步慢了 Kiro 会超时 → 空列表 → 选择器消失，所以把耗时记进日志方便排查
-          info(`cps models: ${list.models.length} 条，用时 ${Date.now() - t0}ms`);
-          res.writeHead(200, { "Content-Type": contentType });
-          res.end(JSON.stringify(list));
-        })
-        .catch((e) => {
-          error("buildModelList failed:", (e as Error)?.message);
-          res.writeHead(200, { "Content-Type": contentType });
-          res.end(JSON.stringify({ models: [] }));
-        });
+      // 早绑端口后模型列表依赖的 provider / token / 目录可能还没初始化：扣到激活完成再建（失败 / 超时回 503）。
+      // 上面的 profile 与下面的 usage / 透传桩只依赖 isEnabled() 与常量，不扣，kiro-agent 启动期的 GetUsageLimits 立即有应答。
+      holdUntilReady(req, res, () => {
+        const t0 = Date.now();
+        this.buildModelList()
+          .then((list) => {
+            // 这一步慢了 Kiro 会超时 → 空列表 → 选择器消失，所以把耗时记进日志方便排查
+            info(`cps models: ${list.models.length} 条，用时 ${Date.now() - t0}ms`);
+            res.writeHead(200, { "Content-Type": contentType });
+            res.end(JSON.stringify(list));
+          })
+          .catch((e) => {
+            error("buildModelList failed:", (e as Error)?.message);
+            res.writeHead(200, { "Content-Type": contentType });
+            res.end(JSON.stringify({ models: [] }));
+          });
+      });
       return;
     }
 

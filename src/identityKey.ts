@@ -12,7 +12,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { warn } from "./log";
-import { setIdentityKey } from "./proxyIdentity";
+import { setIdentityKey, setIdentityKeyPending } from "./proxyIdentity";
 
 export const IDENTITY_KEY_FILE = "identity.key";
 const KEY_BYTES = 32;
@@ -84,6 +84,9 @@ function readKey(file: string): Buffer | undefined {
  * 探测对端时沿用旧的 token 判定（不比修复前更差）。返回是否载入成功。
  */
 export async function initIdentityKey(context: { globalStorageUri: { fsPath: string } }): Promise<boolean> {
+  // 第一条语句、同步执行：激活里端口先于密钥绑定，此后到达的握手（探测 / 身份应答 / 让位）要等密钥落地。
+  let done!: () => void;
+  setIdentityKeyPending(new Promise<void>((r) => (done = r)));
   try {
     setIdentityKey(await ensureKey(context.globalStorageUri.fsPath));
     return true;
@@ -93,5 +96,7 @@ export async function initIdentityKey(context: { globalStorageUri: { fsPath: str
     warn("identity key unavailable; yield requests will be refused until it is:", err?.code || err?.name || "error");
     setIdentityKey(undefined);
     return false;
+  } finally {
+    done();
   }
 }

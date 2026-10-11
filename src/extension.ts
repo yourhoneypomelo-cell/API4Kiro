@@ -13,7 +13,7 @@ import { CTX_CONFIG_ID, decodeCtxConfigValue } from "./contextWindow";
 import { checkForUpdate, GITHUB_URL, installLatestFromGitHub } from "./updateChecker";
 import { openInBrowser } from "./openBrowser";
 import { getActiveProviders } from "./providers";
-import { initLog, showLog, info, error, warn } from "./log";
+import { initLog, showLog, info, error, warn, debug } from "./log";
 import { KrsProxyServer } from "./krsServer";
 import { CpsProxyServer } from "./cpsServer";
 import { applyOverrides, restoreAll, initEndpoints } from "./endpoints";
@@ -28,6 +28,7 @@ import { setOAuthClientVersion } from "./oauth/vendors";
 import { cancelAllLogins } from "./oauth";
 import { initIdentityKey } from "./identityKey";
 import { initClientIdentity } from "./clientIdentity";
+import { beginActivationGate, settleActivationGate } from "./activationGate";
 
 let krsServer: KrsProxyServer | undefined;
 let cpsServer: CpsProxyServer | undefined;
@@ -40,55 +41,88 @@ let reloadPrompted = false;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   initLog();
   initConfig(context);
-  // 多窗口握手（让位 / 对端认证）的共享密钥：同一用户的所有窗口读 globalStorage 下同一个文件。
-  // 必须在 startAndOverride 之前就位；失败只降级（拒绝一切让位、探测沿用旧判定），不阻塞激活。
-  await initIdentityKey(context);
-  // 本地改动：endpoints 需要 globalState 来暂存被覆盖前的 workspace 端点原值。
-  initEndpoints(context);
-  // 学到的"纯文本模型"名单也落 globalState，重启后不必再被 400 一次。
-  initImagePolicy(context);
-  // 自报家门的 UA + 安装级会话前缀：上游要 x-opencode-session 的通道（OpenCode Go）靠它，纯内存操作。
-  initClientIdentity(context);
-  // 模型能力目录（models.dev）：后台异步拉取，不阻塞激活。
-  initModelCatalog(context);
-  initCodexCatalog(context);
-  // 本地用量账本（用量页数据源）。
-  initUsageStore(context);
-  context.subscriptions.push({ dispose: () => void flushUsage() });
-  // 用户侧系统提示词（「提示词」页），翻译层每次请求读它注入 system。
-  initPromptStore(context);
-  // 第三方账号登录（Kimi / Codex / xAI / Antigravity / Anthropic）的 token：钥匙串里按 provider id 存，先于 provider 可用性判定加载。
-  await initTokenStore(context);
-  setOAuthClientVersion(String(context.extension.packageJSON.version || "0.0.0"));
-  context.subscriptions.push({
-    dispose: () => {
-      cancelAllLogins();
-      void flushTokens();
-    },
-  });
+  // 日志提前：早绑端口之后，"activating" 到 "CPS OWNER" 的间隔就是真实的绑定延迟。
   info("activating, version", context.extension.packageJSON.version);
+  usageRefreshFired = false;
 
-  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.command = "api2kiroDual.focusSidebar";
-  context.subscriptions.push(statusBar);
+  // 早绑端口：kiro-agent 是 extensionDependencies，比我们先激活，激活期就会打 CPS 的 usage 接口（持久化的
+  // cpsEndpoints 指向 127.0.0.1:19811）。端口晚绑就是一条 ECONNREFUSED toast，所以 KRS / CPS 并行、在一切慢初始化之前 listen。
+  // 全部路由里依赖后面才初始化的模块的（KRS 全部、CPS 模型列表）由激活闸扣住；CPS profile / usage / 透传桩不扣。
+  let serversUp: Promise<boolean> | undefined;
+  if (isEnabled()) {
+    beginActivationGate();
+    serversUp = startServers(context); // 同步前缀里已发出 listen()，不要在它前面加 await
+  }
+  // 多窗口握手（让位 / 对端认证）的共享密钥：同一用户的所有窗口读 globalStorage 下同一个文件。
+  // 晚于 listen() 加载是安全的：身份相关代码（probeIdentity / serveIdentity）最早也要等到下一轮事件循环才可能跑，
+  // 而 initIdentityKey 在这一轮同步就把「密钥加载中」标好了，握手会等它落地。失败只降级，不阻塞激活。
+  const keyInit = initIdentityKey(context);
+  try {
+    await keyInit;
+    // 本地改动：endpoints 需要 globalState 来暂存被覆盖前的 workspace 端点原值。
+    initEndpoints(context);
+    // 学到的"纯文本模型"名单也落 globalState，重启后不必再被 400 一次。
+    initImagePolicy(context);
+    // 自报家门的 UA + 安装级会话前缀：上游要 x-opencode-session 的通道（OpenCode Go）靠它，纯内存操作。
+    initClientIdentity(context);
+    // 模型能力目录（models.dev）：后台异步拉取，不阻塞激活。
+    initModelCatalog(context);
+    initCodexCatalog(context);
+    // 本地用量账本（用量页数据源）。
+    initUsageStore(context);
+    context.subscriptions.push({ dispose: () => void flushUsage() });
+    // 用户侧系统提示词（「提示词」页），翻译层每次请求读它注入 system。
+    initPromptStore(context);
+    // 第三方账号登录（Kimi / Codex / xAI / Antigravity / Anthropic）的 token：钥匙串里按 provider id 存，先于 provider 可用性判定加载。
+    await initTokenStore(context);
+    setOAuthClientVersion(String(context.extension.packageJSON.version || "0.0.0"));
+    context.subscriptions.push({
+      dispose: () => {
+        cancelAllLogins();
+        void flushTokens();
+      },
+    });
 
-  sidebar = new SidebarProvider(context, () => ({ krsPort, cpsPort }));
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(SidebarProvider.viewType, sidebar, {
-      webviewOptions: { retainContextWhenHidden: true },
-    })
-  );
+    statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBar.command = "api2kiroDual.focusSidebar";
+    context.subscriptions.push(statusBar);
 
-  registerCommands(context);
-  registerSessionConfigHook(context);
+    sidebar = new SidebarProvider(context, () => ({ krsPort, cpsPort }));
+    context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(SidebarProvider.viewType, sidebar, {
+        webviewOptions: { retainContextWhenHidden: true },
+      })
+    );
 
-  // 启动后静默查一次 GitHub 最新 Release（24h 一次、同版本不重复弹）；异步不阻塞激活，失败静默。
-  void checkForUpdate(context, { manual: false });
+    registerCommands(context);
+    registerSessionConfigHook(context);
+
+    // 启动后静默查一次 GitHub 最新 Release（24h 一次、同版本不重复弹）；异步不阻塞激活，失败静默。
+    void checkForUpdate(context, { manual: false });
+  } catch (e) {
+    // 激活中途抛错：已排队 / 早到的请求回 503（不派发进半初始化状态），早绑的服务器停掉，错误照旧上抛。
+    settleActivationGate(false);
+    if (serversUp) {
+      await serversUp;
+      await stopServers();
+    }
+    throw e;
+  }
+  settleActivationGate(true);
 
   if (isEnabled()) {
-    await startAndOverride(context, false);
+    // serversUp 为空 = 激活期间用户才打开了开关：现在补绑。
+    const ok = serversUp ? await serversUp : await startServers(context);
+    if (ok) {
+      await finishStartAndOverride(context, false);
+    }
     void syncGroupHeaderStyle(getGroupHeaderStyle()).then(afterStyleSync);
   } else {
+    if (serversUp) {
+      // 激活期间用户又把开关关了：撤掉早绑的服务器。
+      await serversUp;
+      await stopServers();
+    }
     await restoreAll();
     void syncGroupHeaderStyle(false).then(notifyStyleSync);
     updateStatusBar();
@@ -186,8 +220,12 @@ export async function deactivate(): Promise<void> {
 function afterStyleSync(result: StyleSyncResult): void {
   notifyStyleSync(result);
   const t = result.targets;
-  if (t.style === "applied" || t.selectorScript === "applied" || t.backend === "applied") {
+  const coreApplied = t.style === "applied" || t.selectorScript === "applied" || t.backend === "applied";
+  if (coreApplied) {
     promptReload("已写入 Kiro 外观补丁与模型刷新钩子", "Kiro 才会加载新外观，左侧改模型才会即时同步到右侧选择器");
+  } else if (result.extras.usageRetry === "applied") {
+    // 只写了 usage 重试钩子（targets.backend 不反映它）：同样要重载一次 kiro-agent 才会加载。promptReload 本身按宿主去重。
+    promptReload("已写入 kiro-agent 用量重试钩子", "kiro-agent 启动时才会等待本地端口，不再弹 ECONNREFUSED 提示");
   }
 }
 
@@ -211,25 +249,41 @@ function notifyStyleSync(result: StyleSyncResult): void {
   );
 }
 
-async function startAndOverride(context: vscode.ExtensionContext, fromToggle: boolean): Promise<void> {
+/**
+ * 只绑端口（CPS 与 KRS 并行）。构造与 start() 都在同步前缀里发出（第一个 await 之前），
+ * activate() 靠这一点保证 listen() 先于 initIdentityKey 发出——不要在前面加 await。
+ */
+async function startServers(context: vscode.ExtensionContext): Promise<boolean> {
   try {
     krsPort = getPort();
     cpsPort = getCpsPort();
-    if (!krsServer) {
-      krsServer = new KrsProxyServer(context, krsPort, () => onOwnershipChanged());
-      await krsServer.start();
-    }
+    const starts: Promise<void>[] = [];
     if (!cpsServer) {
       cpsServer = new CpsProxyServer(cpsPort, () => onOwnershipChanged());
-      await cpsServer.start();
+      starts.push(cpsServer.start());
     }
+    if (!krsServer) {
+      krsServer = new KrsProxyServer(context, krsPort, () => onOwnershipChanged());
+      starts.push(krsServer.start());
+    }
+    await Promise.all(starts);
+    return true;
   } catch (e) {
     error("failed to start servers:", (e as Error).message);
     void vscode.window.showErrorMessage("API4Kiro 启动本地代理失败：" + (e as Error).message);
     updateStatusBar();
-    return;
+    return false;
   }
+}
 
+async function startAndOverride(context: vscode.ExtensionContext, fromToggle: boolean): Promise<void> {
+  if (await startServers(context)) {
+    await finishStartAndOverride(context, fromToggle);
+  }
+}
+
+/** 服务器已起之后的收尾（端点劫持、状态栏、重载提示、一次性 usage 刷新）。 */
+async function finishStartAndOverride(context: vscode.ExtensionContext, fromToggle: boolean): Promise<void> {
   // 起服务器期间用户可能又把 enabled 关掉了（排队中的下一条回调会 stop + restore）：
   // 收尾前复核，别把端点劫持到一个马上就要停的服务器上。
   if (!isEnabled()) {
@@ -264,6 +318,7 @@ async function startAndOverride(context: vscode.ExtensionContext, fromToggle: bo
   if (changed || fromToggle) {
     promptReload("代理已启用");
   }
+  maybeRefreshKiroUsage();
 }
 
 /** Called when this window's PortHolder gains ownership (a former owner exited). */
@@ -271,6 +326,31 @@ function onOwnershipChanged(): void {
   info("ownership changed; this window is now (or still) serving requests");
   updateStatusBar();
   sidebar?.postAll();
+  maybeRefreshKiroUsage();
+}
+
+let usageRefreshFired = false;
+
+/**
+ * CPS 在本宿主第一次成为 OWNER 时，让 kiro-agent 重新拉一次用量（一次性、不等结果）：它启动期那次请求可能
+ * 落在我们绑端口之前并失败，这里补一次让它的用量状态与 UI 刷新。命令不存在 / 未登录都只记 debug。
+ * 每次激活只触发一次；STANDBY 窗口在第一次接管时触发。
+ */
+function maybeRefreshKiroUsage(): void {
+  if (usageRefreshFired || !cpsServer?.isOwner()) {
+    return;
+  }
+  usageRefreshFired = true;
+  info("CPS is OWNER; asking kiro-agent to refresh usage limits once");
+  const onFail = (e: unknown) => debug("kiro usage refresh failed:", (e as Error)?.message ?? String(e));
+  try {
+    Promise.resolve(vscode.commands.executeCommand("kiro.usageLimits.getUsageLimits")).then(
+      () => debug("kiro usage refresh done"),
+      onFail
+    );
+  } catch (e) {
+    onFail(e);
+  }
 }
 
 async function stopServers(): Promise<void> {

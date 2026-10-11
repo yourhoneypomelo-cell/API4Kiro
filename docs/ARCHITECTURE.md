@@ -78,7 +78,7 @@ flowchart LR
 | `sidebar.ts` | Webview 四页模板与图表（趋势、六层 Sankey、路径条、设置页 MCP / 子代理 / 上下文卡） | 各 store, providerProbe, ccSwitchImport, mcpConfig, agentConfig, contextWindow, updateChecker |
 | `mcpConfig.ts` | 直管 Kiro 两份 mcp.json：容错 JSONC、原子写、备份、监听 | fs |
 | `agentConfig.ts` | 直管两级自定义 agent 文件（md / json），写回保留未知块 | fs |
-| `selectorStyle.ts` | Kiro 三处靶文件的补丁 / 复原 / 漂移检测；通道 A 刷新；聊天框 Ctx 下拉与宿主转发钩子 | Kiro 安装目录文件 |
+| `selectorStyle.ts` | Kiro 三处靶文件的补丁 / 复原 / 漂移检测；通道 A 刷新；聊天框 Ctx 下拉与宿主转发钩子；usage 重试钩子 | Kiro 安装目录文件 |
 | `updateChecker.ts` | GitHub Release 更新检查与自更新（下载 vsix → 校验 → installExtension） | https |
 | `eventstream.ts` / `cwEvents.ts` / `cwTypes.ts` | CodeWhisperer 协议编解码与类型 | 无 |
 
@@ -111,7 +111,7 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 | --- | --- |
 | `extensions/kiro.kiro-agent/packages/*/dist/style.css` | 分组标题 / 卡片 / 弹层 / Ctx 下拉样式（全部限定在扩展自己的类名作用域内；CSS 只作用于同一个 webview 文档，所以逐 package 各落一份） |
 | `extensions/kiro.kiro-agent/packages/*/dist/assets/mermaid-*.js` | 选择器组头 / 能力徽章渲染（1.1 选项行；1.2 模型面板行）；Context Usage 弹层改为读 description 里的真实窗口；「Ctx」挡位下拉（1.1 在 Effort 旁，1.2 在模型触发器旁） |
-| `extensions/kiro.kiro-agent/dist/extension.js` | 在模型配置 provider 的 setter 上挂钩子，暴露给同宿主的本扩展，用于「通道 A」静默刷新；`a2k:ctx` 挡位转发 |
+| `extensions/kiro.kiro-agent/dist/extension.js` | 在模型配置 provider 的 setter 上挂钩子，暴露给同宿主的本扩展，用于「通道 A」静默刷新；`a2k:ctx` 挡位转发；usage-limits 重试钩子（`kiro.usageLimits.getUsageLimits` 遇回环 ECONNREFUSED 每 500 ms 重试、预算 10 s，耗尽只记 warn 不弹 toast） |
 
 **靶点发现（1.1.14 起）**：按**内容**而不是文件名认 chunk —— Kiro 1.1.14 把聊天界面拆到 `kiro-ui-session-details`，承载模型选择器的同一个 chunk（同名 base `mermaid-GHXKKRXX`、不同 hash、大小 1.87 MB vs 2.22 MB）在各 package 下各有一份且**独立压缩**。`selectorPackages()` 先用类名字面量 `chat-input-popup-option` 筛 `mermaid-*`，该 package 一份都不命中时**回退扫全部 `assets/*.js`**（文件名是 Kiro 内部的偶然命名，换名时不该整组静默失效），随后 chunk 与同 package 的 `style.css` 逐份处理。
 
@@ -127,12 +127,12 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 
 约束与机制：
 
-- **结构匹配，不写死压缩名**。Kiro 自动升级会改变压缩后的标识符（1.0.411 → 1.0.437 → 1.1.14 每次都重排），补丁模板把标识符换成正则捕获组按结构匹配；调用处以捕获到的名字渲染。三处靶点**全有或全无**：任一漂移或写入失败则三处都不写，不留半套。成员访问的属性名（`ne.c(30)` 的 `.c`）按字面量处理、不参与改名映射（4.13.64：1.2.56 把局部 `c` / `u` 对调，旧分词把属性 `.c` 与局部 `c` 算成同一个名字，弹层函数 0 命中）。
+- **结构匹配，不写死压缩名**。Kiro 自动升级会改变压缩后的标识符（1.0.411 → 1.0.437 → 1.1.14 每次都重排），补丁模板把标识符换成正则捕获组按结构匹配；调用处以捕获到的名字渲染。三处靶点**全有或全无**：任一漂移或写入失败则三处都不写，不留半套（Ctx 下拉 / 宿主转发 / usage 重试为可选组，漂移只跳过自身，不计入全有或全无，状态单独经 `extras` 上报）。成员访问的属性名（`ne.c(30)` 的 `.c`）按字面量处理、不参与改名映射（4.13.64：1.2.56 把局部 `c` / `u` 对调，旧分词把属性 `.c` 与局部 `c` 算成同一个名字，弹层函数 0 命中）。
 - **逐 package 记账，半套不许报成功**（4.13.63）。1.1.14 起同一份 chunk 在多个 package 各有一份、各自独立压缩，所以「成没成」逐份回答：任一承载 package 没打上就报 `unavailable` 并**点名**落地 / 漏掉的 package；`CARD_CSS` 也逐份决定（只给拿到补丁的那份加），一份漂移不牵连另一份，也不会留下「改了外观没功能」的半套。可选组（Ctx 下拉）同理：一份不全中就不报 `applied`。
 - **连名字助手也不能写死**。`resolveTaggedName` 原先按 `a(<压缩名>,"<原名>")` 反查，而 1.1.14 的 session-details 那份是 `o(C1,"useSessionConfig")` —— 该视图的 Ctx 下拉因此整体不注入。现在先按历史形态找、不中再放宽到任意助手名（仍要求唯一命中）。
 - **注入段自带标识符必须与压缩名不可能相撞**。`namesCollide` 会在真机名与模板里任一**代码**标识符同名时拒绝整条补丁（防遮蔽 / TDZ；字符串 / 注释里的词不参与判定）。所以 A2kContextSelector 模板里属于扩展自己的标识符（含内部对象键）一律 `a2k` 前缀：压缩器只产出 `a–z / A–Z / aa…` 形态，`a2k*` 永不出现。
 - **原文随身**。替换函数体时把出厂原文以 base64 写进 `a2k-orig:` 块注释，复原时解码回填并校验；CSS 与选项行用锚点式复原，不依赖当前补丁串逐字匹配。写盘走原子写入。
-- **触发时机**。启用代理 / 打开样式开关 / Kiro 升级覆盖后首次激活 → 打补丁并提示重载一次；关闭代理 / 关闭 `groupHeaderStyle` → 三处复原。
+- **触发时机**。启用代理 / 打开样式开关 / Kiro 升级覆盖后首次激活 → 打补丁并提示重载一次；关闭代理 / 关闭 `groupHeaderStyle` → 三处复原。另：`activate()` 在 `initConfig` 之后立刻并行绑 CPS / KRS 端口（先于身份密钥、tokenStore 等慢初始化；密钥懒加载，只有占用探测 / 让位路径等它），`activationGate` 扣住 KRS 全部路由与 CPS 模型列表直到激活完成（失败 / 超时回 503），CPS 的 usage 桩不扣，使 kiro-agent 启动期的 `GetUsageLimits` 尽早得到应答；CPS 首次成为 OWNER 后一次性触发 `kiro.usageLimits.getUsageLimits` 刷新。
 - **为什么窗口关闭时不复原**。kiro-agent 是本扩展的依赖，总是先激活并直接 `require` / `<link>` 磁盘上的文件；如果在 `deactivate` 里复原，下一个窗口的 kiro-agent 拿到的永远是出厂文件，钩子永远不可达。所以窗口关闭时三份文件保持补丁态；没有本扩展运行时，补丁对 Kiro 原生行为无可见影响。
 
 「通道 A」：面板里增删模型或改顺序后，扩展通过钩子调用 kiro-agent 的模型配置刷新（`refreshWithOutcome`，退化为 `refresh`），Kiro 右侧选择器不重载即更新；钩子不可达时才退回「提示重载窗口」。

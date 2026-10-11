@@ -18,6 +18,9 @@ export type TargetStatus = "applied" | "removed" | "unchanged" | "unavailable";
 /** 4.13.55 可选组：聊天框「上下文」下拉（mermaid）与 setSessionConfigOption 宿主转发钩子（dist/extension.js）。 */
 export type CtxTargetKey = "ctxSelector" | "ctxHost";
 export type CtxExtras = Record<CtxTargetKey, TargetStatus>;
+/** 可选组靶点的全集：上下文挡位两处 + kiro-agent usage-limits 启动重试钩子（dist/extension.js）。 */
+export type ExtraKey = CtxTargetKey | "usageRetry";
+export type SyncExtras = Record<ExtraKey, TargetStatus>;
 
 export type StyleSyncResult = {
   status: TargetStatus;
@@ -27,8 +30,9 @@ export type StyleSyncResult = {
   /**
    * 可选组的结果（4.13.55）：靶点不命中只报 `unavailable`，不影响 `status` / `targets`——既有三处 + 弹层照常打；
    * 该文件本轮写失败时随所属靶点一起报 `unavailable`。
+   * `usageRetry`（kiro-agent usage-limits 启动重试）同属可选组，且从不改变 `targets.backend`。
    */
-  extras: CtxExtras;
+  extras: SyncExtras;
 };
 
 function styleFile(): string {
@@ -627,13 +631,14 @@ type TargetResult = { status: TargetStatus; detail?: string };
 /**
  * 一份 Kiro 文件的写入计划（4.13.53 起三处靶点先全部算完再落盘）：`original` 是本轮读到的磁盘内容，`next` 是应写入的内容，
  * 相等则本轮不碰该文件。`original` 同时是提交失败时的回滚依据（不依赖仓内出厂串，任何 Kiro 版本都能回到本轮读到的状态）。
+ * `log` 可选：提交成功时的日志覆盖，用于文件改动与靶点状态不一致的场景（只动了 usage 钩子段）。
  */
-type FilePlan = { file: string; original: string; next: string };
+type FilePlan = { file: string; original: string; next: string; log?: string };
 /**
  * 一个靶点的计划：`status` 是「全部写成功后」应报的状态；`files` 是该靶点涉及的文件（mermaid 可能多份）；
  * `extras` 是该文件里可选组靶点（4.13.55）的状态。
  */
-type TargetPlan = { status: TargetStatus; detail?: string; files: FilePlan[]; extras?: Partial<CtxExtras>; packages?: SelectorPkgState[] };
+type TargetPlan = { status: TargetStatus; detail?: string; files: FilePlan[]; extras?: Partial<SyncExtras>; packages?: SelectorPkgState[] };
 
 /**
  * 逐 package 的补丁落地状态。
@@ -1143,8 +1148,15 @@ const POPOVER_FACTORY_CANON = ["Bde", "Pde", "z"];
 const POPOVER_TAG_SUFFIX = 'a(Bde,"ContextUsagePopover");';
 /** 弹层函数体的规范模板（= 规范串去掉尾部 displayName 标签），结构匹配以它为准。 */
 const POPOVER_FACTORY_BODY_CANON = ORIG_POPOVER_PATTERN.replace('a(Bde,"ContextUsagePopover");', "");
-/** PATCHED_POPOVER_CODE 里需要换成实际名的三个外部名：弹层函数、警告文案函数、useSessionConfig。 */
-const POPOVER_PATCH_CANON = ["Bde", "Pde", "l0"];
+/**
+ * PATCHED_POPOVER_CODE 里需要换成实际名的外部名：弹层函数、警告文案函数、useSessionConfig、React Compiler 运行时。
+ *
+ * 第 4 个 `re` 是 `re.c(30)` 里的 React Compiler 运行时命名空间（压缩名，各版本不同：1.1.14 / 1.2.56 是 `ne`）。
+ * 4.13.64 及以前漏了它：补丁里的 `re.c(30)` 原样落地，而 1.2.56 里顶层的 `re` 是另一个函数
+ * （`function re(t){const e=C.useContext(...)`），于是 Context Usage 弹层一渲染就抛
+ * `re.c is not a function`，整个 webview 掉进 "Something went wrong"。
+ */
+const POPOVER_PATCH_CANON = ["Bde", "Pde", "l0", "re"];
 /** 补丁模板的**函数体**（不含尾部标签）：标签按真机助手名单独拼，不参与模板改名（见下）。 */
 const PATCHED_POPOVER_BODY = PATCHED_POPOVER_CODE.endsWith(POPOVER_TAG_SUFFIX)
   ? PATCHED_POPOVER_CODE.slice(0, -POPOVER_TAG_SUFFIX.length)
@@ -1337,21 +1349,35 @@ async function planKiroAgentBackend(enabled: boolean): Promise<TargetPlan> {
   try {
     original = await fs.promises.readFile(file, "utf8");
   } catch {
-    return { status: "unavailable", files: [] };
+    // 非 Kiro 宿主：没有文件可改，usageRetry 也不算漂移（不打漂移日志）。
+    return { status: "unavailable", files: [], extras: { usageRetry: "unchanged" } };
   }
   await sweepStaleTmp(file);
-  let content = restoreCtxHostHook(restoreBackendHook(original));
+  let content = restoreUsageHook(restoreCtxHostHook(restoreBackendHook(original)));
   if (enabled) {
     content = applyBackendHook(content);
     // 可选组的宿主钩子只在主钩子（通道 A）打上时才打：没有通道 A，聊天框改挡位也到不了 Kiro 的下一轮列表；
     // 主钩子漂移时文件一字不写，targets.backend 仍按老口径报 unavailable。
     if (/__kiroModelConfigProvider=t/.test(content)) content = applyCtxHostHook(content);
+    // usage 重试钩子与通道 A 无关（A2），独立打；锚点漂移只跳过自己。
+    content = applyUsageHook(content);
   }
-  const extras = { ctxHost: ctxStatus(enabled, original.includes("__a2kSessionConfigOption"), content.includes("__a2kSessionConfigOption")) };
-  if (content !== original) return { status: enabled ? "applied" : "removed", files: [{ file, original, next: content }], extras };
-  // 开启但结构锚点找不到、文件里也没有任何版本的钩子：Kiro 版本漂移，静默放行、不写文件。
-  if (enabled && !/__kiroModelConfigProvider=t/.test(content)) return { status: "unavailable", files: [], extras };
-  return { status: "unchanged", files: [], extras };
+  const mainHooked = /__kiroModelConfigProvider=t/.test(content);
+  // targets.backend 不看 usage 段（FR-1.7）：只有主钩子 / ctx 宿主钩子的改动才算 applied / removed。
+  const coreChanged = restoreUsageHook(content) !== restoreUsageHook(original);
+  const usageBefore = original.includes(USAGE_START);
+  const usageAfter = content.includes(USAGE_START);
+  const status: TargetStatus = enabled ? (mainHooked ? (coreChanged ? "applied" : "unchanged") : "unavailable") : coreChanged ? "removed" : "unchanged";
+  const extras = {
+    ctxHost: ctxStatus(enabled, original.includes("__a2kSessionConfigOption"), content.includes("__a2kSessionConfigOption")),
+    usageRetry: ctxStatus(enabled, usageBefore, usageAfter),
+  };
+  // 开启但结构锚点找不到、文件里也没有任何版本的钩子：Kiro 版本漂移，静默放行、不写文件（content === original）。
+  if (content === original) return { status, files: [], extras };
+  // 提交日志要与实际改动一致：只动了 usage 段 → 只报 usage；两者都动 → 合并；只动主钩子 / ctx → 沿用 TARGET_LOG。
+  const usageLog = enabled ? "hooked kiroAgent usage-limits retry" : "restored kiroAgent usage-limits retry";
+  const log = !coreChanged ? usageLog : usageBefore !== usageAfter ? `${status === "removed" ? TARGET_LOG.backend.off : TARGET_LOG.backend.on} + ${usageLog}` : undefined;
+  return { status, files: [{ file, original, next: content, ...(log ? { log } : {}) }], extras };
 }
 
 /**
@@ -1588,6 +1614,119 @@ function ctxStatus(enabled: boolean, before: boolean, after: boolean): TargetSta
 }
 
 // ============================================================================
+// usage-limits 启动重试钩子（4.13.65，可选组 usageRetry）：kiro-agent 是本扩展的 extensionDependencies，比我们先激活，
+// 它在激活期调用 `kiro.usageLimits.getUsageLimits`，打到上一次会话写进设置的 CPS 端点（127.0.0.1:19811）时我们还没绑端口，
+// 得到 ECONNREFUSED，且它不重试，直接弹一条（5 分钟限频的）错误 toast。
+// 钩子两处纯插入，用 /*a2k-usage:start*/…/*a2k-usage:end*/ 定界，还原 = 删段（与 ctx / row 同一套路，不用 a2k-orig）：
+//   A. 把 `()=>u.send(d)` 包成 `()=>(重试函数)(()=>u.send(d))`：回环地址 ECONNREFUSED 时每 500ms 重发一次，预算 10s；
+//      耗尽后在错误对象上打 `__a2kLocalRefused` 标记（打不上 = 保持原行为，照常弹 toast）。
+//   B. catch 里 `…:(X.error(h),WEf(h))` 的 `:` 之后插 `f&&f.__a2kLocalRefused?X.warn(h):`，带标记的错误只记 warn、不弹 toast。
+// 其余错误（非回环 ECONNREFUSED、HTTP 5xx 等）走原路径，行为逐字不变。
+// 状态只通过 extras.usageRetry 上报，绝不改 targets.backend；锚点漂移只跳过自己，不影响其它钩子。
+// ============================================================================
+
+const USAGE_START = "/*a2k-usage:start*/";
+const USAGE_END = "/*a2k-usage:end*/";
+const USAGE_SEGMENT_RE = /\/\*a2k-usage:start\*\/[\s\S]*?\/\*a2k-usage:end\*\//g;
+const USAGE_SEGMENT_MAX = 4000;
+/** 处理函数注册串与错误文案串之间的最大距离（实测 588）。 */
+const USAGE_HANDLER_SPAN = 1500;
+const USAGE_REG = '"kiro.usageLimits.getUsageLimits",async';
+const USAGE_LIT = "`Unable to fetch account usage data";
+
+/**
+ * 重试函数的源码（一个 `async a2kRun=>{…}` 表达式）。自己声明的标识符全带 `a2k` 前缀，只引用全局
+ * （Date / setTimeout / Promise / Object / String），所以不需要 namesCollide。文本里不得出现星号加斜杠（定界注释会被提前截断）。
+ */
+function renderUsageRetry(delayMs = 500, budgetMs = 10000): string {
+  return String.raw`async a2kRun=>{const a2kLocal=a2kE=>{if(!a2kE)return!1;const a2kM=String(a2kE.message||"");const a2kRefused=a2kE.code==="ECONNREFUSED"||/ECONNREFUSED/.test(a2kM);const a2kLoop=/^(?:127\.|::1$|::ffff:127\.|localhost$)/.test(String(a2kE.address||""))||/(?:127(?:\.\d{1,3}){3}|localhost|\[?::1\]?):\d{1,5}/.test(a2kM);return a2kRefused&&a2kLoop};const a2kEnd=Date.now()+${budgetMs};for(;;){try{return await a2kRun()}catch(a2kE){if(!a2kLocal(a2kE))throw a2kE;if(Date.now()+${delayMs}>a2kEnd){try{Object.defineProperty(a2kE,"__a2kLocalRefused",{value:!0})}catch(a2kX){}throw a2kE}await new Promise(a2kR=>setTimeout(a2kR,${delayMs}))}}}`;
+}
+
+type UsageHookHit = {
+  /** 插入点 A 的前缀 / 后缀位置（thunk 体 `u.send(d)` 的起止），插入点 B（catch 里 `:` 之后）。 */
+  sendStart: number;
+  sendEnd: number;
+  catchAt: number;
+  errVar: string;
+  msgVar: string;
+  logger: string;
+};
+
+function countOccurrences(content: string, needle: string): number {
+  let n = 0;
+  for (let at = content.indexOf(needle); at >= 0; at = content.indexOf(needle, at + needle.length)) n++;
+  return n;
+}
+
+/**
+ * 在**出厂（已还原）**内容里定位 usage-limits 处理函数的三个插入点；任一条件不满足返回 null（整个钩子跳过，不留半截改动）。
+ * 全部结构锚定，压缩名一律捕获：见 02-design 的 Matching 六步。
+ */
+function findUsageHook(content: string): UsageHookHit | null {
+  if (countOccurrences(content, USAGE_REG) !== 1) return null;
+  if (countOccurrences(content, USAGE_LIT) !== 1) return null;
+  const r = content.indexOf(USAGE_REG);
+  const l = content.indexOf(USAGE_LIT);
+  if (!(r < l && l - r <= USAGE_HANDLER_SPAN)) return null;
+
+  // 3. 处理函数片段里恰好一处 `xW("GetUsageLimits",l,()=>u.send(d))`
+  const handler = content.slice(r, l);
+  const sends = [...handler.matchAll(new RegExp(`(?<![\\w$])(${IDENT_SRC})\\("GetUsageLimits",(${IDENT_SRC}),\\(\\)=>((${IDENT_SRC})\\.send\\((${IDENT_SRC})\\))\\)`, "g"))];
+  if (sends.length !== 1) return null;
+  const sm = sends[0];
+  const sendEnd = r + (sm.index as number) + sm[0].length - 1; // 紧挨着收尾的 `)` 之前
+  const sendStart = sendEnd - sm[3].length;
+  // 3a. 置信度检查：命令变量确实是在本片段里 new 出来的 GetUsageLimitsCommand
+  const cmd = escapeRe(sm[5]);
+  if (!handler.includes("GetUsageLimitsCommand") || !new RegExp(`(?<![\\w$])${cmd}=new [\\w$.]*\\(`).test(handler)) return null;
+
+  // 4. catch 头：`catch(f){let h=` 正好收在错误文案字面量前
+  const head = new RegExp(`catch\\((${IDENT_SRC})\\)\\{let (${IDENT_SRC})=$`).exec(content.slice(Math.max(0, l - 80), l));
+  if (!head) return null;
+  const errVar = head[1];
+  const msg = escapeRe(head[2]);
+
+  // 5. 错误 / toast 分支：`?X.warn(h):(X.error(h),WEf(h))}` 恰好一处
+  const tailRe = new RegExp(`\\?(${IDENT_SRC})\\.warn\\(${msg}\\):\\(\\1\\.error\\(${msg}\\),(${IDENT_SRC})\\(${msg}\\)\\)\\}`, "g");
+  const tails = [...content.slice(l, l + 1200).matchAll(tailRe)];
+  if (tails.length !== 1) return null;
+  const tm = tails[0];
+  const logger = tm[1];
+  const toast = tm[2];
+  const catchAt = l + (tm.index as number) + `?${logger}.warn(${head[2]}):`.length;
+
+  // 6. toast 函数确实是限频 toast：`c(WEf,"showErrorToastRateLimited");` 全文恰好一处且函数名一致
+  const tags = [...content.matchAll(new RegExp(`(?<![\\w$])(${IDENT_SRC})\\((${IDENT_SRC}),"showErrorToastRateLimited"\\);`, "g"))];
+  if (tags.length !== 1 || tags[0][2] !== toast) return null;
+
+  return { sendStart, sendEnd, catchAt, errVar, msgVar: head[2], logger };
+}
+
+/** 在出厂内容上打 usage 重试钩子；锚点不唯一 / 漂移则原样返回。 */
+function applyUsageHook(content: string): string {
+  const hit = findUsageHook(content);
+  if (!hit) return content;
+  const retry = renderUsageRetry();
+  // 从高位往低位拼，前面的偏移不受影响：B → A 后缀 → A 前缀
+  const branch = `${USAGE_START}${hit.errVar}&&${hit.errVar}.__a2kLocalRefused?${hit.logger}.warn(${hit.msgVar}):${USAGE_END}`;
+  return (
+    content.slice(0, hit.sendStart) +
+    `${USAGE_START}(${retry})(()=>${USAGE_END}` +
+    content.slice(hit.sendStart, hit.sendEnd) +
+    `${USAGE_START})${USAGE_END}` +
+    content.slice(hit.sendEnd, hit.catchAt) +
+    branch +
+    content.slice(hit.catchAt)
+  );
+}
+
+/** 删掉所有 usage 定界段（还原为出厂）；单段超过 USAGE_SEGMENT_MAX 视为误命中不删。 */
+function restoreUsageHook(content: string): string {
+  if (!content.includes(USAGE_START)) return content;
+  return content.replace(USAGE_SEGMENT_RE, (m) => (m.length <= USAGE_SEGMENT_MAX ? "" : m));
+}
+
+// ============================================================================
 // 1.2 代模型面板（4.13.64，v2）：Kiro 1.2.56 把模型选择器整个重写成 ModelPanel / ModelOptionRow / useModelSelector
 // （带搜索框、勾选列、Effort 滑条），1.1 代的选项行 / 菜单 / ref 三个锚点全部消失。v2 不改 React Compiler 的记忆化
 // 组件体，只改它的 props：行组件函数头后插 `<p>=a2kRowFix(<p>);`（唯一的 hook `ne.c(47)` 调用次序不变），
@@ -1724,8 +1863,8 @@ function restoreStructural(content: string, patched: string, original: string): 
  * 结构匹配会把真机名再「映射」一次，把 `n2e` 又写回 `Bde`。
  * 随身携带标记由调用方传进来（它内嵌的是出厂原文，与压缩名无关）。
  */
-function patchedPopoverWritten(origText: string, fn: string, warn: string, useSessionConfig: string, tagger: string): string {
-  const body = renderTemplate(PATCHED_POPOVER_BODY, POPOVER_PATCH_CANON, [fn, warn, useSessionConfig]);
+function patchedPopoverWritten(origText: string, fn: string, warn: string, useSessionConfig: string, runtime: string, tagger: string): string {
+  const body = renderTemplate(PATCHED_POPOVER_BODY, POPOVER_PATCH_CANON, [fn, warn, useSessionConfig, runtime]);
   const head = `function ${fn}(t){`;
   const withMarker = body.startsWith(head) ? head + carryMarker(origText) + body.slice(head.length) : body;
   return withMarker + popoverTagText(tagger, fn);
@@ -1763,11 +1902,12 @@ function restorePatchedPopover(content: string): string {
       const fn = body.map.get("Bde") ?? "Bde";
       const warn = body.map.get("Pde") ?? "Pde";
       const use = body.map.get("l0") ?? "l0";
+      const runtime = body.map.get("re") ?? "re";
       // 助手名从同一次命中的映射读（规范模板尾标签里写着 `a`）；读不出就用贴着正文末尾锚定的读法兜底。
       const tagger = body.map.get("a") ?? readPopoverTagger(out, body.start + body.text.length - 1, fn);
       if (tagger) {
         // 用真机名 + 实际携带标记拼出「写进文件的那一串」去定位函数
-        const writtenText = patchedPopoverWritten(body.text, fn, warn, use, tagger);
+        const writtenText = patchedPopoverWritten(body.text, fn, warn, use, runtime, tagger);
         const written = matchMasked(out, writtenText);
         if (written) {
           const fixed = renderMatched(popoverCanonicalWithTag(fn, tagger), writtenText, written);
@@ -1864,7 +2004,11 @@ function applyPopover(content: string): string | null {
   // 补丁模板直接按真机名字渲染（补丁自带局部名保持原样，避免与真机压缩名撞车）。
   // 模板渲染出来的函数名 / 警告函数名必须与结构匹配读出的名字一致，否则宁可不打。
   // 尾部 displayName 标签不参与模板改名：按真机助手名（fac.tagger）单独拼，见 popoverTagText。
-  const patchedFnText = renderTemplate(PATCHED_POPOVER_BODY, POPOVER_PATCH_CANON, [fac.names.fn, fac.names.warn, useSessionConfig]) + popoverTagText(fac.tagger, fac.names.fn);
+  // React Compiler 运行时名（`re.c(30)` 的 `re`）必须取真机的命名空间名：写死规范名 `re` 会在 1.2.56 上
+  // 落到另一个同名顶层函数上，运行时抛 `re.c is not a function`。读不出就不打（宁可退回原生弹层）。
+  const compilerRuntime = fac.span.map.get("re");
+  if (!compilerRuntime) return null;
+  const patchedFnText = renderTemplate(PATCHED_POPOVER_BODY, POPOVER_PATCH_CANON, [fac.names.fn, fac.names.warn, useSessionConfig, compilerRuntime]) + popoverTagText(fac.tagger, fac.names.fn);
   const head = `function ${fac.names.fn}(t){`;
   if (!patchedFnText.startsWith(head)) return null;
   const patchedFn = head + carryMarker(fac.text) + patchedFnText.slice(head.length);
@@ -2146,7 +2290,8 @@ async function commitPlans(enabled: boolean, plans: Record<TargetKey, TargetPlan
         // 日志按**计划状态**判定，不按 enabled 参数：关闭卡片样式时 styleEnabled=false，
         // 计划是 removed（剥掉 CARD_CSS），若按 enabled=true 记成 "applied card model selector style"
         // 就是谎报——排查时会以为 CSS 在位，实际文件里一个 a2k 都没有（2026-09-15 实拍）。
-        info(plan.status === "removed" ? TARGET_LOG[key].off : TARGET_LOG[key].on, fp.file);
+        // 文件改动与靶点状态不一致时（backend 文件只动了 usage 钩子段）由 fp.log 给出准确文案。
+        info(fp.log ?? (plan.status === "removed" ? TARGET_LOG[key].off : TARGET_LOG[key].on), fp.file);
       } catch (e) {
         const msg = (e as Error).message || String(e);
         error(`${key} write failed:`, fp.file, msg);
@@ -2196,6 +2341,9 @@ export function syncGroupHeaderStyle(enabled: boolean): Promise<StyleSyncResult>
   return run;
 }
 
+/** usage 重试钩子的漂移日志每个宿主只打一次（每次同步都会重算，不去重会刷屏）。 */
+let usageDriftLogged = false;
+
 async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSyncResult> {
   // 一次发现，两处复用：同一 chunk 在多个 package 各有一份，CSS 也要落进各自的 style.css。
   const pkgs = await selectorPackages();
@@ -2214,12 +2362,18 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
     backend: committed.backend.status,
   };
   // 可选组（4.13.55）：所属文件本轮写失败 / 被全有或全无中止（unavailable 且带 detail）→ 也报 unavailable；否则按计划推导的状态。
-  const extraOf = (plan: TargetPlan, res: TargetResult, key: CtxTargetKey): TargetStatus =>
+  const extraOf = (plan: TargetPlan, res: TargetResult, key: ExtraKey): TargetStatus =>
     res.status === "unavailable" && res.detail ? "unavailable" : plan.extras?.[key] ?? "unavailable";
-  const extras: CtxExtras = {
+  const extras: SyncExtras = {
     ctxSelector: extraOf(selectorScript, committed.selectorScript, "ctxSelector"),
     ctxHost: extraOf(backend, committed.backend, "ctxHost"),
+    usageRetry: extraOf(backend, committed.backend, "usageRetry"),
   };
+  // usage 重试钩子是可选组：锚点漂移只在整个宿主里记一次 info（写失败另有 error 日志，这里不重复）。
+  if (enabled && extras.usageRetry === "unavailable" && !committed.backend.detail && !usageDriftLogged) {
+    usageDriftLogged = true;
+    info("usage-limits retry hook (optional): unavailable — kiro-agent may still toast ECONNREFUSED on startup");
+  }
   if (enabled && (extras.ctxSelector === "unavailable" || extras.ctxHost === "unavailable")) {
     const ctxMissing = (selectorScript.packages ?? []).filter((s) => !s.ctx).map((s) => s.pkg);
     info(
@@ -2310,6 +2464,14 @@ export const __selectorStyleInternals = {
     CTX_SEL_CANON,
     CTX_CALL_CANON,
     CTX_HOST_CANON,
+    /** 4.13.65 usage-limits 启动重试钩子（可选组 usageRetry） */
+    findUsageHook,
+    applyUsageHook,
+    restoreUsageHook,
+    renderUsageRetry,
+    USAGE_START,
+    USAGE_END,
+    USAGE_SEGMENT_RE,
     /** 4.13.64 1.2 代模型面板（v2） */
     findModelPanelRow,
     applyModelPanelRow,

@@ -387,6 +387,13 @@ function main() {
         applied.includes("a2k-cu-head") && /,a2kUsage:(?:typeof [A-Za-z_$][\w$]*==="undefined"\?void 0:)?[A-Za-z_$][\w$]*\}\)/.test(applied),
         "弹层补丁没落地（视图会退回原生三项百分比）"
       );
+      // 回归（`re.c is not a function`）：补丁里的 React Compiler 运行时必须沿用出厂弹层函数用的名字，
+      // 不能把模板规范名 `re` 原样落地（1.2.56 里顶层 `re` 是另一个函数）。
+      {
+        const rt = fac ? fac.span.map.get("re") : undefined;
+        const outFn = fac ? new RegExp(`function ${fac.names.fn}\\(t\\)\\{(?:/\\*a2k-orig:[A-Za-z0-9+/=]+\\*/)?const e=([A-Za-z_$][\\w$]*)\\.c\\(30\\)`).exec(applied) : null;
+        check("P16 弹层补丁的 .c(30) 运行时名 = 出厂弹层函数用的名字", !!rt && !!outFn && outFn[1] === rt, `factory=${rt} patched=${outFn && outFn[1]}`);
+      }
       for (const pk of fx.packages) {
         const f = M.findPopoverFactory(pk.factoryChunk);
         const expectInject = !!f && f.span.map.get("b") === "b";
