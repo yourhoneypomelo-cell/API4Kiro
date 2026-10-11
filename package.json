@@ -147,7 +147,7 @@
           "type": "array",
           "default": [],
           "scope": "machine",
-          "description": "Provider 注册表：多个上游接入点（第三方中转 / 官方 Key / 任意 Anthropic|OpenAI 兼容端点）。所有启用且配置完整的 provider，其模型合并进 Kiro 模型选择器，按模型 ID 自动路由。一般在侧边栏面板里增删改，无需手动编辑。为空时会自动从旧版双通道配置（baseUrl/openaiBaseUrl 等）迁移读取。",
+          "description": "Provider 注册表：多个上游接入点（第三方中转 / 官方 Key / 任意 Anthropic|OpenAI 兼容端点）。所有启用且配置完整的 provider，其模型合并进 Kiro 模型选择器，按模型 ID 自动路由。一般在侧边栏面板里增删改，无需手动编辑。为空时会自动从旧版双通道配置（baseUrl/openaiBaseUrl 等）迁移读取。4.13.65 起各 Key 存系统钥匙串，本项里只留占位标记 __API4KIRO_KEYCHAIN__（迁移失败时保留明文并记日志，下次激活重试）。",
           "items": {
             "type": "object",
             "properties": {
@@ -319,7 +319,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "【Anthropic 通道 · 深度兼容】中转站 API Key（形如 sk-xxxx）。"
+          "description": "【Anthropic 通道 · 深度兼容】中转站 API Key（形如 sk-xxxx）。（4.13.65 起 Key 存系统钥匙串，这里只显示占位标记 __API4KIRO_KEYCHAIN__；钥匙串不可用时保留明文并记日志）"
         },
         "api2kiroDual.officialBaseUrl": {
           "type": "string",
@@ -331,7 +331,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "【Anthropic 通道 · 官方直通】API Key。仅 mode=anthropic 时生效。"
+          "description": "【Anthropic 通道 · 官方直通】API Key。仅 mode=anthropic 时生效。（4.13.65 起 Key 存系统钥匙串，这里只显示占位标记 __API4KIRO_KEYCHAIN__；钥匙串不可用时保留明文并记日志）"
         },
         "api2kiroDual.officialModelMapping": {
           "type": "object",
@@ -358,7 +358,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "【OpenAI 通道】API Key。以 Authorization: Bearer 发送。"
+          "description": "【OpenAI 通道】API Key。以 Authorization: Bearer 发送。（4.13.65 起 Key 存系统钥匙串，这里只显示占位标记 __API4KIRO_KEYCHAIN__；钥匙串不可用时保留明文并记日志）"
         },
         "api2kiroDual.openaiModelMapping": {
           "type": "object",
@@ -584,17 +584,22 @@
   },
   "scripts": {
     "compile": "tsc -p ./tsconfig.json --noEmit",
+    "pretest": "node tests/build.js",
+    "test": "node --test tests/*.test.js",
     "watch": "node esbuild.js --watch",
     "bundle": "node esbuild.js",
-    "package": "node esbuild.js && npx @vscode/vsce package --allow-star-activation --skip-license --allow-missing-repository --no-dependencies"
+    "vscode:uninstall": "node ./dist/uninstall.js",
+    "package": "node esbuild.js && vsce package --allow-star-activation --skip-license --allow-missing-repository --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "4.0.0",
     "esbuild": "^0.23.0",
     "typescript": "^5.5.0"
   },
   "allowScripts": {
+    "@vscode/vsce-sign@2.1.0": true,
     "esbuild@0.23.1": true
   }
 }

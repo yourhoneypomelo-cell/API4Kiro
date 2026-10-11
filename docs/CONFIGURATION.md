@@ -1,6 +1,6 @@
 # 配置项参考
 
-> 本文由 `node scripts/gen-config-doc.js` 从 `package.json` 生成（版本 4.13.63），请勿手改；改设置项后重新生成。
+> 本文由 `node scripts/gen-config-doc.js` 从 `package.json` 生成（版本 4.13.65），请勿手改；改设置项后重新生成。
 
 共 42 项：`api2kiroDual.*` 39 项 + 由扩展自动管理的 Kiro 内部端点 3 项。所有设置都在 VS Code / Kiro 的 settings.json 里生效；渠道相关的项一般在侧边栏面板里维护，无需手填。
 
@@ -9,18 +9,18 @@
 | 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `api2kiroDual.enabled` | `boolean` | `false` | 启用代理。默认关闭：本扩展与原版 API2Kiro 共用 codewhisperer.config.*Endpoints，同一时间只能有一个生效。启用本扩展前请先在扩展视图里禁用或卸载原版（仅把 api2kiro.enabled 设为 false 不够，原版关闭状态下激活仍会清掉本扩展的端点）。禁用或卸载本扩展前请先关闭此开关，否则 Kiro 会保留指向已停止本地服务的端点。 |
-| `api2kiroDual.providers` | `array` | `[]` | Provider 注册表：多个上游接入点（第三方中转 / 官方 Key / 任意 Anthropic\|OpenAI 兼容端点）。所有启用且配置完整的 provider，其模型合并进 Kiro 模型选择器，按模型 ID 自动路由。一般在侧边栏面板里增删改，无需手动编辑。为空时会自动从旧版双通道配置（baseUrl/openaiBaseUrl 等）迁移读取。 |
+| `api2kiroDual.providers` | `array` | `[]` | Provider 注册表：多个上游接入点（第三方中转 / 官方 Key / 任意 Anthropic\|OpenAI 兼容端点）。所有启用且配置完整的 provider，其模型合并进 Kiro 模型选择器，按模型 ID 自动路由。一般在侧边栏面板里增删改，无需手动编辑。为空时会自动从旧版双通道配置（baseUrl/openaiBaseUrl 等）迁移读取。4.13.65 起各 Key 存系统钥匙串，本项里只留占位标记 __API4KIRO_KEYCHAIN__（迁移失败时保留明文并记日志，下次激活重试）。 |
 | `api2kiroDual.routing` | `string` | `merge` | 双协议路由策略。merge=两个通道同时生效，模型列表取并集，按 Kiro 选中的模型 ID 自动路由到拥有该模型的通道（ID 同时存在于两侧时优先 Anthropic 通道）；anthropicOnly=只用 Anthropic 通道（等同原版行为）；openaiOnly=所有请求走 OpenAI 通道。切换后需重载窗口。<br>取值：`merge` = 两通道并存，按模型自动路由（推荐）；`anthropicOnly` = 只用 Anthropic 通道；`openaiOnly` = 只用 OpenAI 通道 |
 | `api2kiroDual.mode` | `string` | `kiro` | Anthropic 通道的子模式。kiro=深度兼容（走 kiro2cc-proxy 类中转站，保留 Kiro 私有字段 / effort / thinking 与计费显示）；anthropic=官方 Anthropic 直通（翻成纯 Anthropic /v1/messages，不注入私有字段、不显示计费）。切换后需重载窗口。<br>取值：`kiro`；`anthropic` |
 | `api2kiroDual.baseUrl` | `string` | `""` | 【Anthropic 通道 · 深度兼容】中转站地址。例如 https://your-relay.com/v1 或 https://your-relay.com（会自动补 /v1）。 |
-| `api2kiroDual.apiKey` | `string` | `""` | 【Anthropic 通道 · 深度兼容】中转站 API Key（形如 sk-xxxx）。 |
+| `api2kiroDual.apiKey` | `string` | `""` | 【Anthropic 通道 · 深度兼容】中转站 API Key（形如 sk-xxxx）。（4.13.65 起 Key 存系统钥匙串，这里只显示占位标记 __API4KIRO_KEYCHAIN__；钥匙串不可用时保留明文并记日志） |
 | `api2kiroDual.officialBaseUrl` | `string` | `""` | 【Anthropic 通道 · 官方直通】地址，例如 https://api.anthropic.com。必填：留空则不发出任何请求。仅 mode=anthropic 时生效。 |
-| `api2kiroDual.officialApiKey` | `string` | `""` | 【Anthropic 通道 · 官方直通】API Key。仅 mode=anthropic 时生效。 |
+| `api2kiroDual.officialApiKey` | `string` | `""` | 【Anthropic 通道 · 官方直通】API Key。仅 mode=anthropic 时生效。（4.13.65 起 Key 存系统钥匙串，这里只显示占位标记 __API4KIRO_KEYCHAIN__；钥匙串不可用时保留明文并记日志） |
 | `api2kiroDual.officialModelMapping` | `object` | `{}` | 官方直通模式下 Kiro 内部模型 ID → 上游模型 ID 的映射。留空则原样透传。 |
 | `api2kiroDual.officialDefaultModel` | `string` | `""` | 官方直通模式下映射表未命中时的兜底模型 ID。留空则透传原始 ID。 |
 | `api2kiroDual.openaiEnabled` | `boolean` | `false` | 启用 OpenAI 协议通道（/v1/chat/completions）。开启并填好地址与 Key 后，该端点的模型会出现在 Kiro 的模型选择器里，与 Anthropic 通道的模型并列。 |
 | `api2kiroDual.openaiBaseUrl` | `string` | `""` | 【OpenAI 通道】地址。例如 https://api.openai.com/v1、https://your-relay.com/v1，或 https://your-relay.com（会自动补 /v1）。留空则不发出任何请求。 |
-| `api2kiroDual.openaiApiKey` | `string` | `""` | 【OpenAI 通道】API Key。以 Authorization: Bearer 发送。 |
+| `api2kiroDual.openaiApiKey` | `string` | `""` | 【OpenAI 通道】API Key。以 Authorization: Bearer 发送。（4.13.65 起 Key 存系统钥匙串，这里只显示占位标记 __API4KIRO_KEYCHAIN__；钥匙串不可用时保留明文并记日志） |
 | `api2kiroDual.openaiModelMapping` | `object` | `{}` | OpenAI 通道下 Kiro 内部模型 ID → 上游模型 ID 的映射。留空则原样透传（模型选择器展示的即为该端点 /models 返回的 ID，天然一一对应）。 |
 | `api2kiroDual.openaiDefaultModel` | `string` | `""` | OpenAI 通道下映射表未命中时的兜底模型 ID（例如 gpt-4o）。留空则透传原始 ID。 |
 | `api2kiroDual.openaiMaxTokensField` | `string` | `max_tokens` | OpenAI 通道用哪个字段限制输出长度。max_tokens=兼容绝大多数中转站；max_completion_tokens=OpenAI 新版推理模型要求的字段；both=两个都发（少数网关会因未知字段报错）；none=不发，用上游默认。<br>取值：`max_tokens`；`max_completion_tokens`；`both`；`none` |

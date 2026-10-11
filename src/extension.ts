@@ -12,7 +12,8 @@ import { syncGroupHeaderStyle, triggerKiroModelRefresh, type StyleSyncResult } f
 import { CTX_CONFIG_ID, decodeCtxConfigValue } from "./contextWindow";
 import { checkForUpdate, GITHUB_URL, installLatestFromGitHub } from "./updateChecker";
 import { openInBrowser } from "./openBrowser";
-import { getActiveProviders } from "./providers";
+import { getActiveProviders, initApiKeySettings } from "./providers";
+import { migrateApiKeysOnce } from "./apiKeys";
 import { initLog, showLog, info, error, warn, debug } from "./log";
 import { KrsProxyServer } from "./krsServer";
 import { CpsProxyServer } from "./cpsServer";
@@ -75,6 +76,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     initPromptStore(context);
     // 第三方账号登录（Kimi / Codex / xAI / Antigravity / Anthropic）的 token：钥匙串里按 provider id 存，先于 provider 可用性判定加载。
     await initTokenStore(context);
+    // API Key 迁入系统钥匙串：注入设置端口（不 await，迁移在后台跑，不参与激活闸门）。
+    initApiKeySettings();
+    void migrateApiKeysOnce().then((r) => {
+      if (r.migrated || r.failed.length) {
+        info(`api key 迁移：写入钥匙串 ${r.migrated} 项，未确认 ${r.failed.length} 项，残余明文副本 ${r.residual.length} 项`);
+      }
+    });
     setOAuthClientVersion(String(context.extension.packageJSON.version || "0.0.0"));
     context.subscriptions.push({
       dispose: () => {
@@ -204,8 +212,10 @@ export async function deactivate(): Promise<void> {
   // 时 webview 已经拿着出厂 CSS、懒加载的 mermaid 却是补丁版——就是 2026-09-07 实拍的「有结构没样式」
   // 弹层与 `SSnaillmou9` 组头，后端钩子也永远「不可达」（每次 Reload 前一行 restored …，13 次 Channel A 全败）。
   // 还原只走用户动作：关闭代理 / 关闭卡片样式（onConfigChanged 完整还原并提示重载）、代理关闭状态下激活（activate
-  // 里 restoreAll + syncGroupHeaderStyle(false)）。停用 / 卸载扩展时文件保留补丁态：三处都只在有 CPS 私有
-  // description 或 a2k 类名时改变外观，没有本扩展在跑时就是 Kiro 原生行为；卸载钩子还原在想法池待拍板。
+  // 里 restoreAll + syncGroupHeaderStyle(false)）。**停用**扩展时文件保留补丁态：三处都只在有 CPS 私有
+  // description 或 a2k 类名时改变外观，没有本扩展在跑时就是 Kiro 原生行为。
+  // **卸载**另有出口：package.json 的 vscode:uninstall 钩子（dist/uninstall.js）在下次启动 Kiro 时清端点并离线
+  // 还原这三份文件——那时扩展已经不在了，所以在本函数里做什么都没用；详见 src/uninstall.ts。
   info("left Kiro selector / popover / backend patches untouched on host shutdown (next host loads what is on disk)");
   statusBar?.dispose();
 }
@@ -236,6 +246,21 @@ const styleSyncWarned = new Set<string>();
  * detail 为 ENOENT 表示根本不在 Kiro 里（普通 VS Code 宿主），不是故障，不提示。
  */
 function notifyStyleSync(result: StyleSyncResult): void {
+  // 前置闸（kiro-proxy 残留）：必须放在下面那条 detail 判断**之前**——它带 detail，
+  // 放后面会被通用文案吃掉（用户就看不出「为什么这次什么都没写、要做什么」）。
+  if (result.blockedBy === "kiro-proxy") {
+    if (styleSyncWarned.has("kiro-proxy")) {
+      return;
+    }
+    styleSyncWarned.add("kiro-proxy");
+    error("selector patch sync blocked by a kiro-proxy residue:", result.detail || "");
+    void vscode.window.showWarningMessage(
+      "API4Kiro 检测到 Kiro 目录里有 kiro-proxy 的补丁残留（kiroproxy-），为避免两套补丁互相覆盖，本次未写入任何 Kiro 文件。" +
+        "此时模型选择器会原样显示 __A2K_GRP__|… 这类内部标记、分组标题也可能被选中。" +
+        "请先在 kiro-proxy 一侧还原它的补丁（或恢复 Kiro 出厂文件）后重新打开本扩展的卡片样式。"
+    );
+    return;
+  }
   if (result.status !== "unavailable" || !result.detail || /\bENOENT\b/.test(result.detail)) {
     return;
   }

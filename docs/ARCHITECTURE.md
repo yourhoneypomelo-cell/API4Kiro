@@ -151,7 +151,7 @@ Kiro 的模型选择器不支持分组样式，Context Usage 弹层不显示真�
 - **Context Usage 弹层补丁还剩一处写死的压缩名**（选择器、Ctx 下拉与弹层的另外两处已全部结构匹配）：**jsx 运行时名**。模板与还原侧都以规范名 `b` 逐字落地，所以 `applyPopover` 先读命中段里的真机名，不是 `b` 就直接跳过（宁可这个视图退回原生外观，也不写出 `b.jsx(...)` 这种指向不存在标识符的代码）。要支持任意 jsx 名，得把真机名同时穿到写入侧与 `restorePatchedPopover` 的期望形态——只改一边会把另一种名字写进文件，比跳过更糟。
 - displayName 标签的**名字助手**已按结构捕获（4.13.63）：`findPopoverFactory` 贴着命中段末尾读 `<助手>(<函数名>,"ContextUsagePopover");`，写入与还原都用真机名。此前它拿规范名 `a` 逐字比对，真机助手叫别的名字（session-details 是 `o`）时整条弹层补丁静默不注入。
 - 调用处追加的 store 名（`a2kUsage`）由外层 `{…}=<hook>(n)` 绑定，出厂调用处不引用，命中段里读不出来，所以写成 `typeof n==="undefined"?void 0:n`：名字被压缩器改掉时弹层退回「无 breakdown」的原生三项视图，而不是抛 ReferenceError。`POPOVER_CALL_PATCHED_RE` 同时兼容旧形态（裸标识符），真机上已经打过的旧补丁照样能还原。
-- 卸载扩展后三处 Kiro 文件保持补丁态（无可见影响）；如需彻底出厂，先关闭代理再卸载，或重装 Kiro。
+- 卸载扩展后由 `vscode:uninstall` 钩子（`dist/uninstall.js`，宿主外运行）在**下次启动 Kiro 时**清理端点并离线还原三处文件；从卸载到重启之间三处文件仍是补丁态（无可见影响），端点也仍指向已停掉的本地端口。钩子复用 `syncGroupHeaderStyle(false)` 这一条管线（不是第二套实现），所以还原结果与用户点「关闭代理」逐字一致；它只删自己的标记段，不碰 `kiro-proxy` 的字节。若想立刻恢复：先关闭代理再卸载。
 - Antigravity（Google）登录的 client secret 不在公开仓库，也不进公开 Release。默认 `npm run package` 不注入；本机自用须 `A2K_EMBED_ANTIGRAVITY_SECRET=1` 或 `A2K_ANTIGRAVITY_CLIENT_SECRET`，带密钥的包不得上传。
 - 更新检查依赖 GitHub API 可达；匿名请求有速率限制，失败静默。
 - 回归测试套件包含 Kiro 编译产物的只读副本，未随公开仓发布。

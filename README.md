@@ -50,7 +50,8 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 
 > 装过原版 API2Kiro 的用户：两者共用 Kiro 的 `codewhisperer.config.*Endpoints`，同一时间只能有一个生效。请在扩展视图里**禁用或卸载**原版，再启用本扩展——仅把原版的 `api2kiro.enabled` 设为 `false` 不够：原版在关闭状态下每次激活仍会清掉本扩展写入的端点（对称问题：本扩展 4.13.53 起只清自己写的端点，不再碰原版或手写的）。端口已错开（本扩展 19810 / 19811，原版 19800 / 19801）。
 >
-> 禁用或卸载本扩展前，请先在「设置」页关闭「启用代理」，否则 Kiro 会保留指向已停止本地服务的端点；若已经停用，重新启用本扩展后关闭代理，或手动删除 `settings.json` 里 `codewhisperer.config.endpoints` / `krsEndpoints` / `cpsEndpoints` 三键即可。
+> 卸载本扩展后，由 `vscode:uninstall` 钩子在**下次启动 Kiro 时**清理端点并离线还原被本扩展改过的 Kiro 文件；卸到重启之间端点仍指向已经停掉的本地端口（Kiro 那段时间会连不上）。若想立刻恢复，先在「设置」页关闭「启用代理」，再卸载。
+> 同理，**回退到旧版（迁移 Key 之前的版本）前，请先在当前版本关闭补丁**（设置页关闭「启用代理」）：旧版把 `__API4KIRO_KEYCHAIN__` 这个占位标记当成真实 Key 用，会发出无效鉴权。
 
 三步接入：
 
@@ -60,14 +61,15 @@ kiro --install-extension api2kiro-dual-<version>.vsix --force
 
 之后增删模型、调整顺序都会静默同步到 Kiro 右侧的模型选择器，不再需要重载。
 
-> 需要 Kiro IDE（本扩展声明依赖内置的 `kiro.kiroAgent`），纯 VS Code 中不会激活。已在 Kiro 1.0.411 / 1.0.437 / 1.1.14 / 1.2.56 上验证（1.1.14 起 Kiro 把聊天界面拆到 `kiro-ui-session-details`，两份 chunk 各自独立压缩，补丁逐份覆盖；1.2 起模型选择器改为带搜索的模型面板，补丁按两代结构分别适配）。
+> 需要 Kiro IDE（本扩展声明依赖内置的 `kiro.kiroAgent`），纯 VS Code 中不会激活。Kiro 1.0.411 / 1.0.437 / 1.1.14 上做过真机手测；1.2.56 **只按文件结构在离线夹具上验证过**（
+`node dev/verify-selector-patch.js` / `node dev/verify-startup-race.js` 的只读副本夹具），未在运行中的 1.2.56 里逐项手测。1.1.14 起 Kiro 把聊天界面拆到 `kiro-ui-session-details`，两份 chunk 各自独立压缩、补丁逐份覆盖；1.2 起模型选择器改为带搜索的模型面板，补丁按两代结构分别适配。
 
 ## 接入方式
 
 | 方式 | 适用 | 凭证存放 |
 | --- | --- | --- |
 | **厂商账号登录（OAuth）** | Kimi、Codex（OpenAI）、xAI、Antigravity（Google）、Anthropic（Claude）、Kiro 官方多账号 | 系统钥匙串（VS Code SecretStorage），不落盘到设置文件 |
-| **第三方 API Key** | 中转站、官方 Key；同一渠道可放多把 Key 组成 Key 池 | `api2kiroDual.providers` 设置项 |
+| **第三方 API Key** | 中转站、官方 Key；同一渠道可放多把 Key 组成 Key 池 | 系统钥匙串（VS Code SecretStorage）；`api2kiroDual.providers` 里只留占位标记 `__API4KIRO_KEYCHAIN__` |
 | **自定义端点** | 任意 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses / Gemini generateContent 兼容服务 | 同上 |
 | **从 CC Switch 导入** | 只读解析 `~/.cc-switch/cc-switch.db`，把 [CC Switch](https://github.com/farion1231/cc-switch) 里配好的供应商一键转成渠道 | 同上 |
 
@@ -132,7 +134,9 @@ Kiro 视图标题栏最右侧有两枚命令图标（4.13.56）：**GitHub 标**
 - **意图分类本地拦截**（`interceptIntentClassifier`）：Kiro 每轮的 simple-task 分类请求在本地应答，省一次上游调用。
 - **多窗口**：多个 Kiro 窗口共用同一对端口，先启动的窗口作主实例服务所有窗口；扩展升级后旧实例会被识别并让位。
 - **本地服务只接受本机非浏览器客户端的请求**（校验 Host 与浏览器来源头 `Origin` / `Sec-Fetch-Site`，不符一律 403 且不带 CORS 头），网页无法借用你的凭据调用；Kiro 自身的请求不受影响。
-- **端点只清自己写的**：关闭代理或关闭状态下激活时，只复原本扩展写入的 `codewhisperer.config.*Endpoints`（按写入记录或「指向本扩展端口」判断），原版 API2Kiro 或手写的端点原样保留；窗口关闭 / 停用扩展时不复原端点（其它窗口仍在用），所以**禁用或卸载前请先关闭代理**。
+- **端点只清自己写的**：关闭代理或关闭状态下激活时，只复原本扩展写入的 `codewhisperer.config.*Endpoints`（按写入记录或「指向本扩展端口」判断），原版 API2Kiro 或手写的端点原样保留；窗口关闭 / 停用扩展时不复原端点（其它窗口仍在用），所以建议**卸载前先关闭代理**；直接卸载也可以——`vscode:uninstall` 钩子会在下次启动 Kiro 时清端点并还原补丁。
+- **API Key 存系统钥匙串**：Key 与 OAuth token 一样进系统钥匙串，`settings.json` 里只留占位标记 `__API4KIRO_KEYCHAIN__`；钥匙串不可用（Linux 无 secret service 等）时**不迁移、保留明文并记日志**，功能照常。两个副作用：① 把 `api2kiroDual.providers` 复制到另一台机器后，占位标记在那台机器上解析不到 Key，需要重填；② 回退到迁移前的旧版会把占位标记当 Key 用，所以回退前先在当前版本关闭补丁。
+- **检测到 kiro-proxy 残留就不动手**：如果 Kiro 文件里已经有 `kiro-proxy` 的补丁（`kiroproxy-…` 标记），本扩展**整轮一个字节都不写**并提示你——两套注入互相覆盖会让双方都认不出自己的段落。关闭补丁（不含打补丁）不受影响，只删自己的段。
 - **调试日志**（`debug`，默认关）：开启后把每次上游请求的**完整请求正文**（系统提示、整段对话与编辑器代码上下文、工具 schema）和上游响应流片段写进「API4Kiro」输出通道，由 Kiro 落在其日志目录（`logs/<会话>/window*/exthost/output_logging_*/*-API4Kiro.log`，随会话轮转）。已知形态的 API Key / token / Bearer 会自动打码，**正文里的其它内容不会**；单行超过 64 KiB 截断；开启时输出通道会先打一条提醒。仅排障时开启、用完关闭；命令面板 **API4Kiro: 打开调试日志** 直达。
 
 ## Kiro 前端补丁（重要）

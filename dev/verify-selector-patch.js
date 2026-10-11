@@ -27,10 +27,18 @@ const { execFileSync } = require("child_process");
 
 const REPO = path.resolve(__dirname, "..");
 const SRC = path.join(REPO, "src");
-const REAL_ROOT = process.argv[2] || "/Applications/Kiro.app/Contents/Resources/app";
+/** `--synthetic`：没有真实 Kiro 安装也能跑（CI 用）。真机段落打 SKIP 并计入跳过数。 */
+const SYNTHETIC = process.argv.includes("--synthetic");
+/** 第一个位置参数 = Kiro appRoot（可选；`--synthetic` 之类的开关不算）。 */
+const REAL_ROOT = process.argv.slice(2).find((a) => !a.startsWith("--")) || "/Applications/Kiro.app/Contents/Resources/app";
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "a2k-verify-"));
 const BUILD = path.join(WORK, "build");
 const ROOT = path.join(WORK, "root");
+
+/** 夹具里被归一掉的 kiro-proxy 残留处数（CSS 剥离）与 JS 备份替换数，最后打印一行。 */
+const fixtureStats = { cssStripped: 0, cssFiles: 0, jsFromBackup: 0, jsClean: 0 };
+/** `--synthetic` 模式下跳过的真机段落数（不与 AC-3 的 176 混用）。 */
+let skippedSections = 0;
 
 let pass = 0;
 let fail = 0;
@@ -74,6 +82,86 @@ function build() {
  * （2026-09-15 实拍：卡片样式打在 agent-chat，界面却由 session-details 的工厂 chunk 渲染，
  * 于是每行模型名下面直接显示 `__A2K_MDL__|…` 微格式）。
  */
+/**
+ * 删除 CSS 里 kiro-proxy 的补丁残留：`/*kiroproxy-…*​/` 注释 + 含 `kiroproxy-` 的顶层规则。
+ *
+ * 为什么手工扫描不用正则：600 KB 压缩 CSS 里有超长 base64 字体段，正则（哪怕非回溯写法）在这种
+ * 单行超长文本上代价不可控。写法照抄 `src/selectorStyle.ts` 的 `stripStrayA2kRules`，只把关键字换掉。
+ * 夹具必须是**出厂原文**：本机真实 Kiro 上带着上一版 kiro-proxy 的注入，不归一的话
+ * 产品侧新增的「检测到 kiro-proxy 残留就不写任何文件」前置闸会让整个真机段落全红。
+ */
+function stripKiroProxyCss(css) {
+  let out = css;
+  let removed = 0;
+  // 先删注释形态（`/*kiroproxy-ctxwin-css:r1*​/`）：它不在选择器位置，规则扫描认不出
+  for (let guard = 0; guard < 64; guard++) {
+    const i = out.indexOf("/*kiroproxy-");
+    if (i < 0) break;
+    const close = out.indexOf("*/", i);
+    if (close < 0) break;
+    out = out.slice(0, i) + out.slice(close + 2);
+    removed++;
+  }
+  // 再删含 kiroproxy- 的顶层规则（连同其后一个换行）
+  let from = 0;
+  for (let guard = 0; guard < 64; guard++) {
+    const i = out.indexOf("kiroproxy-", from);
+    if (i < 0) break;
+    const start = Math.max(out.lastIndexOf("}", i), out.lastIndexOf("\n", i)) + 1;
+    const open = out.indexOf("{", i);
+    const close = open < 0 ? -1 : out.indexOf("}", open);
+    const selector = out.slice(start, i);
+    const inSelectorPosition = open >= 0 && close >= 0 && !selector.includes("{") && !out.slice(i, open).includes("}");
+    if (!inSelectorPosition) {
+      from = i + 10;
+      continue;
+    }
+    let end = close + 1;
+    while (end < out.length && (out[end] === " " || out[end] === "\t")) end++;
+    if (out[end] === "\r") end++;
+    if (out[end] === "\n") end++;
+    out = out.slice(0, start) + out.slice(end);
+    removed++;
+    from = start;
+  }
+  return { text: out, removed };
+}
+
+/** 同名 `.kiroproxy-bak-*` 备份：那份是该 Kiro 构建的出厂原文，比现行文件少 1580 / 13277 字节。 */
+function kiroProxyBackup(srcFile) {
+  const dir = path.dirname(srcFile);
+  const base = path.basename(srcFile);
+  const hit = fs.readdirSync(dir).find((f) => f.startsWith(base + ".kiroproxy-bak-"));
+  return hit ? path.join(dir, hit) : null;
+}
+
+/**
+ * JS 夹具归一：优先取同名 `.kiroproxy-bak-*` 备份，**不做文本清洗**——
+ * agent-chat 的 chunk 里有一处行内 `/*kiroproxy-ctxwin-ui:r2*​/…` 没有配对 `:end`，
+ * 按定界段剥离会漏掉它或误吞后续代码。备份也没有、残留又还在时只能明确报错（夹具不能带残留）。
+ */
+function normalizedJsText(srcFile, label) {
+  const backup = kiroProxyBackup(srcFile);
+  if (backup) {
+    const text = fs.readFileSync(backup, "utf8");
+    if (text.includes("kiroproxy-")) {
+      throw new Error(`备份 ${backup} 仍含 kiroproxy- 残留，夹具无法归一`);
+    }
+    fixtureStats.jsFromBackup++;
+    console.log(`      · ${label}：已用备份替换（${path.basename(backup)}）`);
+    return text;
+  }
+  const text = fs.readFileSync(srcFile, "utf8");
+  if (text.includes("kiroproxy-")) {
+    throw new Error(
+      `${srcFile} 带 kiro-proxy 残留且没有同名 .kiroproxy-bak-* 备份：JS 不能文本清洗（有未配对的行内标记），` +
+        `请先恢复该 Kiro 构建的出厂文件再跑本脚本`
+    );
+  }
+  fixtureStats.jsClean++;
+  return text;
+}
+
 function fixture() {
   const ext = path.join(REAL_ROOT, "extensions/kiro.kiro-agent");
   const chat = path.join(ext, "packages/kiro-ui-agent-chat/dist");
@@ -89,26 +177,96 @@ function fixture() {
     if (!carries) continue;
     const assetsDst = path.join(pkgsDir, pkg, "dist/assets");
     fs.mkdirSync(assetsDst, { recursive: true });
-    fs.copyFileSync(path.join(dist, "style.css"), path.join(pkgsDir, pkg, "dist/style.css"));
-    for (const f of chunks) fs.copyFileSync(path.join(assetsSrc, f), path.join(assetsDst, f));
+    // style.css 没有备份（真机上也只对 JS 留了备份），只能剥离；JS 一律优先取备份
+    const cssSrc = path.join(dist, "style.css");
+    const stripped = stripKiroProxyCss(fs.readFileSync(cssSrc, "utf8"));
+    fixtureStats.cssStripped += stripped.removed;
+    fixtureStats.cssFiles++;
+    fs.writeFileSync(path.join(pkgsDir, pkg, "dist/style.css"), stripped.text, "utf8");
+    for (const f of chunks) {
+      const text = normalizedJsText(path.join(assetsSrc, f), `${pkg}/${f}`);
+      fs.writeFileSync(path.join(assetsDst, f), text, "utf8");
+    }
     packages.push({ pkg, assets: assetsDst, chunk: path.join(assetsDst, carries), style: path.join(pkgsDir, pkg, "dist/style.css") });
   }
   fs.mkdirSync(path.join(ROOT, "extensions/kiro.kiro-agent/dist"), { recursive: true });
-  fs.copyFileSync(path.join(ext, "dist/extension.js"), path.join(ROOT, "extensions/kiro.kiro-agent/dist/extension.js"));
+  fs.writeFileSync(
+    path.join(ROOT, "extensions/kiro.kiro-agent/dist/extension.js"),
+    normalizedJsText(path.join(ext, "dist/extension.js"), "dist/extension.js"),
+    "utf8"
+  );
   const chatPkg = packages.find((p) => p.pkg === "kiro-ui-agent-chat") || packages[0];
-  return { packages, assets: chatPkg.assets, style: chatPkg.style };
+  return { packages, assets: chatPkg.assets, style: chatPkg.style, real: true };
+}
+
+/** `--synthetic` 夹具：用仓库内已有的合成 1.1.x 模板 + 合成 style.css 造一个 appRoot，不碰真机。 */
+function syntheticFixture(M, P) {
+  const pkg = "kiro-ui-agent-chat";
+  const dist = path.join(ROOT, "extensions/kiro.kiro-agent/packages", pkg, "dist");
+  const assets = path.join(dist, "assets");
+  fs.mkdirSync(assets, { recursive: true });
+  const style = path.join(dist, "style.css");
+  fs.writeFileSync(style, ":root{--x:1}\nbody{margin:0}\n", "utf8");
+  const chunk = path.join(assets, "mermaid-synthetic.js");
+  fs.writeFileSync(chunk, buildSyntheticV1Chunk(M, P) + ';x("chat-input-popup-option");', "utf8");
+  fs.mkdirSync(path.join(ROOT, "extensions/kiro.kiro-agent/dist"), { recursive: true });
+  // 最小的后端主钩子形态（`findBackendHook` 的结构锚点）：`function QPe(t){Oue=t}` + 一次 setter 读取。
+  fs.writeFileSync(
+    path.join(ROOT, "extensions/kiro.kiro-agent/dist/extension.js"),
+    "function QPe(t){Oue=t}function Zue(){return Oue}var qq=Oue.getAvailableModels();",
+    "utf8"
+  );
+  return { packages: [{ pkg, assets, chunk, style }], assets, style, real: false };
+}
+
+/**
+ * 合成的 1.1.x（v1）chunk：选项行 / 菜单容器 / ref / 弹层 / 调用处 / 标签，全部由产品侧的模板渲染而来
+ * （与真机结构同形），供 `--synthetic` 夹具与 P23 共用。
+ */
+function buildSyntheticV1Chunk(M, P) {
+  const RN = ["E", "R", "O"];
+  const RA = ["w", "I", "N"];
+  const row = M.renderTemplate(P.ORIG_JS_PATTERN, RN, RA);
+  const menu = M.renderTemplate(P.ORIG_MENU_PATTERN, RN, RA);
+  const ref = M.renderTemplate(P.ORIG_REF_PATTERN, RN, RA);
+  const popover = M.renderTemplate(
+    P.ORIG_POPOVER_PATTERN,
+    ["Bde", "re", "Pde", "E", "R", "O", "I", "B", "z"],
+    ["n2e", "ne", "t2e", "w", "I", "N", "R", "$", "H"]
+  );
+  const call = M.renderTemplate(P.ORIG_POPOVER_CALL_PATTERN, ["Bde", "Y"], ["n2e", "q"]);
+  // 调用处不能紧贴在 EffortSelector 标签后面：applyCtxSelector 在标签末尾插函数、在调用处做替换，
+  // 两段起点相同时会互相踩（真机 bundle 里两者相隔很远，不会出现）。这里把调用处放在标签前。
+  const tags = 'b.jsx(x2e,{disabled:K});a(E0,"useSessionConfig");a(x2e,"EffortSelector");';
+  return `${menu},${ref},${row};${popover};${call};${tags}`;
 }
 
 // ---------------------------------------------------------------- checks
 function main() {
   build();
-  const fx = fixture();
+  // 先装载编译产物：合成夹具要用产品侧的模板渲染，所以 fixture() 必须在 require 之后调用。
   process.env.A2K_APP_ROOT = ROOT;
   const S = require(path.join(BUILD, "selectorStyle.js"));
   const I = S.__selectorStyleInternals;
   const M = I.matchers;
   const P = I.patterns;
   const read = (p) => fs.readFileSync(p, "utf8");
+  let fx;
+  if (SYNTHETIC) {
+    // 强制走合成夹具：CI 里没有 Kiro 安装，本机上也让这一模式可复现（真机段落一律 SKIP）。
+    console.log("\n== 夹具：--synthetic（不读真机安装，只用合成 1.1.x 夹具）");
+    fx = syntheticFixture(M, P);
+  } else {
+    fx = fixture();
+  }
+  if (fx.real) {
+    console.log(
+      `夹具已归一：${fixtureStats.cssStripped} 处 kiro-proxy 残留已移除（CSS 剥离 ${fixtureStats.cssFiles} 份），` +
+        `JS 用备份替换 ${fixtureStats.jsFromBackup} 份 / 本来就干净 ${fixtureStats.jsClean} 份；跳过 0 项`
+    );
+  } else {
+    console.log("夹具：合成 1.1.x（无真机 Kiro 安装）；--synthetic 的项数单独记录，不与 AC-3 的 176 混用");
+  }
   // 真机可能正运行着上一版 API4Kiro，先只在 /tmp 副本中剥掉注入，得到稳定的出厂 fixture。
   // 这样验证脚本不会把“真机当前是否已打补丁”误当成产品行为。每个 package 的 chunk 都归一。
   for (const pk of fx.packages) {
@@ -128,6 +286,11 @@ function main() {
   const isPatched = (t) => t.includes("a2k-model-name-box") || t.includes(M.ROW_FIX_FN);
   for (const pk of fx.packages) console.log(`      · ${pk.pkg} 模型选择器代：${gen(pk.factoryChunk)}`);
 
+  // 真机段落（P1–P3）依赖真实 Kiro bundle 的压缩名与结构，`--synthetic` 模式下整段跳过。
+  if (!fx.real) {
+    console.log("\n== 真机段落 P1–P22 SKIP（--synthetic 模式没有真实 Kiro 安装）");
+    skippedSections++;
+  } else {
   section("P1 跨压缩名等价：靶点全部结构命中（真机 factory 文本）");
   check("fixture 已归一为未打补丁的 factory 文本", !factoryMermaid.includes("a2k-"), "restore 后 mermaid 仍含 a2k-");
   const pairs = [["弹层调用处", P.ORIG_POPOVER_CALL_PATTERN]];
@@ -175,9 +338,13 @@ function main() {
     check("不一致改名不产生命中", hits.length === 0, `实际 ${hits.length} 次`);
   }
 
+  } // ← P1–P3（真机段落）到此结束
+
   section("P4/P8 开启：三靶点 applied 且 a2k- 只来自补丁常量");
   let result;
   (async () => {
+    // P4 起的段落同样只对真机 bundle 成立（压缩名、package 结构都来自真机夹具）
+    if (fx.real) {
     result = await S.syncGroupHeaderStyle(true);
     const patched = read(mermaidFile);
     check("P8 status=applied", result.status === "applied", JSON.stringify(result));
@@ -721,24 +888,78 @@ function main() {
         check(`P22 ${pk.pkg} 普通模型 id 放行`, guardFn("gpt-5.6-terra") === "pass");
       }
     }
+    } // ← P4–P22（真机段落）到此结束
+
+    section("P24 kiro-proxy 前置闸：带残留 ⇒ 整轮不写任何文件 + 还原只删自己的段（三步顺序固定）");
+    {
+      const backendFile = I.paths.kiroAgentBackendFile();
+      const targetFiles = [...fx.packages.flatMap((p) => [p.chunk, p.style]), backendFile];
+      const contents = () => targetFiles.map((f) => read(f));
+      const stamps = () =>
+        targetFiles.map((f) => {
+          const s = fs.statSync(f);
+          return `${s.size}:${s.mtimeMs}`;
+        });
+      const kiroproxyBytes = (texts) => texts.map((t) => (t.match(/kiroproxy-[A-Za-z0-9:_-]*/g) || []).join(","));
+
+      // 归零到出厂态：关闭路径**不跑**前置闸，只删自己的标记段。
+      await S.syncGroupHeaderStyle(false);
+      const factoryContents = contents();
+
+      // ① 归一后的出厂夹具 → 开 → a2k 段必须真的写进去（否则第 ② 步的「一个字都没写」是空转）
+      const s1 = await S.syncGroupHeaderStyle(true);
+      check("P24① 开补丁未被挡住（blockedBy 为空）", s1.blockedBy === undefined, JSON.stringify(s1));
+      const after1 = contents();
+      const marksAll = I.SELECTOR_PATCH_MARKS;
+      let missing = [];
+      for (const pk of fx.packages) {
+        const chunk = read(pk.chunk);
+        const style = read(pk.style);
+        if (!marksAll.some((m) => chunk.includes(m))) missing.push(`${pk.pkg} chunk 无 a2k 标记`);
+        if (!chunk.includes("a2k-card-head")) missing.push(`${pk.pkg} chunk 无 a2k-card-head`);
+        if (!style.includes("a2k-card-head")) missing.push(`${pk.pkg} style.css 无 CARD_CSS`);
+        if (gen(pk.factoryChunk) === "v2" && !chunk.includes(M.ROW_FIX_FN)) missing.push(`${pk.pkg} v2 无 a2kRowFix`);
+      }
+      check("P24① 每个 package 的 a2k 段均已写入", missing.length === 0, missing.join("; "));
+      check("P24① 后端钩子已写入", read(backendFile).includes("__kiroModelConfigProvider=t"), read(backendFile).slice(0, 200));
+
+      // ② 在同一份**已打补丁**的夹具上注入 kiroproxy- 残留 → 整轮不写任何文件
+      const cssResidue = "\n/*kiroproxy-ctxwin-css:r1*/\n.kiroproxy-ctxwin-wrap{display:flex}\n";
+      fs.appendFileSync(fx.packages[0].style, cssResidue, "utf8");
+      const jsResidue = "/*kiroproxy-toolcard:r1*/var kiroproxyProbe=1;/*kiroproxy-toolcard:end*/";
+      fs.appendFileSync(fx.packages[0].chunk, jsResidue, "utf8");
+      const before2 = contents();
+      const stamps2 = stamps();
+      const proxy2 = kiroproxyBytes(before2);
+      const s2 = await S.syncGroupHeaderStyle(true);
+      check("P24② status=unavailable 且 blockedBy=kiro-proxy", s2.status === "unavailable" && s2.blockedBy === "kiro-proxy", JSON.stringify(s2));
+      check("P24② 三个靶点都报 unavailable", s2.targets.style === "unavailable" && s2.targets.selectorScript === "unavailable" && s2.targets.backend === "unavailable", JSON.stringify(s2.targets));
+      check("P24② 未抛错且有中文 detail", !!s2.detail && s2.detail.includes("kiro-proxy"), String(s2.detail));
+      check("P24② 所有目标文件 bytes 逐字一致", contents().every((t, i) => t === before2[i]), "有文件被改写了");
+      check("P24② 所有目标文件 mtime 逐字一致", stamps().every((t, i) => t === stamps2[i]), `${stamps().join(" ")} vs ${stamps2.join(" ")}`);
+
+      // ③ 关闭：只删自己的段，kiroproxy- 的字节一个都不碰
+      const s3 = await S.syncGroupHeaderStyle(false);
+      const after3 = contents();
+      const leftovers = [];
+      for (let i = 0; i < targetFiles.length; i++) {
+        const t = after3[i];
+        for (const m of marksAll) {
+          if (t.includes(m)) leftovers.push(`${path.basename(targetFiles[i])}:${m}`);
+        }
+        if (t.includes("/*a2k-row:")) leftovers.push(`${path.basename(targetFiles[i])}:/​*a2k-row:`);
+      }
+      check("P24③ SELECTOR_PATCH_MARKS 与 /*a2k-row: 全部消失", leftovers.length === 0, leftovers.join(", "));
+      check("P24③ kiroproxy- 的字节与第 ② 步逐字一致", kiroproxyBytes(after3).every((v, i) => v === proxy2[i]), `${kiroproxyBytes(after3).join(" | ")} vs ${proxy2.join(" | ")}`);
+      check("P24③ 注入的两段残留原文仍在（别人的字节一个都不碰）", after3[0].includes(jsResidue) && after3[1].includes(cssResidue.trim()), "注入段被误删");
+      check("P24③ 关闭路径不报 blockedBy", s3.blockedBy === undefined, JSON.stringify(s3));
+      // 收尾：把夹具写回出厂态（P24 是最后一个依赖夹具的段落，留着残留会让人工排查误以为脚本写过东西）
+      targetFiles.forEach((f, i) => fs.writeFileSync(f, factoryContents[i], "utf8"));
+    }
 
     section("P23 合成 1.1.x 夹具：v1 全链路（选项行 / 菜单 / ref / 弹层 / Ctx）仍能打上并逐字往返");
     {
-      const RN = ["E", "R", "O"];
-      const RA = ["w", "I", "N"];
-      const row = M.renderTemplate(P.ORIG_JS_PATTERN, RN, RA);
-      const menu = M.renderTemplate(P.ORIG_MENU_PATTERN, RN, RA);
-      const ref = M.renderTemplate(P.ORIG_REF_PATTERN, RN, RA);
-      const popover = M.renderTemplate(
-        P.ORIG_POPOVER_PATTERN,
-        ["Bde", "re", "Pde", "E", "R", "O", "I", "B", "z"],
-        ["n2e", "ne", "t2e", "w", "I", "N", "R", "$", "H"]
-      );
-      const call = M.renderTemplate(P.ORIG_POPOVER_CALL_PATTERN, ["Bde", "Y"], ["n2e", "q"]);
-      // 调用处不能紧贴在 EffortSelector 标签后面：applyCtxSelector 在标签末尾插函数、在调用处做替换，
-      // 两段起点相同时会互相踩（真机 bundle 里两者相隔很远，不会出现）。这里把调用处放在标签前。
-      const tags = 'b.jsx(x2e,{disabled:K});a(E0,"useSessionConfig");a(x2e,"EffortSelector");';
-      const syn = `${menu},${ref},${row};${popover};${call};${tags}`;
+      const syn = buildSyntheticV1Chunk(M, P);
       check("P23 合成夹具判为 v1", gen(syn) === "v1", gen(syn));
       const applied = M.applySelectorScript(syn);
       for (const mark of ["a2k-model-name-box", "a2k-model-selector-menu", "a2kScrolled", "a2k-cu-head", "a2kCtxSel"]) {
@@ -756,7 +977,10 @@ function main() {
       check("P23 1.2.56 形态弹层函数可命中（fn=Ake）", !!f12 && f12.names.fn === "Ake", f12 ? JSON.stringify(f12.names) : "null");
     }
 
-    console.log(`\n${pass} passed, ${fail} failed  (workdir ${WORK})`);
+    console.log(
+      `\n${pass} passed, ${fail} failed, ${skippedSections} section(s) skipped  (workdir ${WORK})` +
+        (fx.real ? "" : "  [--synthetic：项数单独记录，不与 AC-3 的 176 混用]")
+    );
     process.exitCode = fail ? 1 : 0;
   })().catch((e) => {
     console.error("\nverification crashed:", e);

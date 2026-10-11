@@ -14,9 +14,11 @@
  * 在读取时自动合成为 provider 条目，不迁移不写回，保证旧配置零丢失、可回滚。
  */
 
-import { CONFIG_NS, cfg, normalizeUrl, readUserLevelArray, updateSetting } from "./config";
+import { CONFIG_NS, cfg, normalizeUrl, readFallbackRaw, readStrRaw, readUserLevelArray, updateSetting, writeFallbackRaw } from "./config";
 import { warn } from "./log";
 import { getToken, hasToken } from "./oauth/tokenStore";
+import { isPlaceholder, keySlot, resolveKeyValue } from "./keyPlaceholder";
+import { ApiKeyVault, initApiKeys, mergeForWrite, resolveLegacyKey, type KeySettingsPort, type RawSlotLocation } from "./apiKeys";
 import { ANTHROPIC_URLS, ANTIGRAVITY_URLS, CODEX_URLS, KIMI_URLS, KIRO_URLS, VendorSpec, XAI_URLS, getVendor } from "./oauth/vendors";
 import { CatalogProvider, catalogProvider, catalogProviders } from "./modelCatalog";
 import { clientUserAgent, sessionIdFor } from "./clientIdentity";
@@ -477,6 +479,30 @@ export function getPreset(id: string | undefined): Preset | undefined {
 
 const STORE_KEY = "providers";
 
+/** 归一出一个 provider 的 id（`coerce` 与 `buildRawSlotIndex` 共用，保证两处认的是同一个 id）。 */
+function providerIdOf(r: Record<string, unknown>, index: number): string {
+  return typeof r.id === "string" && r.id.trim() ? r.id.trim() : `p${index + 1}`;
+}
+
+/**
+ * c1 槽位在原文里取哪个值：旧字段 `apiKey` 与 `credentials[0].apiKey` 的胜者——**与 `coerce` 的注水同一条规则**。
+ * 两处共用它，于是「迁移收集到的值」与「注水解出来的值」不可能不一致（否则会把一个被覆盖的旧值搬进钥匙串）。
+ */
+function primaryRaw(
+  providerId: string,
+  rawApiKey: string,
+  rawCred0: string,
+  cred0Present: boolean
+): { raw: string; field: string } {
+  const slot = keySlot(providerId, PRIMARY_CREDENTIAL_ID);
+  const apiKeyResolved = resolveKeyValue(rawApiKey, slot);
+  const cred0Resolved = resolveKeyValue(rawCred0, slot);
+  if (!isPlaceholder(rawApiKey) && apiKeyResolved !== "" && cred0Resolved !== apiKeyResolved) {
+    return { raw: rawApiKey, field: "apiKey" };
+  }
+  return cred0Present ? { raw: rawCred0, field: "credentials[0].apiKey" } : { raw: rawApiKey, field: "apiKey" };
+}
+
 /** 校验并归一一条 provider 记录，非法则返回 undefined。 */
 function coerce(raw: unknown, index: number): ProviderConfig | undefined {
   if (!raw || typeof raw !== "object") {
@@ -485,7 +511,7 @@ function coerce(raw: unknown, index: number): ProviderConfig | undefined {
   const r = raw as Record<string, unknown>;
   const protocol: Protocol =
     r.protocol === "openai" ? "openai" : r.protocol === "gemini" ? "gemini" : r.protocol === "kiro" ? "kiro" : "anthropic";
-  const id = typeof r.id === "string" && r.id.trim() ? r.id.trim() : `p${index + 1}`;
+  const id = providerIdOf(r, index);
   const anthropicMode: AnthropicMode = r.anthropicMode === "official" ? "official" : "kiro";
   const openaiApi: OpenaiApi = r.openaiApi === "responses" ? "responses" : "chat";
   const modelMapping =
@@ -503,7 +529,7 @@ function coerce(raw: unknown, index: number): ProviderConfig | undefined {
     : undefined;
   const auth: AuthKind | undefined = r.auth === "oauth" ? "oauth" : undefined;
   const apiKey = typeof r.apiKey === "string" ? r.apiKey.trim() : "";
-  const credentials = coerceCredentials(r.credentials, apiKey, auth === "oauth");
+  const { credentials, slots } = normalizeCredentials(r.credentials, auth === "oauth", id, index, apiKey);
   const p: ProviderConfig = {
     id,
     name: typeof r.name === "string" && r.name.trim() ? r.name.trim() : id,
@@ -525,17 +551,118 @@ function coerce(raw: unknown, index: number): ProviderConfig | undefined {
     modelOverrides,
     enabledModels,
   };
+  hydrateKeys(p, apiKey, slots);
   syncPrimaryCredential(p);
   return p;
 }
 
 /**
- * 归一 credentials 数组：去掉非法项、补 id / priority、保证首条是 c1。
- * 没写或为空 → undefined（读时按"只有 apiKey 这一把"理解，见 credentialsOf）。
+ * 读取侧注水（D5）：把 settings 里读到的占位标记换成钥匙串真值。顺序**不可调换**。
+ *
+ * 为什么「旧字段 apiKey 覆盖 c1」的规则要从 `coerceCredentials` 挪到这里：迁移之后
+ * `r.apiKey` 与 `credentials[0].apiKey` 都是**非空占位**，先覆盖再注水会把用户在
+ * `credentials[0].apiKey` 上手填的**新明文覆盖成占位**，随后注水读到钥匙串里的旧值，
+ * 下一次 `saveProviders` 又把占位写回 → 新明文永久消失且从未进钥匙串。
+ * 改成「比较**解析后**的值」后，占位（旧字段）对上明文（首条凭证）时明文胜出，那个明文就是待迁移的新值。
  */
-function coerceCredentials(raw: unknown, apiKey: string, oauth: boolean): Credential[] | undefined {
+function hydrateKeys(p: ProviderConfig, rawApiKey: string, slots: Map<string, RawSlotLocation>): void {
+  const slot0 = keySlot(p.id, PRIMARY_CREDENTIAL_ID);
+  const rawCred0 = slots.get(slot0)?.raw ?? rawApiKey;
+  const apiKeyResolved = resolveKeyValue(rawApiKey, slot0);
+  const cred0Resolved = resolveKeyValue(rawCred0, slot0);
+  const winner =
+    !isPlaceholder(rawApiKey) && apiKeyResolved !== "" && cred0Resolved !== apiKeyResolved ? apiKeyResolved : cred0Resolved;
+  if (p.credentials && p.credentials.length > 0) {
+    p.credentials[0].apiKey = winner || undefined;
+    for (let i = 1; i < p.credentials.length; i++) {
+      const c = p.credentials[i];
+      const slot = keySlot(p.id, c.id);
+      c.apiKey = resolveKeyValue(slots.get(slot)?.raw ?? "", slot) || undefined;
+    }
+  }
+  p.apiKey = winner;
+}
+
+/**
+ * 把 settings 原文映射成 `槽位 → 原文位置`。**必须与 `coerce` 共用同一套归一序**（本函数与 `coerce`
+ * 同调 `normalizeCredentials`），否则迁移会搬错值、失败回退会回退错字段。
+ */
+export function buildRawSlotIndex(rawProviders: unknown[]): Map<string, RawSlotLocation> {
+  const out = new Map<string, RawSlotLocation>();
+  rawProviders.forEach((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return;
+    }
+    const r = raw as Record<string, unknown>;
+    const id = providerIdOf(r, index);
+    const apiKey = typeof r.apiKey === "string" ? r.apiKey.trim() : "";
+    const { slots } = normalizeCredentials(r.credentials, r.auth === "oauth", id, index, apiKey);
+    for (const [slot, loc] of slots) {
+      if (!out.has(slot)) {
+        out.set(slot, loc);
+      }
+    }
+  });
+  return out;
+}
+
+/** 归一 + 槽位表（`coerce` 与 `buildRawSlotIndex` 的唯一入口）。 */
+function normalizeCredentials(
+  raw: unknown,
+  oauth: boolean,
+  providerId: string,
+  providerIndex: number,
+  rawApiKey: string
+): { credentials: Credential[] | undefined; slots: Map<string, RawSlotLocation> } {
+  const slots = new Map<string, RawSlotLocation>();
+  const norm = coerceCredentials(raw, oauth);
+  if (oauth) {
+    // OAuth 类 provider 的 key 字段永远是空的（token 在钥匙串里按裸键存），槽位表里没有它，
+    // 于是「槽位集合 == expectedSlots(归一列表)」这条自洽性对两种 provider 都成立。
+    return { credentials: norm.credentials, slots };
+  }
+  if (!norm.credentials || norm.credentials.length === 0) {
+    // 没写 credentials：c1 的原文就是旧字段 apiKey
+    slots.set(keySlot(providerId, PRIMARY_CREDENTIAL_ID), {
+      providerIndex,
+      providerId,
+      credentialId: PRIMARY_CREDENTIAL_ID,
+      field: "apiKey",
+      raw: rawApiKey,
+    });
+    return { credentials: undefined, slots };
+  }
+  const rawCred0 = norm.rawKeys.get(PRIMARY_CREDENTIAL_ID) ?? rawApiKey;
+  const primary = primaryRaw(providerId, rawApiKey, rawCred0, norm.rawKeys.has(PRIMARY_CREDENTIAL_ID));
+  slots.set(keySlot(providerId, PRIMARY_CREDENTIAL_ID), {
+    providerIndex,
+    providerId,
+    credentialId: PRIMARY_CREDENTIAL_ID,
+    field: primary.field,
+    raw: primary.raw,
+  });
+  for (let i = 1; i < norm.credentials.length; i++) {
+    const c = norm.credentials[i];
+    slots.set(keySlot(providerId, c.id), {
+      providerIndex,
+      providerId,
+      credentialId: c.id,
+      field: `credentials[${i}].apiKey`,
+      raw: norm.rawKeys.get(c.id) ?? "",
+    });
+  }
+  return { credentials: norm.credentials, slots };
+}
+
+/**
+ * 归一 credentials 数组：去掉非法项、补 id / priority、保证首条是 c1。
+ * 没写或为空 → credentials undefined（读时按"只有 apiKey 这一把"理解，见 credentialsOf）。
+ * `rawKeys` 是「归一号 → 该条目在原文里的 apiKey 串」，供槽位表使用。
+ */
+function coerceCredentials(raw: unknown, oauth: boolean): { credentials: Credential[] | undefined; rawKeys: Map<string, string> } {
+  const rawKeys = new Map<string, string>();
   if (!Array.isArray(raw) || raw.length === 0) {
-    return undefined;
+    return { credentials: undefined, rawKeys };
   }
   // 先把合法条目挑出来，并保留它们显式写的 id（首次出现者优先）；没写 / 非法 / 重复的 id 第二遍再补号。
   // 若边扫边补号，一条排在前面、没写 id 的凭证会抢走 "c1"，随后被旧字段 apiKey 覆盖——那把 key 就丢了，
@@ -575,22 +702,25 @@ function coerceCredentials(raw: unknown, apiKey: string, oauth: boolean): Creden
       priority: typeof c.priority === "number" && isFinite(c.priority) ? Math.max(0, Math.floor(c.priority)) : out.length,
       enabled: c.enabled !== false,
     });
+    rawKeys.set(it.id, it.key);
   }
   if (out.length === 0) {
-    return undefined;
+    return { credentials: undefined, rawKeys };
   }
   // 首条必须是 c1（它镜像到 apiKey / tokenStore[providerId]）；不是就把 c1 挪到最前，没有 c1 就把第一条改名
   const idx = out.findIndex((c) => c.id === PRIMARY_CREDENTIAL_ID);
   if (idx > 0) {
     out.unshift(...out.splice(idx, 1));
   } else if (idx < 0) {
+    // 第一条改名成 c1：它在原文里的值跟着搬到新号上
+    const oldKey = rawKeys.get(out[0].id) ?? "";
     out[0].id = PRIMARY_CREDENTIAL_ID;
+    rawKeys.set(PRIMARY_CREDENTIAL_ID, oldKey);
   }
-  // 旧字段 apiKey 与 c1 不一致时以 apiKey 为准（用户可能在旧版面板里改过 key）
-  if (!oauth && apiKey && out[0].apiKey !== apiKey) {
-    out[0].apiKey = apiKey;
-  }
-  return out;
+  // 旧字段 apiKey 与 c1 不一致时「以 apiKey 为准」的规则**移出本函数**：
+  // 迁移之后两个字段都是占位，先覆盖再注水会吃掉用户在 credentials[0] 上手填的明文。
+  // 现在的落点是 coerce 的 hydrateKeys（比较解析后的值），见那里的注释。
+  return { credentials: out, rawKeys };
 }
 
 export function freshCredentialId(existing: Array<{ id: string }>): string {
@@ -678,8 +808,9 @@ function migrateFromLegacy(): ProviderConfig[] {
   const anthBase = normalizeUrl(
     mode === "official" ? c.get<string>("officialBaseUrl", "") || "" : c.get<string>("baseUrl", "") || ""
   );
-  const anthKey = (
-    mode === "official" ? c.get<string>("officialApiKey", "") || "" : c.get<string>("apiKey", "") || ""
+  const anthKey = resolveLegacyKey(
+    mode === "official" ? c.get<string>("officialApiKey", "") || "" : c.get<string>("apiKey", "") || "",
+    mode === "official" ? "officialApiKey" : "apiKey"
   ).trim();
   if (anthBase || anthKey) {
     out.push({
@@ -701,7 +832,7 @@ function migrateFromLegacy(): ProviderConfig[] {
   }
 
   const oaiBase = normalizeUrl(c.get<string>("openaiBaseUrl", "") || "");
-  const oaiKey = (c.get<string>("openaiApiKey", "") || "").trim();
+  const oaiKey = resolveLegacyKey(c.get<string>("openaiApiKey", "") || "", "openaiApiKey").trim();
   const oaiEnabledFlag = c.get<boolean>("openaiEnabled", false);
   if (oaiBase || oaiKey) {
     out.push({
@@ -737,6 +868,49 @@ export function getProviders(): ProviderConfig[] {
 
 let workspaceShadowWarned = false;
 
+/**
+ * 交给 `apiKeys.ts` 的设置端口：**只读写设置**，钥匙串操作全在 `ApiKeyVault` 里。
+ * 归一序（`slotIndexFor`）与 `coerce` 共用 `normalizeCredentials`，不存在第二套实现。
+ */
+const keySettingsPort: KeySettingsPort = {
+  readProviders: () => readUserLevelArray(STORE_KEY).value,
+  readProviderList: () => getProviders(),
+  slotIndexFor: (raw) => buildRawSlotIndex(raw),
+  credentialsOf: (p) => credentialsOf(p),
+  writeProviders: (list) => updateSetting(STORE_KEY, list),
+  readLegacyRaw: (key) => readStrRaw(key),
+  writeLegacy: (key, value) => updateSetting(key, value),
+  readFallback: (key) => readFallbackRaw(key),
+  writeFallback: async (key, value) => {
+    try {
+      await writeFallbackRaw(key, value);
+      return { settingsOk: true };
+    } catch (e) {
+      return { settingsOk: false, error: (e as Error)?.message || String(e) };
+    }
+  },
+};
+
+let vault: ApiKeyVault | undefined;
+
+/** 本模块自己的 vault 实例：写入漏斗不依赖 `initApiKeys` 的调用顺序。 */
+function keyVault(): ApiKeyVault {
+  if (!vault) {
+    vault = new ApiKeyVault({ port: keySettingsPort });
+  }
+  return vault;
+}
+
+/** activate 里调用：把同一个端口交给 `apiKeys` 的模块级包装（迁移与旧键读取用）。 */
+export function initApiKeySettings(): void {
+  initApiKeys(keySettingsPort);
+}
+
+/** 仅测试用：拿到本模块组装的那份设置端口（测试要自己造 `ApiKeyVault` 注入假日志时用）。 */
+export function _keySettingsPortForTest(): KeySettingsPort {
+  return keySettingsPort;
+}
+
 function noteWorkspaceShadow(shadowed: boolean): void {
   if (!shadowed) {
     workspaceShadowWarned = false;
@@ -749,13 +923,24 @@ function noteWorkspaceShadow(shadowed: boolean): void {
   warn(`工作区级 ${CONFIG_NS}.${STORE_KEY} 已被忽略：该项只在用户设置里生效（scope: machine），本次按用户级值读取`);
 }
 
-/** 写整张注册表。写前把 c1 镜像回 apiKey，两处永远一致。 */
-export async function saveProviders(list: ProviderConfig[]): Promise<{ ok: boolean; error?: string }> {
+/**
+ * 写整张注册表。写前把 c1 镜像回 apiKey，两处永远一致。
+ *
+ * 三段（顺序即语义）：
+ *  ① `persistProviderKeys`：后端闸 → 写钥匙串 → 穿透存储层确认 → 回收孤儿槽位。只产出失败槽位，**任何一个都不外抛**；
+ *  ② 写 settings 之前的原文快照（失败时按 provider 级整体回退用）；
+ *  ③ **无条件**写 settings：metadata（改名 / 勾选模型 / 开关…）必须落盘，Key 字段按失败槽位决定写占位还是回退原文。
+ */
+export async function saveProviders(
+  list: ProviderConfig[]
+): Promise<{ ok: boolean; error?: string; keySlotsFailed?: string[] }> {
   for (const p of list) {
     syncPrimaryCredential(p);
   }
-  const r = await updateSetting(STORE_KEY, list);
-  return { ok: r.settingsOk, error: r.error };
+  const keySlotsFailed = await keyVault().persistProviderKeys(list);
+  const previousRaw = readUserLevelArray(STORE_KEY).value;
+  const r = await updateSetting(STORE_KEY, mergeForWrite(keySettingsPort, list, previousRaw, new Set(keySlotsFailed)));
+  return { ok: r.settingsOk, error: r.error, keySlotsFailed };
 }
 
 export function getProvider(id: string): ProviderConfig | undefined {

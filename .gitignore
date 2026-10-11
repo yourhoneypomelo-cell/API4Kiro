@@ -17,5 +17,7 @@ Thumbs.db
 # Spec 工具的会话指针（瞬态，不进仓库）
 .kiro/specs/_active
 
+# 单测的预编译产物与 vscode 宿主桩（npm test 的 pretest 每次重建）
+tests/.build/
 # 工作流产物（任务记录、流水线中间稿），含本机绝对路径，不进公开仓库
 .agents/

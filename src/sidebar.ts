@@ -1753,8 +1753,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     let settleChannelA!: (ok: boolean) => void;
     this.channelA = new Promise<boolean>((resolve) => (settleChannelA = resolve));
     const r = await saveProviders(list);
-    if (r.ok) {
+    const keyFailed = r.keySlotsFailed?.length || 0;
+    if (r.ok && keyFailed === 0) {
       this.toast("ok", okMsg);
+    } else if (keyFailed > 0 && r.ok) {
+      // 系统钥匙串不可用或写入没确认落地：其它改动照常生效，但本次 Key 变更没生效。
+      error("provider key 未写入系统钥匙串,本次 Key 变更未生效:", `${keyFailed} 项`);
+      this.toast("error", `已保存其它改动；系统钥匙串不可用，本次 Key 变更未生效（${keyFailed} 项），稍后重试`);
     } else {
       error("provider 未写入 Kiro 设置,已本地兜底:", r.error || "");
       this.toast("error", "已本地保存并生效；但未写入 Kiro 设置:" + (r.error || "未知错误"));

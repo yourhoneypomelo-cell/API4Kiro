@@ -270,9 +270,15 @@ export class TokenStore {
     });
   }
 
-  /** 删掉某 provider 的全部 token（裸键 + 所有 providerId/cN 键，含别的窗口刚加进来的）。删 provider 时用。 */
+  /** 删掉某 provider 的全部 token（裸键 + 所有 providerId/cN 键 + key: 命名空间的同名键，含别的窗口刚加进来的）。删 provider 时用。 */
   deleteProviderTokens(providerId: string): void {
-    const matches = (k: string) => k === providerId || k.startsWith(providerId + "/");
+    // `key:` 是 API Key 的命名空间（见 keyPlaceholder.keySlot）：删 provider 时要把 key 池里的
+    // 条目一起清干净，否则重新加一个同 id 的 provider 会复活旧 key。
+    const matches = (k: string) =>
+      k === providerId ||
+      k.startsWith(providerId + "/") ||
+      k === `key:${providerId}` ||
+      k.startsWith(`key:${providerId}/`);
     if (!Object.keys(this.view).some(matches)) {
       return;
     }
@@ -286,8 +292,7 @@ export class TokenStore {
   }
 
   /** 复制一份 token（「创建副本」时新 provider 共用同一账号）。 */
-  copyToken(fromKey: string, toKey: string): void {
-    if (!this.view[fromKey]) {
+  copyToken(fromKey: string, toKey: string): void {    if (!this.view[fromKey]) {
       return;
     }
     this.mutate((t) => {
@@ -319,10 +324,42 @@ export class TokenStore {
     return this.chain;
   }
 
+  /**
+   * 写入会落到哪里：有 SecretStorage 就是 `secrets`（**哪怕现在还没有 blob**），否则 `state`。
+   * 定义的是「落点」而不是「上次读到了什么」——只用 API Key、从没做过第三方账号登录的用户
+   * 钥匙串里没有 blob（`readStorage` 返回 `source: "none"`），按「上次读到什么」判会把他们永远判成不可用。
+   */
+  backend(): TokenStoreBackend {
+    return secretsOf(this.ctx) ? "secrets" : "state";
+  }
+
+  /**
+   * 落盘**并穿透到存储层确认**这些键真的写进去了（写 API Key 前的唯一「写成功」依据）。
+   * 不成立就 reject `TokenStoreLoadError`。为什么不能用 `getToken(key)` 回读：`setToken` → `mutate()`
+   * **同步**就把值写进了本窗口的内存视图 `view`，而 `enqueue()` 给每一步套了 `.catch()`、
+   * `persistPending()` 自己又 try/catch 掉落盘异常并 `armRetry()`——所以 `flush()` 永不 reject，
+   * 用内存视图回读会在「只有内存里写成功」时也通过，随后调用方把明文换成占位，key 就只剩内存。
+   */
+  async flushVerified(expected: Record<string, string>): Promise<void> {
+    if (this.pending.length) {
+      this.enqueue(() => this.persistPending());
+    }
+    await this.chain;
+    await this.enqueueChecked(() => this.verifyStored(expected));
+  }
+
   /** 主动重读钥匙串（onDidChange 之外的补救入口）。 */
   reload(): Promise<void> {
     this.enqueue(() => this.reloadNow());
     return this.chain;
+  }
+
+  /**
+   * 视图里所有以 `prefix` 开头的键（同步、无 I/O）。回收 key 池孤儿槽位时要先知道有哪些槽位。
+   * 含本窗口尚未落盘的改动，所以刚写进去的槽位立刻可见。
+   */
+  keysWithPrefix(prefix: string): string[] {
+    return Object.keys(this.view).filter((k) => k.startsWith(prefix));
   }
 
   /** 加载失败（钥匙串读错 / 数据非法）时的错误；非空期间一切会改表的写入都抛同样的错误。 */
@@ -384,6 +421,51 @@ export class TokenStore {
   private enqueue(step: () => Promise<void>): void {
     const safe = () => step().catch((e) => error("oauth token store: step failed:", (e as Error)?.message || String(e)));
     this.chain = this.chain.then(safe, safe);
+  }
+
+  /**
+   * 与前一步串行、但**不吞掉**自己失败的步骤：返回值原样透出 reject 给调用方；
+   * 同时把「吞掉失败」的那条接回 `this.chain`，保证后续步骤不被这一个失败打断。
+   */
+  private enqueueChecked(step: () => Promise<void>): Promise<void> {
+    const run = this.chain.then(step, step);
+    this.chain = run.then(
+      () => undefined,
+      (e) => error("oauth token store: verified flush failed:", (e as Error)?.message || String(e))
+    );
+    return run;
+  }
+
+  /** 穿透存储层的写成功校验，见 `flushVerified`。比对对象只能是刚从存储层读回来的表。 */
+  private async verifyStored(expected: Record<string, string>): Promise<void> {
+    const c = this.ctx;
+    if (this.pending.length) {
+      throw new TokenStoreLoadError(
+        "keychain_read_failed",
+        `登录 token 存储不可用：写入系统钥匙串失败（有 ${this.pending.length} 项改动没能落盘）。${REFUSED}；请重启 Kiro 后重试。`,
+        `${this.pending.length} pending op(s) still unpersisted`
+      );
+    }
+    if (!c) {
+      throw new TokenStoreLoadError("keychain_read_failed", `登录 token 存储不可用：尚未初始化。${REFUSED}；请重启 Kiro 后重试。`, "token store not initialized");
+    }
+    const snap = await this.readStorage(c);
+    if (snap.source !== "secrets") {
+      throw new TokenStoreLoadError(
+        "keychain_read_failed",
+        `登录 token 存储不可用：写入没有落到系统钥匙串（落点 ${snap.source === "state" ? "插件本地存储" : "空"}）。${REFUSED}；请重启 Kiro 后重试。`,
+        `storage source is ${snap.source}`
+      );
+    }
+    for (const [slot, value] of Object.entries(expected)) {
+      if (snap.table[slot]?.accessToken !== value) {
+        throw new TokenStoreLoadError(
+          "keychain_read_failed",
+          `登录 token 存储不可用：写入后回读不一致（槽位 ${slot}）。${REFUSED}；请重启 Kiro 后重试。`,
+          `slot ${slot} mismatch after write`
+        );
+      }
+    }
   }
 
   private async load(c: vscode.ExtensionContext): Promise<void> {
@@ -643,9 +725,17 @@ export class TokenStore {
 
 const store = new TokenStore();
 
+/** 写入会落到哪里：`secrets` = 系统钥匙串，`state` = 插件本地存储（拿不到 SecretStorage）。 */
+export type TokenStoreBackend = "secrets" | "state";
+
 /** 启动时调用；从 SecretStorage（或 globalState）加载整张表。读失败不抛：记错、读为空、写入拒绝。 */
 export function initTokenStore(context: vscode.ExtensionContext): Promise<void> {
   return store.init(context);
+}
+
+/** 写入会落到哪里（见 `TokenStore.backend`）。写 API Key 前的取向后端闸用它。 */
+export function tokenStoreBackend(): TokenStoreBackend {
+  return store.backend();
 }
 
 /** token 表变化时通知（UI 刷新登录状态）。 */
@@ -690,6 +780,14 @@ export function flushTokens(): Promise<void> {
   return store.flush();
 }
 
+/**
+ * 落盘并**穿透到存储层确认**这些键真的写进去了；不成立就 reject `TokenStoreLoadError`。
+ * 写 API Key 前的唯一「写成功」依据，见 `TokenStore.flushVerified`。
+ */
+export function flushTokensOrThrow(expected: Record<string, string>): Promise<void> {
+  return store.flushVerified(expected);
+}
+
 /** 加载失败（钥匙串读错 / 数据非法）时的错误；非空期间一切会改表的写入都抛同样的错误。 */
 export function tokenStoreLoadError(): TokenStoreLoadError | undefined {
   return store.loadFailure();
@@ -698,6 +796,11 @@ export function tokenStoreLoadError(): TokenStoreLoadError | undefined {
 /** 主动重读钥匙串（onDidChange 之外的补救入口）。 */
 export function reloadTokens(): Promise<void> {
   return store.reload();
+}
+
+/** 视图里所有以 `prefix` 开头的键（同步、无 I/O）。key 池孤儿槽位回收用。 */
+export function listStoredKeys(prefix: string): string[] {
+  return store.keysWithPrefix(prefix);
 }
 
 /** 仅测试用。 */

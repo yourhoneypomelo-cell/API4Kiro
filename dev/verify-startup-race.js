@@ -29,6 +29,27 @@ const EXT_FILE = path.join(ROOT, "extensions/kiro.kiro-agent/dist/extension.js")
 
 let pass = 0;
 let fail = 0;
+/** 跳过的段落数（真机夹具不可用 / 带残留时）。与 AC-3 的 61 项分开记录。 */
+let skippedSections = 0;
+
+/**
+ * 真机 `dist/extension.js` 的归一文本：优先取同名 `.kiroproxy-bak-*` 备份（该 Kiro 构建的出厂原文），
+ * 否则用原文；原文仍含残留时返回 null（本段 SKIP —— 产品侧前置闸会拒绝对带残留的文件做任何写入）。
+ * **不做文本清洗**：JS 里有未配对的行内 `/*kiroproxy-…*​/` 标记，按定界段剥离会漏掉或误吞后续代码。
+ */
+function normalizedRealText(srcFile, fallbackText) {
+  const dir = path.dirname(srcFile);
+  const base = path.basename(srcFile);
+  const backup = fs.readdirSync(dir).find((f) => f.startsWith(base + ".kiroproxy-bak-"));
+  const text = backup ? fs.readFileSync(path.join(dir, backup), "utf8") : fallbackText;
+  if (text.includes("kiroproxy-")) {
+    return null;
+  }
+  if (backup) {
+    console.log(`      · 已用备份替换：${backup}`);
+  }
+  return text;
+}
 const check = (name, ok, extra) => {
   if (ok) {
     pass++;
@@ -263,19 +284,62 @@ async function main() {
     check("R1 打过补丁的 extension.js 通过 node --check", parses);
     check("R1 restore 与出厂归一内容逐字相同", M.restoreUsageHook(real2) === factory);
     check("R1 再打一次无变化（幂等）", M.applyUsageHook(M.restoreUsageHook(real2)) === real2);
-    // 整条规划链路：真机副本放进沙箱，开 → 再开 → 关
-    fs.writeFileSync(EXT_FILE, realText, "utf8");
+    // 整条规划链路：真机副本放进沙箱，开 → 再开 → 关。
+    // 写进沙箱的那一份要归一：本机真实 Kiro 的 extension.js 带 kiro-proxy 残留，产品侧新增的
+    // 「检测到 kiroproxy- 就不写任何文件」前置闸会让本段整体 unavailable。JS 不能文本清洗
+    // （有未配对的行内标记），所以优先取同名 .kiroproxy-bak-* 备份；仍带残留就本段 SKIP。
+    const sandboxText = normalizedRealText(realFile, realText);
+    if (sandboxText === null) {
+      console.log(`  SKIP  ${realFile} 带 kiro-proxy 残留且无 .kiroproxy-bak-* 备份可用（本段会撞前置闸）`);
+      skippedSections++;
+    } else {
+    fs.writeFileSync(EXT_FILE, sandboxText, "utf8");
     const s1 = await S.syncGroupHeaderStyle(true);
     const afterOn = read(EXT_FILE);
     check("R1 sync(true)：usageRetry 为 applied 或 unchanged，且文件含 usage 段", (s1.extras.usageRetry === "applied" || s1.extras.usageRetry === "unchanged") && count(afterOn, M.USAGE_START) === 3, JSON.stringify(s1.extras));
     const s2 = await S.syncGroupHeaderStyle(true);
     check("R1 再规划无变化", s2.extras.usageRetry === "unchanged" && read(EXT_FILE) === afterOn, JSON.stringify(s2.extras));
     const s3 = await S.syncGroupHeaderStyle(false);
-    check("R1 sync(false) 后与出厂归一内容逐字相同", factoryNormalize(read(EXT_FILE)) === read(EXT_FILE) && read(EXT_FILE) === factory, JSON.stringify(s3.extras));
+    check("R1 sync(false) 后与出厂归一内容逐字相同", factoryNormalize(read(EXT_FILE)) === read(EXT_FILE) && factoryNormalize(read(EXT_FILE)) === factoryNormalize(sandboxText), JSON.stringify(s3.extras));
+    }
     // U7：真机文件上三个钩子（主 / ctx 宿主 / usage）共存并往返
     const withAll = M.applyUsageHook(M.applyCtxHostHook(M.applyBackendHook ? M.applyBackendHook(factory) : factory));
     check("U7 三钩子叠加后 usage 段仍是 3 段", count(withAll, M.USAGE_START) === 3);
     check("U7 三钩子叠加后整体还原到出厂", factoryNormalize(withAll) === factory);
+  }
+
+  // ------------------------------------------------------------ K
+  section("K1 kiro-proxy 前置闸：带残留 ⇒ 整轮不写任何文件（三步顺序固定）");
+  {
+    const marks = () => read(EXT_FILE).includes("__kiroModelConfigProvider=t");
+    const stamp = () => {
+      const s = fs.statSync(EXT_FILE);
+      return `${s.size}:${s.mtimeMs}`;
+    };
+    const proxyBytes = () => (read(EXT_FILE).match(/kiroproxy-[A-Za-z0-9:_-]*/g) || []).join(",");
+    // ① 出厂后端文件 → 开补丁 → 钩子必须真的写进去（否则第 ② 步的「一个字都没写」是空转）
+    fs.writeFileSync(EXT_FILE, MAIN_FACTORY, "utf8");
+    const s1 = await S.syncGroupHeaderStyle(true);
+    check("K1① 开补丁未被挡住（blockedBy 为空）", s1.blockedBy === undefined, JSON.stringify(s1));
+    check("K1① 后端钩子已写入", marks(), JSON.stringify(s1.targets));
+    // ② 在同一份已打补丁的文件上注入 kiroproxy- 残留 → 整轮不写任何文件
+    const residue = "/*kiroproxy-toolcard:r1*/var kiroproxyProbe=1;/*kiroproxy-toolcard:end*/";
+    fs.appendFileSync(EXT_FILE, residue, "utf8");
+    const before = read(EXT_FILE);
+    const stamp2 = stamp();
+    const proxy2 = proxyBytes();
+    const s2 = await S.syncGroupHeaderStyle(true);
+    check("K1② status=unavailable 且 blockedBy=kiro-proxy", s2.status === "unavailable" && s2.blockedBy === "kiro-proxy", JSON.stringify(s2));
+    check("K1② 三个靶点都报 unavailable", s2.targets.style === "unavailable" && s2.targets.selectorScript === "unavailable" && s2.targets.backend === "unavailable", JSON.stringify(s2.targets));
+    check("K1② 文件 bytes 与 mtime 逐字一致", read(EXT_FILE) === before && stamp() === stamp2, `${stamp()} vs ${stamp2}`);
+    // ③ 关闭路径不跑闸门：只删自己的段，kiroproxy- 的字节一个都不碰
+    const s3 = await S.syncGroupHeaderStyle(false);
+    check("K1③ 后端 a2k 段已消失", !marks() && !read(EXT_FILE).includes("a2kRun"), read(EXT_FILE).slice(0, 160));
+    check("K1③ kiroproxy- 的字节与第 ② 步逐字一致", proxyBytes() === proxy2, `${proxyBytes()} vs ${proxy2}`);
+    check("K1③ 关闭路径不报 blockedBy", s3.blockedBy === undefined, JSON.stringify(s3));
+    check("K1③ 注入的残留原文仍在", read(EXT_FILE).includes(residue));
+    // 收尾：回到出厂态
+    fs.writeFileSync(EXT_FILE, MAIN_FACTORY, "utf8");
   }
 
   // ------------------------------------------------------------ G
@@ -439,7 +503,7 @@ main()
   })
   .finally(() => {
     clearInterval(keepAlive);
-    console.log(`\n${pass} passed, ${fail} failed  (workdir ${WORK})`);
+    console.log(`\n${pass} passed, ${fail} failed, ${skippedSections} section(s) skipped  (workdir ${WORK})`);
     try {
       fs.rmSync(WORK, { recursive: true, force: true });
     } catch {

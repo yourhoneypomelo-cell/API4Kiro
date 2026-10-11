@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { info, error } from "./log";
 import { getCpsPort, getPort } from "./config";
+import { endpointListPointsAt } from "./endpointOwnership";
 
 /**
  * 本地改动：保存 / 还原被本扩展清掉的 workspace 级端点配置。
@@ -82,16 +83,10 @@ async function clearWritten(key: EndpointKey): Promise<void> {
 /**
  * 形状判断：非空数组且每一项都指向本扩展当前配置的 KRS / CPS 端口（`http://127.0.0.1:<port>`）。
  * 原版 API2Kiro 的 19800/19801、用户手写的 https 中转、null / 字符串等一律 false。
- * 用于升级前版本留下的 Global 值（那时还没有 endpointWritten 记录）。
+ * 判定实现与卸载脚本共用 `endpointOwnership.endpointListPointsAt`（两端只有一份规则）。
  */
 function pointsAtOurPorts(value: unknown): boolean {
-  if (!Array.isArray(value) || value.length === 0) {
-    return false;
-  }
-  const ours = new Set([`http://127.0.0.1:${getPort()}`, `http://127.0.0.1:${getCpsPort()}`]);
-  return value.every(
-    (e) => !!e && typeof e === "object" && ours.has(String((e as { endpoint?: unknown }).endpoint))
-  );
+  return endpointListPointsAt(value, [getPort(), getCpsPort()]);
 }
 
 /** Global 层的这份值是不是本扩展写的：与记录逐字一致，或（无记录 / 记录已过期）指向本扩展端口。 */

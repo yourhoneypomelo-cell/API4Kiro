@@ -25,6 +25,12 @@ export type SyncExtras = Record<ExtraKey, TargetStatus>;
 export type StyleSyncResult = {
   status: TargetStatus;
   detail?: string;
+  /**
+   * 整轮被前置闸拦下的原因（4.13.65）。目前只有一种：目标文件里存在 kiro-proxy 的补丁残留
+   * （`kiroproxy-…`）——两套注入互相覆盖会同时坏掉，所以整轮一个字节都不写。
+   * 既有构造点不传即 `undefined`，向后兼容。
+   */
+  blockedBy?: "kiro-proxy";
   /** 三个靶点文件各自的结果：style.css / mermaid-*.js / kiro-agent dist/extension.js */
   targets: { style: TargetStatus; selectorScript: TargetStatus; backend: TargetStatus };
   /**
@@ -2344,9 +2350,57 @@ export function syncGroupHeaderStyle(enabled: boolean): Promise<StyleSyncResult>
 /** usage 重试钩子的漂移日志每个宿主只打一次（每次同步都会重算，不去重会刷屏）。 */
 let usageDriftLogged = false;
 
+/**
+ * kiro-proxy 补丁残留的标记字面量。实测三种形态都带这个前缀：
+ * `/*kiroproxy-ctxwin-css:r1*​/`、`/*kiroproxy-ctxwin-ui:r2*​/`、`/*kiroproxy-toolcard:r1*​/`，
+ * 以及它们注入的规则（`.kiroproxy-ctxwin-wrap` 等）。压缩器不动字面量，所以按它判定稳定。
+ */
+const KIRO_PROXY_MARK = "kiroproxy-";
+
+/** 整轮被前置闸拦下时的固定文案（宿主内提示与卸载脚本共用同一句约束）。 */
+const KIRO_PROXY_DETAIL =
+  "检测到 kiro-proxy 的补丁残留（kiroproxy-…）：为避免两套注入互相覆盖，本次未写入任何 Kiro 文件。";
+
+/**
+ * 前置闸（4.13.65）：打补丁前先读**全部**目标文件，发现 kiro-proxy 残留就整轮不写。
+ *
+ * 为什么在写之前而不是写之后：两套补丁在同一份 bundle 上互相覆盖后，双方的还原逻辑都可能认不出
+ * 自己的段落，用户既回不到出厂态也打不上新补丁。宁可这一轮什么都不做（模型面板会原样显示
+ * `__A2K_GRP__|…` 微格式，与「靶点不命中」的表现一致），等用户先处理掉 kiro-proxy。
+ *
+ * 逐文件 try/catch：读不到（ENOENT / EACCES）视为「该文件无标记」，让后续 planX 照常报 unavailable +
+ * `code path` detail——普通 VS Code 宿主不该被报成「检测到了 kiro-proxy」。
+ */
+async function preflightKiroProxy(pkgs: SelectorPackage[], backendFile: string): Promise<boolean> {
+  const files = [...new Set([...pkgs.map((p) => p.chunk), ...pkgs.map((p) => p.style), backendFile])];
+  for (const file of files) {
+    let text: string;
+    try {
+      text = await fs.promises.readFile(file, "utf8");
+    } catch {
+      continue;
+    }
+    if (text.includes(KIRO_PROXY_MARK)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSyncResult> {
   // 一次发现，两处复用：同一 chunk 在多个 package 各有一份，CSS 也要落进各自的 style.css。
   const pkgs = await selectorPackages();
+  // 前置闸只在开补丁时跑：关闭路径不跑闸门，只删自己的标记段（别人注入的字节一个都不碰）。
+  if (enabled && (await preflightKiroProxy(pkgs, kiroAgentBackendFile()))) {
+    info(`selector patch sync blocked by a kiro-proxy residue: ${KIRO_PROXY_DETAIL}`);
+    return {
+      status: "unavailable",
+      blockedBy: "kiro-proxy",
+      detail: KIRO_PROXY_DETAIL,
+      targets: { style: "unavailable", selectorScript: "unavailable", backend: "unavailable" },
+      extras: { ctxSelector: "unavailable", ctxHost: "unavailable", usageRetry: "unavailable" },
+    };
+  }
   const selectorScript = await planModelSelectorScript(enabled, pkgs);
   const backend = await planKiroAgentBackend(enabled);
   // CSS 逐份决定：只给「本 package 的 chunk 确实拿到了补丁」的那些包加 CARD_CSS。
@@ -2414,6 +2468,8 @@ export const __selectorStyleInternals = {
   START,
   END,
   CARD_CSS,
+  /** 「这个文件已带本扩展的补丁」的标记集合（4.13.65 起随 internals 暴露，供 verify 脚本断言还原干净）。 */
+  SELECTOR_PATCH_MARKS,
   /** 结构匹配器：模板以 1.0.411 压缩名书写，名字按结构捕获 / 反查 / 渲染。 */
   matchers: {
     renderTemplate,

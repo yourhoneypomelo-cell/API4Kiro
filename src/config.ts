@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { legacyKeySlot, resolveKeyValue } from "./keyPlaceholder";
 
 export const CONFIG_NS = "api2kiroDual";
 
@@ -28,15 +29,38 @@ export function cfg() {
 const FB_PREFIX = "fallback.";
 
 /**
- * 读字符串配置:本地兜底若存在(说明之前写 settings.json 失败,兜底为用户最新意图)优先,
- * 否则读 VS Code 设置。空字符串也算有效兜底值(用于「清除 Key」)。
+ * 读字符串配置的**原文**：本地兜底若存在(说明之前写 settings.json 失败,兜底为用户最新意图)优先,
+ * 否则读 VS Code 设置。空字符串也算有效兜底值(用于「清除 Key」)。**不做占位解析**——
+ * 迁移要拿原始值判断「是不是占位」。
  */
-function readStr(key: string): string {
+export function readStrRaw(key: string): string {
   const fb = extCtx?.globalState.get<string>(FB_PREFIX + key);
   if (fb !== undefined) {
     return String(fb).trim();
   }
   return (cfg().get<string>(key, "") || "").trim();
+}
+
+/**
+ * 读字符串配置的**最终值**：占位标记 ⇒ 去系统钥匙串取真值（查不到 ⇒ 空串，fail-closed），
+ * 其余原样。于是 `getKiroApiKey` / `getOfficialApiKey` / `getOpenaiApiKey` 与全部下游消费者
+ * （`authHeaders` / 探测 / 面板）行为逐字不变，而 settings 里只留占位。
+ */
+function readStr(key: string): string {
+  return resolveKeyValue(readStrRaw(key), legacyKeySlot(key));
+}
+
+/** 读 `fallback.*` 兜底副本的原始值（写 settings 失败时 `updateSetting` 落下的那份明文副本）。 */
+export function readFallbackRaw(key: string): unknown {
+  return extCtx?.globalState.get(FB_PREFIX + key);
+}
+
+/** 覆盖（或清除）`fallback.*` 兜底副本：迁移把明文搬进钥匙串后，用它把副本里的明文换成占位。 */
+export function writeFallbackRaw(key: string, value: unknown): Promise<void> {
+  if (!extCtx) {
+    return Promise.reject(new Error("扩展上下文尚未初始化"));
+  }
+  return Promise.resolve(extCtx.globalState.update(FB_PREFIX + key, value));
 }
 
 function readBool(key: string, def: boolean): boolean {

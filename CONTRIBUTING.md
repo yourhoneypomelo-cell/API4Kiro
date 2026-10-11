@@ -4,13 +4,15 @@
 
 ## 环境
 
-- Node.js 18 或更高版本；Kiro IDE（用于真机验证）
+- Node.js 22 或更高版本；Kiro IDE（用于真机验证）
+  （22 是打包工具 `@vscode/vsce` 4.0.0 的 `engines.node` 要求，CI 也用 22；扩展本体运行时仍兼容更老的宿主）
 - 克隆后执行：
 
   ```bash
   npm ci
   npm run compile   # 类型检查
-  npm run package   # 生成 .vsix
+  npm test          # 单元测试 + 卸载/补丁端到端（node --test，无需真机）
+  npm run package   # 生成 .vsix（走本地 node_modules/.bin/vsce，版本已锁定）
   kiro --install-extension api2kiro-dual-<version>.vsix --force
   ```
 
@@ -36,3 +38,4 @@
 
 - 版本号在 `package.json`，遵循语义化版本
 - 推送 `v<version>` 标签会触发 CI 打包并挂到对应 GitHub Release。CI 包与 Release 资产均不得含 Antigravity client secret；不要用本机带密钥的 vsix `gh release upload --clobber` 覆盖。
+- 发布资产由 CI 生成安装包的 `.sha256`（`api2kiro-dual-<version>.vsix.sha256`）并一起上传；客户端安装前会校验同名摘要，对不上就拒绝安装并删掉已下载文件。旧 Release 没有这个文件时，客户端会弹模态框二次确认（默认取消）。

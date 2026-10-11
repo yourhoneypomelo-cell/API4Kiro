@@ -10,6 +10,7 @@
  * 标题栏「有新版」靠 `setContext(api2kiroDual.updateAvailable)` 在两条命令间切换；设置页按钮文案由 `UpdateState` 驱动。
  */
 import * as vscode from "vscode";
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as http from "http";
 import * as https from "https";
@@ -139,6 +140,55 @@ export function pickVsixAsset(assets: ReleaseAsset[] | undefined, version: strin
   if (exact) return exact;
   const vsix = list.filter((a) => /\.vsix$/i.test(a.name));
   return vsix.length === 1 ? vsix[0] : undefined;
+}
+
+/**
+ * 挑同一 Release 里的摘要文件：**只认「实际要安装的那份资产的名字 + `.sha256`」**，不做模糊猜测。
+ *
+ * 第二个参数必须是 `pickVsixAsset()` 返回的 `asset.name`，**不是** `vsixAssetName(version)`：
+ * `pickVsixAsset` 的单 `.vsix` 回退存在的理由正是「资产名与版本推导名不一致」，传版本推导名会把
+ * 「可校验」误判成「没有 `.sha256`」而走旧 Release 的二次确认框 —— 那是降级，不是拒绝。
+ */
+export function pickSha256Asset(assets: ReleaseAsset[] | undefined, vsixAssetNameActual: string): ReleaseAsset | undefined {
+  if (!vsixAssetNameActual) return undefined;
+  const want = `${vsixAssetNameActual}.sha256`;
+  return (Array.isArray(assets) ? assets : []).find((a) => a.name === want);
+}
+
+/** 64 位十六进制摘要的字面形态。 */
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+/**
+ * 解析 `.sha256` 文件内容：纯 hex，或 `sha256sum` 的行式（`<hex>  <文件名>` / `<hex> *<文件名>`）。
+ * 大小写不敏感；不是恰好 64 位 hex 就返回 undefined（长度不对同样拒绝）。
+ */
+export function parseSha256(text: string): string | undefined {
+  const first = String(text || "").trim().split(/\r?\n/).find((l) => l.trim() !== "");
+  if (!first) {
+    return undefined;
+  }
+  const hex = first.trim().split(/\s+/)[0].replace(/^\*/, "");
+  return SHA256_HEX_RE.test(hex) ? hex.toLowerCase() : undefined;
+}
+
+/** 流式算文件的 sha256（避免把 50 MB 上限的包整个读进内存）。 */
+export function sha256File(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(file);
+    stream.on("error", reject);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolve(hash.digest("hex").toLowerCase()));
+  });
+}
+
+/** 摘要不一致就抛（文案直接给用户看）；一致返回。 */
+export async function verifyVsixDigest(file: string, expectedHex: string): Promise<void> {
+  const want = String(expectedHex || "").toLowerCase();
+  const got = await sha256File(file);
+  if (got !== want) {
+    throw new Error(`安装包摘要不匹配（期望 ${want.slice(0, 8)}…，实际 ${got.slice(0, 8)}…）`);
+  }
 }
 
 function parseAssets(raw: unknown): ReleaseAsset[] {
@@ -727,9 +777,36 @@ export interface InstallOptions {
   fetchTimeoutMs?: number;
   /** 下载参数覆盖（测试缩短超时）。 */
   download?: Pick<DownloadOptions, "idleTimeoutMs" | "totalTimeoutMs" | "maxBytes">;
+  /** Release 没有 `.sha256` 时的二次确认（默认弹模态框，默认「取消」）。测试注入。 */
+  confirm?: (message: string) => Promise<boolean>;
 }
 
 const INSTALL_COMMAND = "workbench.extensions.installExtension";
+
+/** 模态框的「默认」= 第一个 item（VS Code 没有指定默认按钮的 API，回车触发第一个）。 */
+export const CANCEL_LABEL = "取消";
+export const INSTALL_ANYWAY_LABEL = "仍要安装";
+
+/** 只有明确选了「仍要安装」才继续；关闭 / Esc / undefined / 「取消」一律 false（默认取消）。 */
+export function resolveInstallAnyway(pick: string | undefined): boolean {
+  return pick === INSTALL_ANYWAY_LABEL;
+}
+
+/** 旧 Release（没有同 Release 的 `.sha256`）的二次确认：默认取消。 */
+async function defaultConfirm(message: string): Promise<boolean> {
+  const pick = await vscode.window.showWarningMessage(message, { modal: true }, CANCEL_LABEL, INSTALL_ANYWAY_LABEL);
+  return resolveInstallAnyway(pick);
+}
+
+const NO_SHA256_NOTICE =
+  "API4Kiro 更新提示：这个 Release 没有提供安装包摘要文件（.sha256），无法校验下载到的安装包是否与发布内容一致。\n" +
+  "摘要只防传输损坏与 CDN 层替换，不防发布账号被盗；旧版本 Release 多数没有这个文件。" +
+  "仍可继续安装，但请自行确认来源可信。";
+
+/** 摘要校验不通过的固定文案（末尾不带「可手动安装」：那个文件已经被删掉）。 */
+function digestFailureMessage(expected: string, got: string): string {
+  return `API4Kiro 更新失败：安装包摘要校验不通过（期望 ${expected.slice(0, 8)}…，实际 ${got.slice(0, 8)}…），已删除该文件，未安装。`;
+}
 
 function fmtBytes(n: number): string {
   if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -819,6 +896,67 @@ export async function installLatestFromGitHub(context: vscode.ExtensionContext, 
         });
         downloaded = true;
         info(`update: downloaded ${asset.name} (${bytes} bytes)`);
+        if (token.isCancellationRequested) throw new UpdateCancelledError();
+        // ① 摘要校验：先算摘要，再做结构校验，最后才安装（顺序写死：结构校验会读整个 zip）。
+        //    资产名用**实际安装的那份**（asset.name），不是版本推导名。
+        const shaAsset = pickSha256Asset(rel.assets, asset.name);
+        if (shaAsset) {
+          progress.report({ message: "校验安装包摘要…" });
+          const shaFile = `${target}.sha256`;
+          try {
+            await downloadFile(shaAsset.url, shaFile, {
+              maxBytes: 4096,
+              idleTimeoutMs: opts.download?.idleTimeoutMs,
+              totalTimeoutMs: opts.download?.totalTimeoutMs,
+              token,
+              expectedSize: shaAsset.size >= 0 ? shaAsset.size : undefined,
+              testOrigin: opts.apiUrl && opts.apiUrl !== GITHUB_LATEST_RELEASE_API ? opts.apiUrl : undefined,
+            });
+            const expected = parseSha256(await fs.promises.readFile(shaFile, "utf8"));
+            if (!expected) {
+              logError("update: sha256 asset is not a 64-hex digest, install refused");
+              throw new Error(digestFailureMessage("(无法解析)", "(无法解析)"));
+            }
+            const got = await sha256File(target);
+            if (got !== expected) {
+              logError("update: sha256 mismatch, install refused", `${expected.slice(0, 12)}… vs ${got.slice(0, 12)}…`);
+              throw new Error(digestFailureMessage(expected, got));
+            }
+            info(`update: sha256 verified ${got.slice(0, 12)}…`);
+          } catch (e) {
+            // 独立收尾：**下载失败 / 不可解析 / 不一致** 三种都走这里。
+            // 两个文件都必须删掉，并把 downloaded/dest 复位，好让下面 catch 里的 where 为空串
+            // （不得提示用户去「从 VSIX 安装」一个已经被删掉的文件）。
+            fs.rmSync(target, { force: true });
+            try {
+              fs.rmSync(shaFile, { force: true });
+            } catch {
+              /* ignore */
+            }
+            downloaded = false;
+            dest = undefined;
+            const reason = (e as Error)?.message || String(e);
+            throw new Error(
+              /摘要校验不通过/.test(reason)
+                ? reason
+                : `API4Kiro 更新失败：安装包摘要校验不通过（无法取得或解析同 Release 的 .sha256 校验文件：${reason}），已删除该文件，未安装。`
+            );
+          } finally {
+            try {
+              fs.rmSync(shaFile, { force: true });
+            } catch {
+              /* ignore */
+            }
+          }
+        } else {
+          // ② 旧 Release（没有同 Release 的 `.sha256`）：模态二次确认，默认取消
+          const ok = await (opts.confirm ?? defaultConfirm)(NO_SHA256_NOTICE);
+          if (!ok) {
+            warn("update: release has no .sha256 asset, user declined to install anyway");
+            throw new UpdateCancelledError();
+          }
+          warn("update: release has no .sha256 asset, user chose to install anyway");
+        }
         if (token.isCancellationRequested) throw new UpdateCancelledError();
         progress.report({ message: "校验安装包…" });
         await verifyVsix(target, { name: EXTENSION_NAME, version, size: asset.size >= 0 ? asset.size : undefined });
