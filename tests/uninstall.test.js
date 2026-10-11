@@ -240,6 +240,39 @@ test("AC-9：夹具带 kiroproxy- 残留 ⇒ 卸载后等于「打补丁前的�
   assert.ok(res.stdout.includes("kiro-proxy"), `摘要里要点出残留：${res.stdout}`);
 });
 
+test("JSONC 边界：最后一个成员的「前一个值带逗号块注释」⇒ 端点仍被清除，且不误报「解析失败」", () => {
+  // 端点键是最后一个成员、前一个成员的值后面跟着含逗号的块注释：
+  // 4.13.65 的 `indexOf(",")` 会命中注释里的逗号 → 自校验失败 → 整份清理静默跳过（日志还误报成解析失败）。
+  const sb = makeSandbox({
+    settings: `{\n  "editor.fontSize": 14 /* x, y */,\n  "codewhisperer.config.endpoints": ${OURS(19810)}\n}\n`,
+  });
+  const res = runUninstall(sb);
+  assert.equal(res.status, 0, res.stderr);
+  const after = read(sb.settings);
+  assert.ok(!after.includes("codewhisperer.config.endpoints"), `端点必须被清掉：${after}`);
+  assert.ok(after.includes("editor.fontSize") && after.includes("/* x, y */"), `别人的设置与注释要留住：${after}`);
+  assert.ok(res.stdout.includes("已清理 1 个端点键"), res.stdout);
+  assert.ok(!res.stdout.includes("解析失败"), `合法 JSONC 不得被报成解析失败：${res.stdout}`);
+});
+
+test("端点清理的两种结果分开报：「自校验失败」≠「整份解析失败」", () => {
+  const U = require(path.join(BUILD, "uninstall.js"));
+  const dir = fs.mkdtempSync(path.join(WORK, "cleanup-"));
+  const ok = path.join(dir, "ok.json");
+  fs.writeFileSync(ok, `{\n  "codewhisperer.config.endpoints": ${OURS(19810)},\n  "a": 1\n}\n`, "utf8");
+  const rOk = U.cleanupEndpoints(ok);
+  assert.deepEqual(rOk.removed, ["codewhisperer.config.endpoints"], JSON.stringify(rOk));
+  assert.equal(rOk.parseFailed, false);
+  assert.deepEqual(rOk.selfCheckFailed, [], "正常删除不该记自校验失败");
+
+  const bad = path.join(dir, "bad.json");
+  fs.writeFileSync(bad, "[1,2,3]\n", "utf8");
+  const rBad = U.cleanupEndpoints(bad);
+  assert.equal(rBad.parseFailed, true, "顶层不是对象 = 整份解析失败");
+  assert.deepEqual(rBad.selfCheckFailed, [], "解析失败不记进自校验失败（两种原因两种文案）");
+  assert.equal(read(bad), "[1,2,3]\n", "解析失败必须原样保留");
+});
+
 test("AC-12：settings 解析失败 / 目录只读 / 文件缺失 ⇒ exit 0 且其它项照常完成", () => {
   // ① 解析失败（顶层不是对象）：原样保留
   const bad = makeSandbox({ settings: "[1,2,3]\n" });

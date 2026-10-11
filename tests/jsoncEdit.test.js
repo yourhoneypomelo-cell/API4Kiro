@@ -41,6 +41,39 @@ test("removeTopLevelProperty：最后一个成员连带前一个逗号", () => {
   assert.equal(J.readTopLevel(r.text, KEY), undefined);
 });
 
+test("FAIL A：最后一个成员 + 前一个值的块注释里带逗号 ⇒ 必须删得掉（逗号搜索要跳过注释）", () => {
+  const text = `{\n  "a": 14 /* x, y */,\n  "${KEY}": ${LIST}\n}\n`;
+  const r = J.removeTopLevelProperty(text, KEY);
+  assert.equal(r.removed, true, r.text);
+  assert.deepEqual(J.readTopLevel(r.text, "a"), 14);
+  assert.equal(J.readTopLevel(r.text, KEY), undefined);
+  assert.ok(r.text.includes("/* x, y */"), `前一个成员的注释要留住：${JSON.stringify(r.text)}`);
+  assert.deepEqual(J.topLevelKeys(r.text), ["a"]);
+
+  // 同一形态 + CRLF / 前一个值后面跟行注释里带逗号
+  const crlf = `{\r\n  "a": 1 /* , */,\r\n  "${KEY}": ${LIST}\r\n}\r\n`;
+  const r2 = J.removeTopLevelProperty(crlf, KEY);
+  assert.equal(r2.removed, true, r2.text);
+  assert.deepEqual(J.readTopLevel(r2.text, "a"), 1);
+  assert.equal(J.readTopLevel(r2.text, KEY), undefined);
+});
+
+test("FAIL C：删除最后一个成员时，前一个成员与目标键之间的注释能保则保", () => {
+  const text = `{\n  "a": 14, // a, b\n  "${KEY}": ${LIST}\n}\n`;
+  const r = J.removeTopLevelProperty(text, KEY);
+  assert.equal(r.removed, true, r.text);
+  assert.deepEqual(J.readTopLevel(r.text, "a"), 14);
+  assert.equal(J.readTopLevel(r.text, KEY), undefined);
+  assert.ok(r.text.includes("// a, b"), `这条注释讲的是前一个成员，不该跟着被删：${JSON.stringify(r.text)}`);
+
+  // 块注释同样保住
+  const block = `{"a":1,/* keep me */"${KEY}":${LIST}}`;
+  const r2 = J.removeTopLevelProperty(block, KEY);
+  assert.equal(r2.removed, true, r2.text);
+  assert.equal(r2.text, '{"a":1/* keep me */}');
+  assert.deepEqual(J.readTopLevel(r2.text, "a"), 1);
+});
+
 test("removeTopLevelProperty：唯一成员", () => {
   const text = `{"${KEY}": ${LIST}}`;
   const r = J.removeTopLevelProperty(text, KEY);

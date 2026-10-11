@@ -6,7 +6,8 @@
  * `JSON.parse` + `JSON.stringify` 会把注释与格式全抹掉，所以这里做**文本级**编辑。
  *
  * 容忍：BOM、行注释、块注释、尾逗号、CRLF、单行压缩（无任何空白）的 JSONC。
- * 删除时按「后面还有成员就连带其后一个逗号，否则连带前一个逗号」处理，
+ * 删除时按「后面还有成员就连带其后一个逗号，否则连带前一个逗号」处理；找那个逗号时**跳过空白与注释**
+ * （前一个值的块注释里也可能有逗号），并保留逗号与目标键之间的注释。
  * 删完必须能用同一解析器重新解析成功，否则原样返回、不写盘。
  */
 
@@ -263,20 +264,28 @@ export function removeTopLevelProperty(text: string, key: string): { text: strin
   const m = doc.members[idx];
   let from: number;
   let to: number;
+  /** 保留下来、位于被删逗号与目标成员之间的注释（只有「最后一个成员」那条分支可能非空）。 */
+  let kept = "";
   if (idx + 1 < doc.members.length) {
     // 后面还有成员：连它后面的逗号一起删（这里的逗号必然是它与下一项之间的分隔符）
     from = m.memberStart;
     to = doc.members[idx + 1].memberStart;
   } else if (idx > 0) {
-    // 最后一个成员（且不是唯一成员）：连带前一个逗号
-    const comma = text.indexOf(",", doc.members[idx - 1].memberEnd);
+    // 最后一个成员（且不是唯一成员）：连带前一个逗号。
+    // 逗号必须用「跳过空白与注释」的扫描来找：`indexOf(",", prevEnd)` 会命中前一个值后面的块注释里的
+    // 逗号（`"a": 14 /* x, y */,`），from 落进注释内部会删出一个未闭合注释 → 自校验失败 → 整份文件都不动。
+    const sep = skipTrivia(text, doc.members[idx - 1].memberEnd);
+    const comma = text[sep] === "," ? sep : -1;
     from = comma >= 0 && comma < m.memberStart ? comma : m.memberStart;
     to = m.memberEnd;
+    // 逗号与目标键之间的注释（如 `14, // a, b` 里的 `// a, b`）能保则保：它讲的是前一个成员，
+    // 跟着目标键一起删属于保真度损失。删掉的只有那个逗号与目标成员本身。
+    kept = comma >= 0 ? text.slice(comma + 1, m.memberStart) : "";
   } else {
     from = m.memberStart;
     to = m.memberEnd;
   }
-  const out = text.slice(0, from) + text.slice(to);
+  const out = text.slice(0, from) + kept + text.slice(to);
   if (!parseDocument(out)) {
     return { text, removed: false };
   }

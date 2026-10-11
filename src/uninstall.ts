@@ -184,8 +184,10 @@ export interface EndpointCleanupResult {
   removed: string[];
   /** 值不属于本插件、原样保留的键。 */
   notOurs: string[];
-  /** 文本解析失败，整份文件原样保留。 */
+  /** 整份文本不是合法 JSONC 对象，整份文件原样保留。 */
   parseFailed: boolean;
+  /** 删除后自校验失败（≠ 整份解析失败）的键：文件原样保留，但原因与「解析不了 settings.json」不同。 */
+  selfCheckFailed: string[];
   /** 文件不存在 / 读不到 / 太大。 */
   readFailed?: string;
 }
@@ -195,11 +197,11 @@ export interface EndpointCleanupResult {
  *
  * - 端口集合 = {19810, 19811} ∪ 同一份 settings 里 `api2kiroDual.port` / `cpsPort`；
  * - 只有「非空数组且每一项都指向端口集合」才删（`endpointListPointsAt`，与原版 19800/19801 区分开）；
- * - 写之前逐键自校验，失败就回滚为原文；
+ * - 写之前逐键自校验，失败就回滚为原文（并把原因与「整份解析失败」分开报）；
  * - 有变更才写，走临时文件 + 原子改名（避免写到一半被中断留下半个 settings.json）。
  */
 export function cleanupEndpoints(settingsPath: string, opts?: { dryRun?: boolean }): EndpointCleanupResult {
-  const result: EndpointCleanupResult = { removed: [], notOurs: [], parseFailed: false };
+  const result: EndpointCleanupResult = { removed: [], notOurs: [], parseFailed: false, selfCheckFailed: [] };
   if (!settingsPath) {
     result.readFailed = "未提供 settings.json 路径";
     return result;
@@ -246,7 +248,9 @@ export function cleanupEndpoints(settingsPath: string, opts?: { dryRun?: boolean
       result.removed.push(key);
     } else {
       console.log(`[API4Kiro 卸载] 删除 ${key} 后自校验失败，已回滚（settings.json 保持不变）`);
-      result.parseFailed = true;
+      // 与「整份解析失败」分开：这里文本本身是合法 JSONC，只是这一次删除没能通过自校验
+      // （例如布局超出 jsoncEdit 的处理面）。把它报成「settings.json 解析失败」会让用户找错方向。
+      result.selfCheckFailed.push(key);
       result.removed = [];
       return result;
     }
@@ -342,6 +346,13 @@ function reportEndpoints(r: EndpointCleanupResult, settings: ResolveOutcome<stri
   }
   if (r.parseFailed) {
     console.log(`[API4Kiro 卸载] settings.json 解析失败，整份文件原样保留：${settings.value}`);
+    return;
+  }
+  if (r.selfCheckFailed.length > 0) {
+    console.log(
+      `[API4Kiro 卸载] settings.json 是合法 JSONC，但删除 ${r.selfCheckFailed.join(", ")} 后自校验没通过，` +
+        `整份文件原样保留（端点没被清掉，原因不是解析失败）：${settings.value}`
+    );
     return;
   }
   if (r.removed.length === 0 && r.notOurs.length === 0) {
