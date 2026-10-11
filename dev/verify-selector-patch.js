@@ -890,23 +890,25 @@ function main() {
     }
     } // ← P4–P22（真机段落）到此结束
 
-    section("P24 kiro-proxy 前置闸：带残留 ⇒ 整轮不写任何文件 + 还原只删自己的段（三步顺序固定）");
+    section("P24 kiro-proxy 前置闸（4.13.66 逐文件）：带残留的文件跳过并点名、干净文件照常打补丁；全部带残留才整轮拒绝");
     {
       const backendFile = I.paths.kiroAgentBackendFile();
       const targetFiles = [...fx.packages.flatMap((p) => [p.chunk, p.style]), backendFile];
       const contents = () => targetFiles.map((f) => read(f));
-      const stamps = () =>
-        targetFiles.map((f) => {
-          const s = fs.statSync(f);
-          return `${s.size}:${s.mtimeMs}`;
-        });
+      const stamp = (f) => {
+        const s = fs.statSync(f);
+        return `${s.size}:${s.mtimeMs}`;
+      };
+      const stamps = () => targetFiles.map(stamp);
       const kiroproxyBytes = (texts) => texts.map((t) => (t.match(/kiroproxy-[A-Za-z0-9:_-]*/g) || []).join(","));
+      const short = (f) => path.relative(path.join(ROOT, "extensions"), f);
+      const sameList = (a, b) => [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
 
       // 归零到出厂态：关闭路径**不跑**前置闸，只删自己的标记段。
       await S.syncGroupHeaderStyle(false);
       const factoryContents = contents();
 
-      // ① 归一后的出厂夹具 → 开 → a2k 段必须真的写进去（否则第 ② 步的「一个字都没写」是空转）
+      // ① 干净夹具 → 开 → a2k 段必须真的写进去（否则后面「干净文件照常打」的断言是空转）
       const s1 = await S.syncGroupHeaderStyle(true);
       check("P24① 开补丁未被挡住（blockedBy 为空）", s1.blockedBy === undefined, JSON.stringify(s1));
       const after1 = contents();
@@ -922,23 +924,73 @@ function main() {
       }
       check("P24① 每个 package 的 a2k 段均已写入", missing.length === 0, missing.join("; "));
       check("P24① 后端钩子已写入", read(backendFile).includes("__kiroModelConfigProvider=t"), read(backendFile).slice(0, 200));
+      // 回到出厂态再进 ②（逐文件判定要能从「还没打过补丁」的干净态出发观察）
+      targetFiles.forEach((f, i) => fs.writeFileSync(f, factoryContents[i], "utf8"));
 
-      // ② 在同一份**已打补丁**的夹具上注入 kiroproxy- 残留 → 整轮不写任何文件
+      // ② 只给第 0 个 package 的 chunk + style.css 注入 kiroproxy- 残留 ⇒ 这一对跳过，其余干净文件照常打
+      const p0 = fx.packages[0];
       const cssResidue = "\n/*kiroproxy-ctxwin-css:r1*/\n.kiroproxy-ctxwin-wrap{display:flex}\n";
-      fs.appendFileSync(fx.packages[0].style, cssResidue, "utf8");
       const jsResidue = "/*kiroproxy-toolcard:r1*/var kiroproxyProbe=1;/*kiroproxy-toolcard:end*/";
-      fs.appendFileSync(fx.packages[0].chunk, jsResidue, "utf8");
-      const before2 = contents();
-      const stamps2 = stamps();
-      const proxy2 = kiroproxyBytes(before2);
+      fs.appendFileSync(p0.style, cssResidue, "utf8");
+      fs.appendFileSync(p0.chunk, jsResidue, "utf8");
+      const p0ChunkText = read(p0.chunk);
+      const p0StyleText = read(p0.style);
+      const p0ChunkStamp = stamp(p0.chunk);
+      const p0StyleStamp = stamp(p0.style);
+      const proxy2 = kiroproxyBytes(contents());
       const s2 = await S.syncGroupHeaderStyle(true);
-      check("P24② status=unavailable 且 blockedBy=kiro-proxy", s2.status === "unavailable" && s2.blockedBy === "kiro-proxy", JSON.stringify(s2));
-      check("P24② 三个靶点都报 unavailable", s2.targets.style === "unavailable" && s2.targets.selectorScript === "unavailable" && s2.targets.backend === "unavailable", JSON.stringify(s2.targets));
-      check("P24② 未抛错且有中文 detail", !!s2.detail && s2.detail.includes("kiro-proxy"), String(s2.detail));
-      check("P24② 所有目标文件 bytes 逐字一致", contents().every((t, i) => t === before2[i]), "有文件被改写了");
-      check("P24② 所有目标文件 mtime 逐字一致", stamps().every((t, i) => t === stamps2[i]), `${stamps().join(" ")} vs ${stamps2.join(" ")}`);
+      check(
+        "P24② blockedBy=kiro-proxy 且 status=unavailable（这一轮有文件被跳过）",
+        s2.blockedBy === "kiro-proxy" && s2.status === "unavailable",
+        JSON.stringify(s2)
+      );
+      check(
+        "P24② 跳过清单点名带残留的那一对文件（chunk + 同 package 的 style.css）",
+        sameList(s2.skippedBy || [], [short(p0.chunk), short(p0.style)]),
+        JSON.stringify(s2.skippedBy)
+      );
+      check("P24② 带残留的 chunk bytes 逐字不变", read(p0.chunk) === p0ChunkText, "带残留的 chunk 被改写了");
+      check("P24② 带残留的 style.css bytes 逐字不变", read(p0.style) === p0StyleText, "带残留的 style.css 被改写了");
+      check("P24② 带残留的两个文件 mtime 也不变", stamp(p0.chunk) === p0ChunkStamp && stamp(p0.style) === p0StyleStamp, `${stamp(p0.chunk)} / ${stamp(p0.style)} vs ${p0ChunkStamp} / ${p0StyleStamp}`);
+      check(
+        "P24② 被跳过的两个靶点报 unavailable、干净的后端报 applied",
+        s2.targets.style === "unavailable" && s2.targets.selectorScript === "unavailable" && s2.targets.backend === "applied",
+        JSON.stringify(s2.targets)
+      );
+      check("P24② 干净的 backend 照常打上钩子", read(backendFile).includes("__kiroModelConfigProvider=t"), read(backendFile).slice(0, 200));
+      const cleanMissing = [];
+      for (const pk of fx.packages.slice(1)) {
+        if (!marksAll.some((m) => read(pk.chunk).includes(m))) cleanMissing.push(`${pk.pkg} chunk 无 a2k 标记`);
+        if (!read(pk.style).includes("a2k-card-head")) cleanMissing.push(`${pk.pkg} style.css 无 CARD_CSS`);
+      }
+      check("P24② 其它 package（干净）照常打上 a2k 段", cleanMissing.length === 0, cleanMissing.join("; "));
+      check("P24② 别人的 kiroproxy- 字节一个都没动", kiroproxyBytes(contents()).every((v, i) => v === proxy2[i]), `${kiroproxyBytes(contents()).join(" | ")} vs ${proxy2.join(" | ")}`);
+
+      // ②b 给**剩下每一个干净文件**也注入残留 ⇒ 全部目标文件都带残留 ⇒ 退回 4.13.65 的整轮拒绝语义
+      for (const f of targetFiles) {
+        if (!read(f).includes("kiroproxy-")) {
+          fs.appendFileSync(f, `\n/*kiroproxy-toolcard:r1*/var kiroproxyProbe2=1;/*kiroproxy-toolcard:end*/\n`, "utf8");
+        }
+      }
+      const before2b = contents();
+      const stamps2b = stamps();
+      const s2b = await S.syncGroupHeaderStyle(true);
+      check(
+        "P24②b 全部带残留 ⇒ status 与三个靶点全 unavailable",
+        s2b.status === "unavailable" &&
+          s2b.blockedBy === "kiro-proxy" &&
+          s2b.targets.style === "unavailable" &&
+          s2b.targets.selectorScript === "unavailable" &&
+          s2b.targets.backend === "unavailable",
+        JSON.stringify(s2b)
+      );
+      check("P24②b 全部带残留 ⇒ bytes 逐字一致", contents().every((t, i) => t === before2b[i]), "有文件被改写了");
+      check("P24②b 全部带残留 ⇒ mtime 逐字一致", stamps().every((t, i) => t === stamps2b[i]), `${stamps().join(" ")} vs ${stamps2b.join(" ")}`);
+      check("P24②b 跳过清单覆盖全部目标文件", sameList(s2b.skippedBy || [], targetFiles.map(short)), JSON.stringify(s2b.skippedBy));
+      check("P24②b 有中文 detail 且提到跳过", !!s2b.detail && s2b.detail.includes("跳过"), String(s2b.detail));
 
       // ③ 关闭：只删自己的段，kiroproxy- 的字节一个都不碰
+      const proxy3Before = kiroproxyBytes(contents());
       const s3 = await S.syncGroupHeaderStyle(false);
       const after3 = contents();
       const leftovers = [];
@@ -947,10 +999,10 @@ function main() {
         for (const m of marksAll) {
           if (t.includes(m)) leftovers.push(`${path.basename(targetFiles[i])}:${m}`);
         }
-        if (t.includes("/*a2k-row:")) leftovers.push(`${path.basename(targetFiles[i])}:/​*a2k-row:`);
+        if (t.includes("/*a2k-row:")) leftovers.push(`${path.basename(targetFiles[i])}:/*a2k-row:`);
       }
       check("P24③ SELECTOR_PATCH_MARKS 与 /*a2k-row: 全部消失", leftovers.length === 0, leftovers.join(", "));
-      check("P24③ kiroproxy- 的字节与第 ② 步逐字一致", kiroproxyBytes(after3).every((v, i) => v === proxy2[i]), `${kiroproxyBytes(after3).join(" | ")} vs ${proxy2.join(" | ")}`);
+      check("P24③ kiroproxy- 的字节与第 ③ 步前逐字一致", kiroproxyBytes(after3).every((v, i) => v === proxy3Before[i]), `${kiroproxyBytes(after3).join(" | ")} vs ${proxy3Before.join(" | ")}`);
       check("P24③ 注入的两段残留原文仍在（别人的字节一个都不碰）", after3[0].includes(jsResidue) && after3[1].includes(cssResidue.trim()), "注入段被误删");
       check("P24③ 关闭路径不报 blockedBy", s3.blockedBy === undefined, JSON.stringify(s3));
       // 收尾：把夹具写回出厂态（P24 是最后一个依赖夹具的段落，留着残留会让人工排查误以为脚本写过东西）

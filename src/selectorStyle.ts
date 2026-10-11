@@ -26,11 +26,19 @@ export type StyleSyncResult = {
   status: TargetStatus;
   detail?: string;
   /**
-   * 整轮被前置闸拦下的原因（4.13.65）。目前只有一种：目标文件里存在 kiro-proxy 的补丁残留
-   * （`kiroproxy-…`）——两套注入互相覆盖会同时坏掉，所以整轮一个字节都不写。
+   * 前置闸动过的痕迹（4.13.65 引入，4.13.66 起改成**逐文件**粒度）。只要本轮有文件因为
+   * kiro-proxy 残留（`kiroproxy-…`）被跳过就是 `"kiro-proxy"`——可能是部分跳过（其余文件照常打补丁），
+   * 也可能是全部跳过（那时 `status` / `targets` 全是 unavailable，一个字节都没写）。
    * 既有构造点不传即 `undefined`，向后兼容。
    */
   blockedBy?: "kiro-proxy";
+  /** 被前置闸跳过的目标文件（`extensions/` 之后的短路径，逐文件）——提示里点名用。 */
+  skippedBy?: string[];
+  /**
+   * 被跳过的文件旁边检测到的 kiro-proxy 出厂备份（`<文件名>.kiroproxy-bak-<版本>`）的绝对路径。
+   * 有值时提示文案里给出「可用它恢复该文件」的可操作指引（谁的备份归谁，不存在自动覆盖）。
+   */
+  kiroProxyBackups?: string[];
   /** 三个靶点文件各自的结果：style.css / mermaid-*.js / kiro-agent dist/extension.js */
   targets: { style: TargetStatus; selectorScript: TargetStatus; backend: TargetStatus };
   /**
@@ -2350,30 +2358,39 @@ export function syncGroupHeaderStyle(enabled: boolean): Promise<StyleSyncResult>
 /** usage 重试钩子的漂移日志每个宿主只打一次（每次同步都会重算，不去重会刷屏）。 */
 let usageDriftLogged = false;
 
-/**
- * kiro-proxy 补丁残留的标记字面量。实测三种形态都带这个前缀：
+/** kiro-proxy 补丁残留的标记字面量。实测三种形态都带这个前缀：
  * `/*kiroproxy-ctxwin-css:r1*​/`、`/*kiroproxy-ctxwin-ui:r2*​/`、`/*kiroproxy-toolcard:r1*​/`，
  * 以及它们注入的规则（`.kiroproxy-ctxwin-wrap` 等）。压缩器不动字面量，所以按它判定稳定。
  */
 const KIRO_PROXY_MARK = "kiroproxy-";
 
-/** 整轮被前置闸拦下时的固定文案（宿主内提示与卸载脚本共用同一句约束）。 */
+/** kiro-proxy 自己留下的出厂备份名（`<文件名>.kiroproxy-bak-<版本>`），提示里给用户当恢复入口。 */
+const KIRO_PROXY_BAK = ".kiroproxy-bak-";
+
+/** 被前置闸挡下的整轮文案（宿主内提示与卸载脚本共用同一句约束）。 */
 const KIRO_PROXY_DETAIL =
-  "检测到 kiro-proxy 的补丁残留（kiroproxy-…）：为避免两套注入互相覆盖，本次未写入任何 Kiro 文件。";
+  "检测到 kiro-proxy 的补丁残留（kiroproxy-…）：为避免两套注入互相覆盖，本轮未写入带残留的那些 Kiro 文件。";
 
 /**
- * 前置闸（4.13.65）：打补丁前先读**全部**目标文件，发现 kiro-proxy 残留就整轮不写。
+ * 前置闸（4.13.65 引入，4.13.66 起**逐文件**判定）：打补丁前先读目标文件，把带 kiro-proxy 残留的挑出来。
  *
- * 为什么在写之前而不是写之后：两套补丁在同一份 bundle 上互相覆盖后，双方的还原逻辑都可能认不出
- * 自己的段落，用户既回不到出厂态也打不上新补丁。宁可这一轮什么都不做（模型面板会原样显示
- * `__A2K_GRP__|…` 微格式，与「靶点不命中」的表现一致），等用户先处理掉 kiro-proxy。
+ * 为什么逐文件而不是整轮拒绝：两套补丁只有落在**同一个文件**里才会互相覆盖（双方都按自己的标记段
+ * 找段落，别人写进去的字节会让自己的锚点错位）。目标文件之间没有交叉依赖——`selectorStyle.ts` 的三处
+ * 补丁各自在一个文件内文本级增删（chunk 的选择器渲染、style.css 的 CARD_CSS、dist/extension.js 的钩子），
+ * 都不读别的目标文件的内容。唯一的跨文件约束是**同一 package 内 chunk ↔ style.css 必须成对**
+ * （chunk 拿到补丁才给那份 style.css 加 CARD_CSS，见 planStyleSheet 的逐份开关），
+ * 这条约束由调用方按 package 过滤时一起保住。
+ *
+ * 所以：带残留的文件跳过（在结果里报告清单），其余干净文件照常打补丁。整轮拒绝的粒度比必要的粗——
+ * 本机真实 Kiro 就是「agent-chat 的 chunk + style.css + extension.js 带残留、session-details 干净」，
+ * 整轮拒绝会让用户完全用不上补丁，而逐文件至少能保住干净的那几份。
  *
  * 逐文件 try/catch：读不到（ENOENT / EACCES）视为「该文件无标记」，让后续 planX 照常报 unavailable +
  * `code path` detail——普通 VS Code 宿主不该被报成「检测到了 kiro-proxy」。
  */
-async function preflightKiroProxy(pkgs: SelectorPackage[], backendFile: string): Promise<boolean> {
-  const files = [...new Set([...pkgs.map((p) => p.chunk), ...pkgs.map((p) => p.style), backendFile])];
-  for (const file of files) {
+async function preflightKiroProxy(files: string[]): Promise<string[]> {
+  const hits: string[] = [];
+  for (const file of [...new Set(files)]) {
     let text: string;
     try {
       text = await fs.promises.readFile(file, "utf8");
@@ -2381,47 +2398,105 @@ async function preflightKiroProxy(pkgs: SelectorPackage[], backendFile: string):
       continue;
     }
     if (text.includes(KIRO_PROXY_MARK)) {
-      return true;
+      hits.push(file);
     }
   }
-  return false;
+  return hits;
+}
+
+/** 被跳过的文件的短名（`extensions/` 之后的相对路径；拿不到相对路径就退回 basename）。 */
+function shortTargetName(file: string): string {
+  const base = path.join(vscode.env.appRoot, "extensions");
+  const rel = path.relative(base, file);
+  return rel && !rel.startsWith("..") ? rel : path.basename(file);
+}
+
+/** 被跳过的文件旁边有没有 kiro-proxy 自己留下的出厂备份（有则在提示里给出恢复指引）。 */
+async function findKiroProxyBackups(files: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const dir of [...new Set(files.map((f) => path.dirname(f)))]) {
+    let names: string[];
+    try {
+      names = await fs.promises.readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names.sort()) {
+      if (n.includes(KIRO_PROXY_BAK)) {
+        out.push(path.join(dir, n));
+      }
+    }
+  }
+  return out;
 }
 
 async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSyncResult> {
   // 一次发现，两处复用：同一 chunk 在多个 package 各有一份，CSS 也要落进各自的 style.css。
   const pkgs = await selectorPackages();
+  const backendFile = kiroAgentBackendFile();
   // 前置闸只在开补丁时跑：关闭路径不跑闸门，只删自己的标记段（别人注入的字节一个都不碰）。
-  if (enabled && (await preflightKiroProxy(pkgs, kiroAgentBackendFile()))) {
+  const allTargets = [...new Set([...pkgs.map((p) => p.chunk), ...pkgs.map((p) => p.style), backendFile])];
+  const polluted = enabled ? await preflightKiroProxy(allTargets) : [];
+  const pollutedSet = new Set(polluted);
+  // 同一 package 的 chunk 与 style.css 必须成对（给一份 style.css 加 CARD_CSS 的前提是那份 chunk 拿到了补丁）：
+  // 两者之一带残留 ⇒ 整个 package 一起跳过，不当「改了一半」的那一套。
+  const blockedPkgFiles = new Set<string>();
+  for (const p of pkgs) {
+    if (pollutedSet.has(p.chunk) || pollutedSet.has(p.style)) {
+      blockedPkgFiles.add(p.chunk);
+      blockedPkgFiles.add(p.style);
+    }
+  }
+  const skippedSet = new Set([...pollutedSet, ...blockedPkgFiles]);
+  const skippedFiles = allTargets.filter((f) => skippedSet.has(f));
+  const activePkgs = pkgs.filter((p) => !blockedPkgFiles.has(p.chunk));
+  if (skippedFiles.length > 0) {
+    const names = skippedFiles.map(shortTargetName);
+    info(`selector patch sync: skipped ${names.length} file(s) with a kiro-proxy residue: ${names.join(", ")}`);
+  }
+  if (enabled && skippedFiles.length === allTargets.length) {
+    // 全部目标文件都带残留：与 4.13.65 的整轮拒绝同义（一个字节都不写），沿用同一套状态与文案。
+    const names = skippedFiles.map(shortTargetName);
+    const backups = await findKiroProxyBackups(skippedFiles);
     info(`selector patch sync blocked by a kiro-proxy residue: ${KIRO_PROXY_DETAIL}`);
     return {
       status: "unavailable",
       blockedBy: "kiro-proxy",
-      detail: KIRO_PROXY_DETAIL,
+      detail: `跳过 ${names.join("、")}（${KIRO_PROXY_DETAIL}）`,
+      skippedBy: names,
+      ...(backups.length > 0 ? { kiroProxyBackups: backups } : {}),
       targets: { style: "unavailable", selectorScript: "unavailable", backend: "unavailable" },
       extras: { ctxSelector: "unavailable", ctxHost: "unavailable", usageRetry: "unavailable" },
     };
   }
-  const selectorScript = await planModelSelectorScript(enabled, pkgs);
-  const backend = await planKiroAgentBackend(enabled);
+  const skippedChunks = activePkgs.length !== pkgs.length;
+  const skippedStyles = pkgs.some((p) => skippedSet.has(p.style));
+  const skippedBackend = skippedSet.has(backendFile);
+  const selectorScript = await planModelSelectorScript(enabled, activePkgs);
+  // 被跳过的后端文件**不读也不写**：这里不能走 planKiroAgentBackend(false)（那是还原路径，会删掉自己的段）。
+  const backend: TargetPlan = skippedBackend
+    ? { status: "unavailable", files: [], extras: { ctxHost: "unavailable", usageRetry: "unavailable" } }
+    : await planKiroAgentBackend(enabled);
   // CSS 逐份决定：只给「本 package 的 chunk 确实拿到了补丁」的那些包加 CARD_CSS。
   // 否则就是「改了 IDE 外观却没有对应功能」的半补丁；反过来，一份靶点漂移也不该牵连
   // 另一份（打上的那份保留卡片样式）。关闭路径 / 靶点整体不命中 → patched 集合为空 → 全部剥掉。
   const patchedSet = new Set((selectorScript.packages ?? []).filter((s) => s.patched).map((s) => s.pkg));
-  const style = await planStyleSheet(pkgs.map((p) => ({ file: p.style, enabled: enabled && patchedSet.has(p.pkg) })));
+  const style = await planStyleSheet(activePkgs.map((p) => ({ file: p.style, enabled: enabled && patchedSet.has(p.pkg) })));
   const committed = await commitPlans(enabled, { selectorScript, backend, style });
 
   const targets = {
-    style: committed.style.status,
-    selectorScript: committed.selectorScript.status,
-    backend: committed.backend.status,
+    // 被跳过的文件一律报 unavailable（它不在目标态）；其余按计划推导的状态。
+    style: skippedStyles ? "unavailable" : committed.style.status,
+    selectorScript: skippedChunks ? "unavailable" : committed.selectorScript.status,
+    backend: skippedBackend ? "unavailable" : committed.backend.status,
   };
   // 可选组（4.13.55）：所属文件本轮写失败 / 被全有或全无中止（unavailable 且带 detail）→ 也报 unavailable；否则按计划推导的状态。
-  const extraOf = (plan: TargetPlan, res: TargetResult, key: ExtraKey): TargetStatus =>
-    res.status === "unavailable" && res.detail ? "unavailable" : plan.extras?.[key] ?? "unavailable";
+  const extraOf = (plan: TargetPlan, res: TargetResult, key: ExtraKey, skipped: boolean): TargetStatus =>
+    skipped || (res.status === "unavailable" && res.detail) ? "unavailable" : plan.extras?.[key] ?? "unavailable";
   const extras: SyncExtras = {
-    ctxSelector: extraOf(selectorScript, committed.selectorScript, "ctxSelector"),
-    ctxHost: extraOf(backend, committed.backend, "ctxHost"),
-    usageRetry: extraOf(backend, committed.backend, "usageRetry"),
+    ctxSelector: extraOf(selectorScript, committed.selectorScript, "ctxSelector", skippedChunks),
+    ctxHost: extraOf(backend, committed.backend, "ctxHost", skippedBackend),
+    usageRetry: extraOf(backend, committed.backend, "usageRetry", skippedBackend),
   };
   // usage 重试钩子是可选组：锚点漂移只在整个宿主里记一次 info（写失败另有 error 日志，这里不重复）。
   if (enabled && extras.usageRetry === "unavailable" && !committed.backend.detail && !usageDriftLogged) {
@@ -2460,7 +2535,23 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
   } else {
     status = "unchanged";
   }
-  return detail ? { status, detail, targets, extras } : { status, targets, extras };
+  const out: StyleSyncResult = { status, targets, extras };
+  // 有文件被前置闸跳过（部分跳过）：整轮报 unavailable + 一句可操作的中文说明，
+  // 并带上跳过清单；调用方（extension.ts#notifyStyleSync）据此提示用户而不是当成成功。
+  if (skippedFiles.length > 0) {
+    const names = skippedFiles.map(shortTargetName);
+    out.status = "unavailable";
+    out.blockedBy = "kiro-proxy";
+    out.skippedBy = names;
+    const backups = await findKiroProxyBackups(skippedFiles);
+    if (backups.length > 0) {
+      out.kiroProxyBackups = backups;
+    }
+    out.detail = [`跳过 ${names.join(", ")}（${KIRO_PROXY_DETAIL}）`, detail].filter(Boolean).join(" ");
+  } else if (detail) {
+    out.detail = detail;
+  }
+  return out;
 }
 
 /** 仅供 tests/selector、scripts/check-selector-patch.js、probe-kiro.js 使用：暴露靶点模板、标记块与结构匹配器。 */

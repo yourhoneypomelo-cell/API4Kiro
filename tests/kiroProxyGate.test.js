@@ -1,5 +1,6 @@
 "use strict";
-// kiro-proxy 前置闸：带残留 ⇒ 整轮不写任何目标文件；关闭路径只删自己的段（AC-9 / AC-15）。
+// kiro-proxy 前置闸（4.13.66 起**逐文件**）：带残留的文件跳过并在结果里点名，干净文件照常打补丁；
+// 全部目标文件都带残留时退化成 4.13.65 的整轮拒绝。关闭路径只删自己的段（AC-9 / AC-15）。
 // 全部读写都在临时沙箱里，绝不碰真实 /Applications/Kiro.app。
 const test = require("node:test");
 const assert = require("node:assert");
@@ -61,6 +62,8 @@ const FILES = [CHUNK, STYLE, BACKEND];
 const contents = () => FILES.map(read);
 const stamps = () => FILES.map((f) => { const s = fs.statSync(f); return `${s.size}:${s.mtimeMs}`; });
 const proxyBytes = (texts) => texts.map((t) => (t.match(/kiroproxy-[A-Za-z0-9:_-]*/g) || []).join(","));
+const marksIn = (text) => I.SELECTOR_PATCH_MARKS.filter((m) => text.includes(m));
+const shortName = (f) => path.relative(path.join(APP, "extensions"), f);
 
 const CSS_RESIDUE = "\n/*kiroproxy-ctxwin-css:r1*/\n.kiroproxy-ctxwin-wrap{display:flex}\n";
 const JS_RESIDUE = "/*kiroproxy-toolcard:r1*/var kiroproxyProbe=1;/*kiroproxy-toolcard:end*/";
@@ -70,7 +73,7 @@ test.beforeEach(async () => {
   await S.syncGroupHeaderStyle(false);
 });
 
-test("三步顺序：①开补丁写入 a2k 段 → ②带 kiroproxy- 残留时整轮不写 → ③关闭只删自己的段", async () => {
+test("①开补丁写入 a2k 段 → ②整轮带残留时逐文件跳过并点名（干净文件照常打） → ③关闭只删自己的段", async () => {
   // ①
   const s1 = await S.syncGroupHeaderStyle(true);
   assert.equal(s1.blockedBy, undefined, JSON.stringify(s1));
@@ -80,40 +83,82 @@ test("三步顺序：①开补丁写入 a2k 段 → ②带 kiroproxy- 残留时�
   assert.ok(read(STYLE).includes("a2k-card-head"), "CARD_CSS 应落进 style.css");
   assert.ok(read(BACKEND).includes("__kiroModelConfigProvider=t"), "后端钩子应写入");
 
-  // ② 在同一份已打补丁的夹具上注入残留
-  fs.appendFileSync(STYLE, CSS_RESIDUE, "utf8");
-  fs.appendFileSync(CHUNK, JS_RESIDUE, "utf8");
-  const before = contents();
-  const stampBefore = stamps();
-  const proxyBefore = proxyBytes(before);
+  // ② 只把**这一个** package（chunk + style.css）换成带残留的出厂夹具 → 整轮目标文件都带残留 ⇒ 整轮拒绝
+  await S.syncGroupHeaderStyle(false);
+  fs.writeFileSync(CHUNK, `${syntheticChunk()}\n${JS_RESIDUE}\n`, "utf8");
+  fs.writeFileSync(STYLE, `${CSS_FACTORY}${CSS_RESIDUE}`, "utf8");
+  fs.writeFileSync(BACKEND, `${BACKEND_FACTORY}\n${JS_RESIDUE}\n`, "utf8");
+  const before2 = contents();
+  const stamps2 = stamps();
+  const proxy2 = proxyBytes(before2);
 
   const s2 = await S.syncGroupHeaderStyle(true); // 不得抛错
   assert.equal(s2.status, "unavailable");
   assert.equal(s2.blockedBy, "kiro-proxy");
   assert.deepEqual(s2.targets, { style: "unavailable", selectorScript: "unavailable", backend: "unavailable" });
   assert.deepEqual(s2.extras, { ctxSelector: "unavailable", ctxHost: "unavailable", usageRetry: "unavailable" });
+  assert.deepEqual([...s2.skippedBy].sort(), [shortName(CHUNK), shortName(STYLE), shortName(BACKEND)].sort(), JSON.stringify(s2.skippedBy));
   assert.ok(s2.detail && s2.detail.includes("kiro-proxy"), String(s2.detail));
-  assert.deepEqual(contents(), before, "整轮不得写任何目标文件");
-  assert.deepEqual(stamps(), stampBefore, "mtime 也不得变");
+  assert.deepEqual(contents(), before2, "全部带残留时整轮不得写任何目标文件");
+  assert.deepEqual(stamps(), stamps2, "mtime 也不得变");
 
-  // ③ 关闭路径不跑闸门
+  // ③ 关闭路径不跑闸门（只删自己的段；本夹具本来就没有本扩展的段，所以内容不变）
   const s3 = await S.syncGroupHeaderStyle(false);
   assert.equal(s3.blockedBy, undefined, JSON.stringify(s3));
   const after = contents();
   for (let i = 0; i < FILES.length; i++) {
-    for (const m of I.SELECTOR_PATCH_MARKS) {
-      assert.ok(!after[i].includes(m), `${path.basename(FILES[i])} 仍含 ${m}`);
-    }
+    assert.deepEqual(marksIn(after[i]), [], `${path.basename(FILES[i])} 仍含 a2k 标记`);
     assert.ok(!after[i].includes("/*a2k-row:"), `${path.basename(FILES[i])} 仍含 a2k-row 段`);
   }
-  assert.deepEqual(proxyBytes(after), proxyBefore, "别人的 kiroproxy- 字节一个都不能碰");
+  assert.deepEqual(proxyBytes(after), proxy2, "别人的 kiroproxy- 字节一个都不能碰");
   assert.ok(after[0].includes(JS_RESIDUE), "注入的 JS 残留仍在");
   assert.ok(after[1].includes(CSS_RESIDUE.trim()), "注入的 CSS 残留仍在");
 });
 
+test("逐文件：只有一个文件带残留 ⇒ 干净文件照常打补丁，带残留的那份一个字节都不动", async () => {
+  // 出厂夹具，只把 style.css 换成带残留的版本（chunk 不变、后端不变）
+  fs.writeFileSync(STYLE, `${CSS_FACTORY}${CSS_RESIDUE}`, "utf8");
+  const styleBefore = read(STYLE);
+  const styleStamp = stamps()[1];
+
+  const s = await S.syncGroupHeaderStyle(true);
+  assert.equal(s.blockedBy, "kiro-proxy", JSON.stringify(s));
+  assert.equal(s.status, "unavailable", JSON.stringify(s));
+  // 同 package 的 chunk 与 style.css 必须成对：这份 style.css 带残留 ⇒ 这一对一起跳过
+  assert.deepEqual([...s.skippedBy].sort(), [shortName(CHUNK), shortName(STYLE)].sort(), JSON.stringify(s.skippedBy));
+  assert.deepEqual(s.targets, { style: "unavailable", selectorScript: "unavailable", backend: "applied" }, JSON.stringify(s.targets));
+  assert.ok(s.detail.includes("跳过"), String(s.detail));
+
+  assert.equal(read(STYLE), styleBefore, "带残留的 style.css 一个字节都不许动");
+  assert.equal(stamps()[1], styleStamp, "连 mtime 都不能变");
+  assert.ok(read(STYLE).includes(CSS_RESIDUE.trim()), "别人的 CSS 字节不能被碰");
+  assert.deepEqual(marksIn(read(CHUNK)), [], "成对的 chunk 也不能被打上（否则就是半套补丁）");
+  assert.ok(read(BACKEND).includes("__kiroModelConfigProvider=t"), "干净的后端文件必须照常打上钩子");
+
+  // 残留清掉后再开：这一对也能打上（与无闸门时一致）
+  fs.writeFileSync(STYLE, CSS_FACTORY, "utf8");
+  const s2 = await S.syncGroupHeaderStyle(true);
+  assert.equal(s2.blockedBy, undefined, JSON.stringify(s2));
+  assert.ok(read(CHUNK).includes("a2k-card-head"));
+  assert.ok(read(STYLE).includes("a2k-card-head"));
+});
+
+test("提示可操作：旁边有 `.kiroproxy-bak-*` 出厂备份时结果里给出备份路径", async () => {
+  fs.writeFileSync(STYLE, `${CSS_FACTORY}${CSS_RESIDUE}`, "utf8");
+  const bak = `${STYLE}.kiroproxy-bak-1.2.56`;
+  fs.writeFileSync(bak, CSS_FACTORY, "utf8");
+  const s = await S.syncGroupHeaderStyle(true);
+  assert.equal(s.blockedBy, "kiro-proxy", JSON.stringify(s));
+  assert.deepEqual(s.kiroProxyBackups, [bak], JSON.stringify(s.kiroProxyBackups));
+  fs.rmSync(bak, { force: true });
+  // 没有备份时不编造指引
+  const s2 = await S.syncGroupHeaderStyle(true);
+  assert.equal(s2.kiroProxyBackups, undefined, JSON.stringify(s2.kiroProxyBackups));
+});
+
 test("AC-9：残留清掉后行为与无闸门时逐字一致", async () => {
-  fs.appendFileSync(STYLE, CSS_RESIDUE, "utf8");
-  fs.appendFileSync(CHUNK, JS_RESIDUE, "utf8");
+  fs.writeFileSync(CHUNK, `${syntheticChunk()}\n${JS_RESIDUE}\n`, "utf8");
+  fs.writeFileSync(STYLE, `${CSS_FACTORY}${CSS_RESIDUE}`, "utf8");
   assert.equal((await S.syncGroupHeaderStyle(true)).blockedBy, "kiro-proxy");
 
   // 手工清掉两处残留（模拟用户还原 kiro-proxy）
