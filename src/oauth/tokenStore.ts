@@ -292,7 +292,8 @@ export class TokenStore {
   }
 
   /** 复制一份 token（「创建副本」时新 provider 共用同一账号）。 */
-  copyToken(fromKey: string, toKey: string): void {    if (!this.view[fromKey]) {
+  copyToken(fromKey: string, toKey: string): void {
+    if (!this.view[fromKey]) {
       return;
     }
     this.mutate((t) => {
