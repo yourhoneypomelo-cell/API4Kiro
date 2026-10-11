@@ -1,6 +1,6 @@
 "use strict";
 // kiro-proxy 前置闸（4.13.66 起**逐文件**）：带残留的文件跳过并在结果里点名，干净文件照常打补丁；
-// 全部目标文件都带残留时退化成 4.13.65 的整轮拒绝。关闭路径只删自己的段（AC-9 / AC-15）。
+// 全部目标文件都带残留时退化成整轮拒绝。关闭路径只删自己的段（AC-9 / AC-15）。
 // 全部读写都在临时沙箱里，绝不碰真实 /Applications/Kiro.app。
 const test = require("node:test");
 const assert = require("node:assert");

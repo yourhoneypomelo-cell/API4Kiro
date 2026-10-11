@@ -26,7 +26,7 @@ export type StyleSyncResult = {
   status: TargetStatus;
   detail?: string;
   /**
-   * 前置闸动过的痕迹（4.13.65 引入，4.13.66 起改成**逐文件**粒度）。只要本轮有文件因为
+   * 前置闸动过的痕迹（4.13.66 起**逐文件**粒度）。只要本轮有文件因为
    * kiro-proxy 残留（`kiroproxy-…`）被跳过就是 `"kiro-proxy"`——可能是部分跳过（其余文件照常打补丁），
    * 也可能是全部跳过（那时 `status` / `targets` 全是 unavailable，一个字节都没写）。
    * 既有构造点不传即 `undefined`，向后兼容。
@@ -2372,7 +2372,7 @@ const KIRO_PROXY_DETAIL =
   "检测到 kiro-proxy 的补丁残留（kiroproxy-…）：为避免两套注入互相覆盖，本轮未写入带残留的那些 Kiro 文件。";
 
 /**
- * 前置闸（4.13.65 引入，4.13.66 起**逐文件**判定）：打补丁前先读目标文件，把带 kiro-proxy 残留的挑出来。
+ * 前置闸（4.13.66 起**逐文件**判定）：打补丁前先读目标文件，把带 kiro-proxy 残留的挑出来。
  *
  * 为什么逐文件而不是整轮拒绝：两套补丁只有落在**同一个文件**里才会互相覆盖（双方都按自己的标记段
  * 找段落，别人写进去的字节会让自己的锚点错位）。目标文件之间没有交叉依赖——`selectorStyle.ts` 的三处
@@ -2455,7 +2455,7 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
     info(`selector patch sync: skipped ${names.length} file(s) with a kiro-proxy residue: ${names.join(", ")}`);
   }
   if (enabled && skippedFiles.length === allTargets.length) {
-    // 全部目标文件都带残留：与 4.13.65 的整轮拒绝同义（一个字节都不写），沿用同一套状态与文案。
+    // 全部目标文件都带残留：退回整轮拒绝（一个字节都不写），沿用同一套状态与文案。
     const names = skippedFiles.map(shortTargetName);
     const backups = await findKiroProxyBackups(skippedFiles);
     info(`selector patch sync blocked by a kiro-proxy residue: ${KIRO_PROXY_DETAIL}`);
@@ -2559,7 +2559,7 @@ export const __selectorStyleInternals = {
   START,
   END,
   CARD_CSS,
-  /** 「这个文件已带本扩展的补丁」的标记集合（4.13.65 起随 internals 暴露，供 verify 脚本断言还原干净）。 */
+  /** 「这个文件已带本扩展的补丁」的标记集合（4.13.66 起随 internals 暴露，供 verify 脚本断言还原干净）。 */
   SELECTOR_PATCH_MARKS,
   /** 结构匹配器：模板以 1.0.411 压缩名书写，名字按结构捕获 / 反查 / 渲染。 */
   matchers: {

@@ -966,7 +966,7 @@ function main() {
       check("P24② 其它 package（干净）照常打上 a2k 段", cleanMissing.length === 0, cleanMissing.join("; "));
       check("P24② 别人的 kiroproxy- 字节一个都没动", kiroproxyBytes(contents()).every((v, i) => v === proxy2[i]), `${kiroproxyBytes(contents()).join(" | ")} vs ${proxy2.join(" | ")}`);
 
-      // ②b 给**剩下每一个干净文件**也注入残留 ⇒ 全部目标文件都带残留 ⇒ 退回 4.13.65 的整轮拒绝语义
+      // ②b 给**剩下每一个干净文件**也注入残留 ⇒ 全部目标文件都带残留 ⇒ 退回整轮拒绝语义
       for (const f of targetFiles) {
         if (!read(f).includes("kiroproxy-")) {
           fs.appendFileSync(f, `\n/*kiroproxy-toolcard:r1*/var kiroproxyProbe2=1;/*kiroproxy-toolcard:end*/\n`, "utf8");
