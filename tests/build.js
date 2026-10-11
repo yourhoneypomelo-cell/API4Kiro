@@ -54,9 +54,10 @@ module.exports = {
     showWarningMessage: message("warning"),
     showErrorMessage: message("error"),
     showInformationMessage: message("info"),
-    // withProgress 直接跑回调、给一个永不被取消的 token；命令调用由 commands.executeCommand 记录
+    // withProgress 直接跑回调、给一个永不被取消的 token；命令调用由 commands.executeCommand 记录。
+    // 测试要验「下载中途取消」时，把 globalThis.__a2kProgressToken 设成自己的 token 即可。
     withProgress: async (_opts, task) =>
-      task({ report() {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }),
+      task({ report() {} }, globalThis.__a2kProgressToken || { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }),
   },
   Uri: { file: (p) => ({ fsPath: p, toString: () => String(p) }) },
   commands: {

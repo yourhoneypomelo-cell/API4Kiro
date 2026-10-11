@@ -924,6 +924,12 @@ export async function installLatestFromGitHub(context: vscode.ExtensionContext, 
             }
             info(`update: sha256 verified ${got.slice(0, 12)}…`);
           } catch (e) {
+            // 取消要保住「已取消」语义：`downloadFile` 在用户在 `.sha256` 下载期间点取消时以
+            // `UpdateCancelledError` reject，原样透出（外层 catch 报「已取消更新」并清掉下载目录）；
+            // 归到下面的「摘要校验不通过」会让用户看到一条安全告警 + Release 页，排障时被误导。
+            if (e instanceof UpdateCancelledError || (e as Error)?.name === "UpdateCancelledError") {
+              throw e;
+            }
             // 独立收尾：**下载失败 / 不可解析 / 不一致** 三种都走这里。
             // 两个文件都必须删掉，并把 downloaded/dest 复位，好让下面 catch 里的 where 为空串
             // （不得提示用户去「从 VSIX 安装」一个已经被删掉的文件）。

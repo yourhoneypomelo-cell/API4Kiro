@@ -121,12 +121,16 @@ function crc32(buf) {
 /**
  * 起一个只服务本测试的假 GitHub：`/releases/latest` + 资产下载。
  * `files` = { 路径: Buffer }，`release` 由用例给出。
+ * 返回对象上的 `onRequest(url)` 可挂一个观察回调（用例用它制造「下载中途取消」的时机）。
  */
 async function startFakeGitHub(files, release) {
-  const hits = [];
+  const g = { hits: [], onRequest: undefined, base: "", close: async () => {} };
   const server = http.createServer((req, res) => {
     const url = (req.url || "").split("?")[0];
-    hits.push(url);
+    g.hits.push(url);
+    if (g.onRequest) {
+      g.onRequest(url);
+    }
     if (url === "/releases/latest") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(release));
@@ -141,8 +145,9 @@ async function startFakeGitHub(files, release) {
     res.end(body);
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${server.address().port}`;
-  return { server, base, hits, close: () => new Promise((r) => server.close(r)) };
+  g.base = `http://127.0.0.1:${server.address().port}`;
+  g.close = () => new Promise((r) => server.close(r));
+  return g;
 }
 
 function makeContext(version = "4.13.60") {
@@ -256,6 +261,56 @@ test("AC-31 边界：摘要文件下载失败 / 畸形 / 长度不对 ⇒ 一律
     assert.equal(res.status, "failed", JSON.stringify(res));
     assert.equal(installCalls().length, 0, "摘要下不下来就不能安装");
     assert.ok(!fs.existsSync(path.join(ctx.globalStorageUri.fsPath, "updates", name)));
+  });
+});
+
+test("LOW-4：在 `.sha256` 下载期间点「取消」⇒ 报「已取消更新」，不得报成摘要校验失败（安全告警 + Release 页）", async () => {
+  const vsix = makeVsix("4.13.66");
+  const { files, release, name } = releaseWithSha("4.13.66", vsix, sha(vsix));
+  await withFakeGitHub(files, release, async (g) => {
+    U._resetUpdateStateForTest();
+    for (const a of release.assets) a.browser_download_url = `${g.base}/${a.name}`;
+    const { ctx } = makeContext();
+    // 可取消的 token：假 GitHub 一收到 `.sha256` 请求就取消（正好落在那个下载的 I/O 窗口里）
+    const listeners = [];
+    const token = {
+      isCancellationRequested: false,
+      onCancellationRequested(cb) {
+        listeners.push(cb);
+        return { dispose() {} };
+      },
+    };
+    const cancel = () => {
+      token.isCancellationRequested = true;
+      for (const cb of listeners) cb();
+    };
+    g.onRequest = (url) => {
+      if (url === `/${name}.sha256`) cancel();
+    };
+    globalThis.__a2kProgressToken = token;
+    try {
+      const res = await U.installLatestFromGitHub(ctx, {
+        apiUrl: `${g.base}/releases/latest`,
+        fetchTimeoutMs: 3000,
+        download: { idleTimeoutMs: 3000, totalTimeoutMs: 3000 },
+      });
+      assert.equal(res.status, "cancelled", JSON.stringify(res));
+      assert.equal(installCalls().length, 0, "取消不得安装");
+      const ui = globalThis.__a2kUiCalls || [];
+      assert.ok(
+        ui.some((c) => c.kind === "info" && String(c.args[0]).includes("已取消更新")),
+        `应提示「已取消更新」：${JSON.stringify(ui)}`
+      );
+      assert.ok(
+        !ui.some((c) => /摘要校验/.test(String(c.args[0] || ""))),
+        `取消不得被报成摘要校验失败：${JSON.stringify(ui)}`
+      );
+      assert.ok(!String(res.error || "").includes("摘要"), String(res.error));
+      // 下载目录里的半成品被清掉（与其它取消路径一致）
+      assert.ok(!fs.existsSync(path.join(ctx.globalStorageUri.fsPath, "updates", name)), "取消后删掉已下载的文件");
+    } finally {
+      globalThis.__a2kProgressToken = undefined;
+    }
   });
 });
 
