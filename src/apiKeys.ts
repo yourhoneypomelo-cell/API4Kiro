@@ -11,6 +11,8 @@
  *
  * 不变量（I1，措辞见设计 §10）：本扩展在迁移之后**永不把新增的明文 key 写进 `settings.json`**
  * （含 `fallback.*` 兜底副本）；钥匙串不可用或写入失败时**保留原有明文**，**不得**用占位覆盖它。
+ * 反向同理（4.13.66）：钥匙串读不出来时**不得把 settings 里的占位写成空串**（那会让钥匙串里的真值失联），
+ * 见 `unresolvedPlaceholderSlots` / `mergeForWrite` 的 (a) 规则 / `reconcile` 的 I13 判据。
  */
 
 import { API_KEY_PLACEHOLDER, isPlaceholder, keySlot, legacyKeySlot, registerKeyLookup, resolveKeyValue } from "./keyPlaceholder";
@@ -135,6 +137,67 @@ function maskedField(value: string | undefined): string {
 }
 
 /**
+ * 钥匙串当前读不出来 ⇒ true。两种情形等价：`loadError` 已置位（这次读钥匙串失败），
+ * 或写入根本不会落到钥匙串（后端不是 `secrets`）。
+ *
+ * 为什么写路径需要它：`resolveKeyValue` 对「占位 + 查不到真值」与「字段本来就是空」返回**同一个** `""`。
+ * 钥匙串可读时，占位解析为空只可能是用户真的清掉了这把 Key（允许写空串、允许回收槽位）；
+ * 读不出来时，那个空值是「解析不到」而不是用户意图 —— 照写空串就会把 settings 里的占位抹掉，
+ * 钥匙串里的真值从此无人引用（既不被读也不被回收）。
+ */
+function keychainUnreadable(): boolean {
+  return !!tokenStoreLoadError() || tokenStoreBackend() !== "secrets";
+}
+
+/** 原文里是否还有 key 占位（= settings 仍把真值指向钥匙串）。判据与 `coerce` 共用同一套归一序。 */
+function rawHasPlaceholderKey(port: KeySettingsPort): boolean {
+  try {
+    for (const loc of port.slotIndexFor(port.readProviders()).values()) {
+      if (isPlaceholder(loc.raw)) {
+        return true;
+      }
+    }
+  } catch {
+    // 读设置失败：按「原文没有占位」处理，与既有行为一致（此时也没什么东西可保）
+  }
+  return false;
+}
+
+/**
+ * 钥匙串读不出来时，原文是占位、而本次解析为空的槽位。
+ *
+ * 这些空值必须当成**失败**而不是「用户清空」：注入阶段占位就被解析成了空串，`expectedSlots` 只能看到明文，
+ * 于是它一个槽位都看不到、`persistKeys` 会提前返回且不记录任何失败槽位 —— 保存路径就悄悄把占位写成了空串。
+ * 回到原文上认一遍（`slotIndexFor` 与 `coerce` 同一套归一序），失败槽位才如实。
+ */
+function unresolvedPlaceholderSlots(port: KeySettingsPort, list: ProviderConfig[], previousRaw: unknown[]): string[] {
+  if (!keychainUnreadable()) {
+    return [];
+  }
+  const rawIndex = port.slotIndexFor(previousRaw);
+  const out: string[] = [];
+  for (const p of list) {
+    if (!isKeyType(p) || reservedId(p.id)) {
+      continue;
+    }
+    const fields: Array<[string, string | undefined]> =
+      p.credentials && p.credentials.length > 0
+        ? p.credentials.map((c) => [c.id, c.apiKey] as [string, string | undefined])
+        : [[PRIMARY_CREDENTIAL_ID, p.apiKey]];
+    for (const [credentialId, value] of fields) {
+      // 有值 ⇒ 走 `persistKeys` 的既有失败路径（写入 / 穿透回读都会失败），这里只认「解析不到的空值」
+      if ((value ?? "").trim()) {
+        continue;
+      }
+      if (isPlaceholder(rawIndex.get(keySlot(p.id, credentialId))?.raw)) {
+        out.push(keySlot(p.id, credentialId));
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * 落盘形态：非空 key 字段写占位、空 key 字段写空串（等于原样）。
  * OAuth 类 provider 的 key 字段原样不动。
  * 空字段写空串而不是占位：`coerceCredentials` 会丢掉「key 类没 key 的条目」，
@@ -164,6 +227,22 @@ function slotField(p: ProviderConfig, credentialId: string, value: string | unde
   return failed.has(keySlot(p.id, credentialId)) ? "" : API_KEY_PLACEHOLDER;
 }
 
+/**
+ * (a) 的单字段规则：本次解析值为空、而原文该字段是占位 ⇒ 保留占位（不得写空串）。
+ * 调用方只在 `keychainUnreadable()` 时才会拿到非空 `rawSlots`。
+ */
+function keepPlaceholderIfUnresolved(
+  rawSlots: Map<string, RawSlotLocation>,
+  providerId: string,
+  credentialId: string,
+  value: string | undefined
+): string {
+  if ((value ?? "").trim()) {
+    return value as string;
+  }
+  return isPlaceholder(rawSlots.get(keySlot(providerId, credentialId))?.raw) ? API_KEY_PLACEHOLDER : "";
+}
+
 /** 深拷贝原文里的 credentials 数组（不把原文对象引用交给 `updateSetting`）。 */
 function copyRawCredentials(raw: unknown): Credential[] | undefined {
   if (!Array.isArray(raw)) {
@@ -184,6 +263,10 @@ function copyRawCredentials(raw: unknown): Credential[] | undefined {
  *
  * 两种写法的差别就是防「删 c1 → c2 改名成 c1」在保存失败时把已删的 A 写回。
  * `previousRaw` 必须是 `slotIndexFor` 用的同一个原文数组。
+ *
+ * (a) 额外一层防护（4.13.66）：**钥匙串读不出来时**（`keychainUnreadable`），任何 key 字段都不许从
+ * 「原文是占位」降级成空串 —— 那条空值来自「占位解析不到真值」，写下去 settings 就再也指不回钥匙串了。
+ * 只在读不出来时生效：钥匙串可读时占位解析为空 = 用户真的清了 Key，那时必须能写空串（否则 Key 永远清不掉）。
  */
 export function mergeForWrite(
   port: KeySettingsPort,
@@ -192,6 +275,8 @@ export function mergeForWrite(
   failed: ReadonlySet<string>
 ): ProviderConfig[] {
   const prevById = new Map<string, Record<string, unknown>>();
+  // (a) 用：原文各槽位的未解析值（与 `slotIndexFor` 同一套归一序）
+  const rawSlots = keychainUnreadable() ? port.slotIndexFor(previousRaw) : new Map<string, RawSlotLocation>();
   for (const raw of previousRaw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       continue;
@@ -211,7 +296,19 @@ export function mergeForWrite(
     }
     const failedHere = [...failed].some((slot) => slot.startsWith(`key:${p.id}/`));
     if (!failedHere) {
-      return withPlaceholders(port, [p])[0];
+      const out = withPlaceholders(port, [p])[0];
+      if (rawSlots.size === 0) {
+        return out;
+      }
+      // (a)：原文是占位、本次解析为空 ⇒ 保占位（不写空串）
+      if (out.credentials && out.credentials.length > 0) {
+        out.credentials = out.credentials.map((c) => ({
+          ...c,
+          apiKey: keepPlaceholderIfUnresolved(rawSlots, p.id, c.id, c.apiKey),
+        }));
+      }
+      out.apiKey = keepPlaceholderIfUnresolved(rawSlots, p.id, PRIMARY_CREDENTIAL_ID, out.apiKey);
+      return out;
     }
     const prev = prevById.get(p.id);
     if (prev && (prev.auth === "oauth") === (p.auth === "oauth")) {
@@ -422,16 +519,22 @@ export class ApiKeyVault {
    * 把 `list` 里仍是明文的 key 写进钥匙串并确认落盘，返回**失败**的槽位名（绝不外抛）。
    * 后端不是 `secrets` 时**一次 `setToken` 都不调**：`TokenStore` 在缺 SecretStorage 时不会抛错，
    * 而是静默改道 `globalState`，于是 settings 会被换成占位、key 却以明文落进插件的本地存储。
+   *
+   * 4.13.66 起同时是**保存路径的后端闸**：`tokenStoreLoadError()` / `tokenStoreBackend()` 任一不满足
+   * 「钥匙串可读可写」时，Key 类字段一律不改（保留 settings 原文）并如实报出失败槽位，
+   * 让调用方走「Key 变更未生效」而不是成功提示。metadata 不受影响，照常落盘。
    */
   async persistKeys(list: ProviderConfig[]): Promise<string[]> {
     const failed = new Set<string>();
     const expected = expectedSlots(this.port, list);
+    // 读不出钥匙串时占位早已被注入解析成空串，`expectedSlots` 看不到这些槽位 —— 回到原文上补认一遍。
+    const unresolved = unresolvedPlaceholderSlots(this.port, list, this.port.readProviders());
     if (expected.size === 0) {
-      return [];
+      return unresolved;
     }
     if (tokenStoreBackend() !== "secrets") {
       this.log.warn(`api key 保存：拿不到系统钥匙串（写入会落到插件本地存储），本次 ${expected.size} 项 Key 未生效`);
-      return [...expected];
+      return [...new Set([...expected, ...unresolved])];
     }
     const wanted: Record<string, string> = {};
     for (const p of list) {
@@ -469,7 +572,7 @@ export class ApiKeyVault {
       }
       this.log.warn(`api key 保存：落盘确认失败（${failed.size} 个槽位），本次不改写这些 Key 的落盘值`, describe(e));
     }
-    return [...failed];
+    return [...new Set([...failed, ...unresolved])];
   }
 
   /**
@@ -480,10 +583,17 @@ export class ApiKeyVault {
     const failed = new Set<string>();
     const keyProviders = list.filter((p) => isKeyType(p) && !reservedId(p.id));
     const expected = expectedSlots(this.port, list);
-    // I13 自我保护：列表里所有 key 字段都是占位（例如刚被 withPlaceholders 处理过），
-    // 说明它不是「用户意图」，此时 expectedSlots 必然是空集，照算会把槽位全删空。
-    if (expected.size === 0 && keyProviders.some((p) => hasPlaceholderKey(this.port, p))) {
-      this.log.warn("api key 回收：列表里所有 Key 字段都是占位标记，跳过槽位回收（避免把刚确认写好的钥匙串条目删空）");
+    // I13 自我保护（4.13.66 起判据含**原文快照**）：`list` 是注水后的列表，占位在注入阶段就已被解析掉，
+    // 挂在它上面这条保护在它本来要防的「钥匙串读不出来」场景里永远不会命中。两条并集：
+    //  ① 调用方递进来的就是一份全占位列表（`withPlaceholders` 的产物）——既有语义；
+    //  ② 钥匙串读不出来、而 settings 原文仍是占位 ⇒ 这个空集是「解析不到」而不是「用户清空了 Key」。
+    const listIsPlaceholder = keyProviders.some((p) => hasPlaceholderKey(this.port, p));
+    const rawPointsAtKeychain = keychainUnreadable() && rawHasPlaceholderKey(this.port);
+    if (expected.size === 0 && (listIsPlaceholder || rawPointsAtKeychain)) {
+      this.log.warn(
+        "api key 回收：本次列表里没有可确认的明文 Key（列表或 settings 原文仍是占位标记，钥匙串不可读时为真），" +
+          "跳过槽位回收（避免把刚确认写好的钥匙串条目删空）"
+      );
       return [];
     }
     if (tokenStoreBackend() !== "secrets") {

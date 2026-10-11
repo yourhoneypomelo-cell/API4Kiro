@@ -217,6 +217,88 @@ test("§8 边界 16b：只改 metadata 且保存失败时 Key 字段取原文", 
   assert.equal(h.settings().providers[0].apiKey, "sk-plain-1");
 });
 
+test("HIGH-1：迁移完成（settings 只剩占位）+ 钥匙串读失败 ⇒ 占位逐字保留、如实报失败、不给成功提示", async () => {
+  const h = await boot({ settings: { providers: [rawProvider({ apiKey: "sk-plain-1" })] } }).init();
+  const m = await h.apiKeys.migrateApiKeysOnce();
+  assert.equal(m.migrated, 1, JSON.stringify(m));
+  assert.equal(h.settings().providers[0].apiKey, PLACEHOLDER, "夹具前提：迁移完成后 settings 里只剩占位");
+  assert.equal(slotValue(h.blob, "key:p1/c1"), "sk-plain-1");
+
+  // 下一次激活时钥匙串读不出来
+  h.opts.failGet = true;
+  await h.tokenStore.initTokenStore(h.ctx);
+  assert.ok(h.tokenStore.tokenStoreLoadError(), "夹具前提：loadError 非空");
+  const list = h.providers.getProviders();
+  assert.equal(list[0].apiKey, "", "读失败期间面板看到的 key 是空的（占位解析不到真值）");
+
+  const r = await h.providers.saveProviders([{ ...list[0], name: "改了名字" }]);
+  assert.equal(r.ok, true, "settings 写入本身应成功");
+  // ① settings 里的占位仍逐字保留（不得被抹成空串）
+  assert.equal(h.settings().providers[0].apiKey, PLACEHOLDER, JSON.stringify(h.settings().providers[0]));
+  // ② 钥匙串条目仍被引用（不是孤儿）
+  assert.equal(slotValue(h.blob, "key:p1/c1"), "sk-plain-1");
+  // ③ 如实报告失败槽位
+  assert.deepEqual(r.keySlotsFailed, ["key:p1/c1"], JSON.stringify(r));
+  // ④ 组合语义：sidebar 的成功提示分支是 `ok && keySlotsFailed.length === 0`，这里必须走不到
+  assert.ok(!(r.ok && (r.keySlotsFailed || []).length === 0), "不得给出「已保存」成功提示");
+  // metadata 照常落盘
+  assert.equal(h.settings().providers[0].name, "改了名字");
+
+  // 恢复后（重载成功）渠道恢复可用，占位继续解析到真值
+  h.opts.failGet = false;
+  await h.tokenStore.reloadTokens();
+  assert.equal(h.tokenStore.tokenStoreLoadError(), undefined);
+  assert.equal(h.providers.getProviders()[0].apiKey, "sk-plain-1");
+  assert.equal(h.providers.isProviderUsable(h.providers.getProviders()[0]), true);
+});
+
+test("MEDIUM-3：读失败 ⇒ 重载成功 ⇒ loadError 清掉、key 类渠道恢复可用（多凭证 + 撤销场景一起验）", async () => {
+  const h = await boot({
+    settings: {
+      providers: [
+        rawProvider({
+          apiKey: "A",
+          credentials: [
+            { id: "c1", apiKey: "A", priority: 0, enabled: true },
+            { id: "c2", apiKey: "B", priority: 1, enabled: true },
+          ],
+        }),
+      ],
+    },
+  }).init();
+  await h.apiKeys.migrateApiKeysOnce();
+  assert.equal(slotValue(h.blob, "key:p1/c2"), "B");
+
+  h.opts.failGet = true;
+  await h.tokenStore.initTokenStore(h.ctx);
+  assert.equal(h.tokenStore.tokenStoreLoadError().code, "keychain_read_failed");
+  const dark = h.providers.getProviders()[0];
+  assert.equal(dark.apiKey, "");
+  assert.ok(!h.providers.isProviderUsable(dark), "读失败期间 key 类渠道不可用");
+  assert.equal(h.providers.providerMissing(dark), "缺少 API Key");
+
+  h.opts.failGet = false;
+  await h.tokenStore.reloadTokens();
+  assert.equal(h.tokenStore.tokenStoreLoadError(), undefined, "重载成功后 loadError 必须清掉");
+  const lit = h.providers.getProviders()[0];
+  assert.equal(lit.apiKey, "A");
+  assert.deepEqual(lit.credentials.map((c) => c.apiKey), ["A", "B"], "两把 key 都回来了");
+  assert.equal(h.providers.isProviderUsable(lit), true);
+});
+
+test("HIGH-1 反向：钥匙串可读时「清除 Key」仍然生效（占位 → 空串是用户意图，不得被保住）", async () => {
+  const h = await boot({ settings: { providers: [rawProvider({ apiKey: "A" })] } }).init();
+  await h.providers.saveProviders(h.providers.getProviders());
+  assert.equal(h.settings().providers[0].apiKey, PLACEHOLDER);
+  const list = h.providers.getProviders();
+  list[0].apiKey = "";
+  list[0].credentials = undefined;
+  const r = await h.providers.saveProviders(list);
+  assert.deepEqual(r.keySlotsFailed, []);
+  assert.equal(h.settings().providers[0].apiKey, "", "钥匙串可读时清 Key 必须能落盘成空");
+  assert.equal(slotValue(h.blob, "key:p1/c1"), undefined, "槽位被回收");
+});
+
 test("后端闸：假上下文没有 secrets ⇒ 不写钥匙串、Key 处理全部报失败、明文保留", async () => {
   const h = await boot({ settings: { providers: [rawProvider({ apiKey: "sk-plain-1" })] }, noSecrets: true }).init();
   const r = await h.providers.saveProviders(h.providers.getProviders());
