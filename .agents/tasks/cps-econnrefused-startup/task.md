@@ -1,8 +1,8 @@
 # Task: eliminate "Unable to fetch account usage data: connect ECONNREFUSED 127.0.0.1:19811" on Kiro startup
 
-Repo: /Users/macbkkopro/Documents/API4Kiro (branch `main`, work directly in it; no worktree). Do NOT commit; leave changes uncommitted for the user to review.
+Repo: <repo> (branch `main`, work directly in it; no worktree). Do NOT commit; leave changes uncommitted for the user to review.
 
-Root-cause analysis (already confirmed, read it first): /Users/macbkkopro/Documents/API4Kiro/.agents/tasks/cps-econnrefused-startup/findings.md
+Root-cause analysis (already confirmed, read it first): <repo>/.agents/tasks/cps-econnrefused-startup/findings.md
 
 Summary: `kiro.kiroAgent` is in our `extensionDependencies`, so kiro-agent activates before our `activate()`. During its activation it calls `kiro.usageLimits.getUsageLimits` against the persisted `codewhisperer.config.cpsEndpoints` (http://127.0.0.1:19811) before our CPS server binds. It gets ECONNREFUSED, has no retry, and shows a rate-limited error toast (`showErrorToastRateLimited`, function `WEf`, 5 min window `aga=300*1e3`; message built in command handler in function `dga`: `` `Unable to fetch account usage data: ${f.message}` ``). Our CPS returns `{}` for usage anyway (`src/cpsServer.ts` getusagelimits branch), so this is cosmetic.
 

@@ -1,6 +1,6 @@
 # Kiro 1.2.56 兼容：调查结论与实施计划
 
-worktree：`/Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat`（分支 `fix/kiro-1.2.56-compat`，HEAD `ac64f04`，4.13.63）
+worktree：`<repo>/.worktrees/kiro-1.2.56-compat`（分支 `fix/kiro-1.2.56-compat`，HEAD `ac64f04`，4.13.63）
 目标 Kiro：1.2.56（product.json commit `a9f29386…`，date 2026-10-08；kiro-agent `kiroAgent` 1.1.343）
 
 ## 0. 结论
@@ -91,11 +91,11 @@ worktree：`/Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat`�
 ## 4. 实施计划
 
 约定：
-- 所有路径都在 worktree 里，用绝对路径。git 一律用 `git -C /Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat`。
+- 所有路径都在 worktree 里，用绝对路径。git 一律用 `git -C <repo>/.worktrees/kiro-1.2.56-compat`。
 - 不碰 `/Applications/Kiro.app`，不往 Kiro 里装 vsix。
 - 只在本地提交，不 push。提交信息用 Conventional Commits，见 CONTRIBUTING。
 
-下文 `W=/Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat`，`FX=/tmp/kiro-1.2.56-factory`。
+下文 `W=<repo>/.worktrees/kiro-1.2.56-compat`，`FX=/tmp/kiro-1.2.56-factory`。
 
 - [ ] 1. **装依赖并确认基线**
       在 `$W` 里跑 `npm ci`。
@@ -237,7 +237,7 @@ worktree：`/Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat`�
 
 - [ ] 8. **整体验证**，依赖 1–7
       ```bash
-      cd /Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat
+      cd <repo>/.worktrees/kiro-1.2.56-compat
       npm run compile
       npm_config_yes=true npm run package            # 生成 api2kiro-dual-4.13.64.vsix（*.vsix 已被 gitignore）
       python3 - <<'PY'                               # 复刻 CI 的密钥检查

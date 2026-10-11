@@ -1,6 +1,6 @@
 # Kiro 1.2.56 兼容：验证记录（4.13.64，第 1 轮）
 
-worktree：`/Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat`（分支 `fix/kiro-1.2.56-compat`，基于 `ac64f04`）
+worktree：`<repo>/.worktrees/kiro-1.2.56-compat`（分支 `fix/kiro-1.2.56-compat`，基于 `ac64f04`）
 目标：Kiro 1.2.56（`/Applications/Kiro.app` product.json：`1.2.56 a9f293869e317e8f9e195227dffceb57fe52a847`）
 本轮没有 review.json，是第一轮，按 findings.md §4 第 1–8 项从头实现。
 

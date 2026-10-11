@@ -85,6 +85,6 @@ Not tested：运行中的 Kiro 1.2.56 里的面板视觉和键盘导航、Ctx �
 - `docs/ARCHITECTURE.md`：两代靶点一节、结构匹配规则、已知限制。
 - `package.json`、`package-lock.json`：4.13.63 → 4.13.64。
 
-完整 diff：`git -C /Users/macbkkopro/Documents/API4Kiro/.worktrees/kiro-1.2.56-compat diff main...HEAD`
+完整 diff：`git -C <repo>/.worktrees/kiro-1.2.56-compat diff main...HEAD`
 
 </details>

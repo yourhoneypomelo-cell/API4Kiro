@@ -20,5 +20,5 @@
       "detail": "README 第 63 行写「已在 … 1.2.56 上验证」，实际只做了文件结构验证。建议改成「按 1.2.56 文件结构验证」，与 ARCHITECTURE 的措辞一致，或者手动确认后再保留原句。"
     }
   ],
-  "reviewDoc": "/Users/macbkkopro/Documents/API4Kiro/.agents/tasks/kiro-1.2.56-compat/review.md"
+  "reviewDoc": "<repo>/.agents/tasks/kiro-1.2.56-compat/review.md"
 }
