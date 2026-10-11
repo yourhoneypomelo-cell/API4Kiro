@@ -893,6 +893,7 @@ function main() {
     section("P24 kiro-proxy 前置闸（4.13.66 逐文件）：带残留的文件跳过并点名、干净文件照常打补丁；全部带残留才整轮拒绝");
     {
       const backendFile = I.paths.kiroAgentBackendFile();
+      const N = require(path.join(BUILD, "kiroProxyNotice.js"));
       const targetFiles = [...fx.packages.flatMap((p) => [p.chunk, p.style]), backendFile];
       const contents = () => targetFiles.map((f) => read(f));
       const stamp = (f) => {
@@ -944,6 +945,15 @@ function main() {
         s2.blockedBy === "kiro-proxy" && s2.status === "unavailable",
         JSON.stringify(s2)
       );
+      // 回归（4.13.66 修复）：部分跳过时三个靶点字段也全是 unavailable，所以「是否全部跳过」
+      // 只能是显式字段，不能再从 targets 反推。
+      check("P24② 部分跳过 ⇒ allSkipped=false（不得由三个 unavailable 反推成整轮拒绝）", s2.allSkipped === false, JSON.stringify(s2));
+      {
+        const notice = N.buildKiroProxyNotice(s2);
+        const text = notice.head + notice.why + notice.hint;
+        check("P24② 部分跳过文案不说「未写入任何」且点名被跳过的文件", !text.includes("未写入任何") && text.includes(short(p0.chunk)) && text.includes(short(p0.style)), text);
+        check("P24② 部分跳过文案说明其余干净文件已照常打补丁", notice.head.includes("其余干净文件已照常打补丁"), notice.head);
+      }
       check(
         "P24② 跳过清单点名带残留的那一对文件（chunk + 同 package 的 style.css）",
         sameList(s2.skippedBy || [], [short(p0.chunk), short(p0.style)]),
@@ -987,7 +997,13 @@ function main() {
       check("P24②b 全部带残留 ⇒ bytes 逐字一致", contents().every((t, i) => t === before2b[i]), "有文件被改写了");
       check("P24②b 全部带残留 ⇒ mtime 逐字一致", stamps().every((t, i) => t === stamps2b[i]), `${stamps().join(" ")} vs ${stamps2b.join(" ")}`);
       check("P24②b 跳过清单覆盖全部目标文件", sameList(s2b.skippedBy || [], targetFiles.map(short)), JSON.stringify(s2b.skippedBy));
+      check("P24②b 全部带残留 ⇒ allSkipped=true", s2b.allSkipped === true, JSON.stringify(s2b));
       check("P24②b 有中文 detail 且提到跳过", !!s2b.detail && s2b.detail.includes("跳过"), String(s2b.detail));
+      {
+        const notice = N.buildKiroProxyNotice(s2b);
+        const text = notice.head + notice.why + notice.hint;
+        check("P24②b 全部带残留 ⇒ 文案说「本次未写入任何 Kiro 文件」", text.includes("本次未写入任何 Kiro 文件"), text);
+      }
 
       // ③ 关闭：只删自己的段，kiroproxy- 的字节一个都不碰
       const proxy3Before = kiroproxyBytes(contents());

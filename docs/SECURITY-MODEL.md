@@ -140,7 +140,7 @@ flowchart LR
 | --- | --- | --- |
 | 系统钥匙串**读**失败（`secrets.get` 抛错，或 blob 不是合法 JSON） | key 类渠道的 Key 与 OAuth token 都在钥匙串里，读取侧每轮解析占位时取不到真值 ⇒ **该渠道整会话不可用**（面板显示「未配置」，不阻断激活）；此时保存**不会**把 `settings.json` 里的占位写成空串，失败槽位如实上报并提示「本次 Key 变更未生效」（`oauth/tokenStore.ts` `loadFailed`；`apiKeys.ts` `unresolvedPlaceholderSlots` / `mergeForWrite` / `reconcile`） | 打开 / 切回侧边栏面板触发一次重读（`sidebar.ts` `retryTokenStoreRead` → `reloadTokens()`），或**重载窗口**；重读成功后 `loadError` 清掉、渠道恢复可用（该路径有回归测试） |
 | 宿主不提供 SecretStorage | 后端闸：不迁移、不写钥匙串，保留明文并记日志；卸载脚本也删不掉钥匙串条目 | 环境问题，换支持钥匙串的宿主后重启 |
-| 目标文件带 `kiro-proxy` 残留（`kiroproxy-…`） | 前置闸**逐文件**跳过（同一 package 的 chunk 与 `style.css` 成对跳过，其余干净文件照常打补丁）；该视图的模型选择器原样显示 `__A2K_GRP__|…` 内部标记 | 用同目录的 `.kiroproxy-bak-*` 出厂备份覆盖对应文件，或在 kiro-proxy 一侧还原后重开卡片样式 |
+| 目标文件带 `kiro-proxy` 残留（`kiroproxy-…`） | 前置闸**逐文件**跳过（同一 package 的 chunk 与 `style.css` 成对跳过，其余干净文件照常打补丁）；该视图的模型选择器原样显示 `__A2K_GRP__|…` 内部标记 | 用该文件自己的同目录 `.kiroproxy-bak-*` 出厂备份覆盖回它（先退出 Kiro）；**没有**备份的那几份只能到 kiro-proxy 一侧还原它的补丁，或手工删掉文件里的 `kiroproxy-` 标记段。注意同一 package 的 chunk 与 `style.css` 是**成对**跳过：只还原其中一份、另一份仍带残留时，这一对仍会被跳过（应用内提示按「有备份 / 无备份」逐份列出，并说明这一点） |
 | 目标文件被占用 / 只读 / 权限不足 | 三处写入先算计划再按序提交，任一失败回滚本轮已写文件并报 unavailable | 关闭代理或调整权限后重试；重装 / 更新 Kiro 会恢复出厂文件 |
 | 卸载钩子未执行或超时（约 5 秒由 VS Code 决定） | 端点仍指向已停掉的本地端口（Kiro 在此期间连不上） | 退出 Kiro 后手工删除 `settings.json` 里的 `codewhisperer.config.endpoints` / `krsEndpoints` / `cpsEndpoints` 三键（见 README 卸载说明） |
 

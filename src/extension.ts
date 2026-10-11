@@ -9,6 +9,7 @@ import {
   updateSetting,
 } from "./config";
 import { syncGroupHeaderStyle, triggerKiroModelRefresh, type StyleSyncResult } from "./selectorStyle";
+import { buildKiroProxyNotice } from "./kiroProxyNotice";
 import { CTX_CONFIG_ID, decodeCtxConfigValue } from "./contextWindow";
 import { checkForUpdate, GITHUB_URL, installLatestFromGitHub } from "./updateChecker";
 import { openInBrowser } from "./openBrowser";
@@ -257,20 +258,11 @@ function notifyStyleSync(result: StyleSyncResult): void {
     }
     styleSyncWarned.add(key);
     error("selector patch sync skipped files with a kiro-proxy residue:", skipped.join(", "));
-    const t = result.targets;
-    const allSkipped = t.style === "unavailable" && t.selectorScript === "unavailable" && t.backend === "unavailable";
-    const head = allSkipped
-      ? "API4Kiro 检测到 Kiro 目录里有 kiro-proxy 的补丁残留（kiroproxy-），为避免两套补丁互相覆盖，本次未写入任何 Kiro 文件。"
-      : `API4Kiro 检测到 kiro-proxy 的补丁残留（kiroproxy-），本次跳过这些文件：${skipped.join("、")}；其余干净文件已照常打补丁。`;
-    const why =
-      "两套补丁落在同一个文件里会互相覆盖（双方的段落标记都可能认不出来），所以带残留的那份不能动。" +
-      "被跳过的那一处，模型选择器会原样显示 __A2K_GRP__|… 这类内部标记、分组标题也可能被选中。";
-    const backups = result.kiroProxyBackups || [];
-    const hint =
-      backups.length > 0
-        ? `本机检测到 kiro-proxy 自己留下的出厂备份，可用它覆盖回对应文件（先退出 Kiro 以免文件被占用，备份名去掉 .kiroproxy-bak-<版本> 后缀就是原文件名）：${backups.join("、")}。`
-        : "请先在 kiro-proxy 一侧还原它的补丁（或恢复 Kiro 出厂文件）后重新打开本扩展的卡片样式。";
-    void vscode.window.showWarningMessage(head + why + hint);
+    // 全部跳过 / 部分跳过由 result.allSkipped（selectorStyle 逐文件判定后显式传出）决定，
+    // 不再由 targets 三个字段反推——部分跳过时它们同样全是 unavailable。
+    // 文案与补救指引全在纯函数里（kiroProxyNotice.ts），单测直接断言两种分支。
+    const notice = buildKiroProxyNotice(result);
+    void vscode.window.showWarningMessage(notice.head + notice.why + notice.hint);
     return;
   }
   if (result.status !== "unavailable" || !result.detail || /\bENOENT\b/.test(result.detail)) {

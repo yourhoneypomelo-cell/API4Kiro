@@ -15,11 +15,19 @@ const PKG_DIST = path.join(EXT_DIR, "packages/kiro-ui-agent-chat/dist");
 const BACKEND = path.join(EXT_DIR, "dist/extension.js");
 const STYLE = path.join(PKG_DIST, "style.css");
 const CHUNK = path.join(PKG_DIST, "assets/mermaid-gate.js");
+// 真机布局里的第二个 package（session-details 那一对）。默认夹具不带它；
+// 需要 5 份目标文件的用例自己建，由 seedSandbox 在下一个用例前清掉。
+const PKG2_DIR = path.join(EXT_DIR, "packages/kiro-ui-session-details");
+const PKG2_DIST = path.join(PKG2_DIR, "dist");
+const CHUNK2 = path.join(PKG2_DIST, "assets/mermaid-gate2.js");
+const STYLE2 = path.join(PKG2_DIST, "style.css");
 
 // 宿主桩在 require 时读 A2K_APP_ROOT，所以必须在装载编译产物之前指到沙箱。
 process.env.A2K_APP_ROOT = APP;
 
 const S = require("./.build/selectorStyle.js");
+// 提示文案的纯函数（无 vscode 依赖）：单测直接断言「全部跳过 / 部分跳过」两种输出。
+const N = require("./.build/kiroProxyNotice.js");
 const I = S.__selectorStyleInternals;
 const M = I.matchers;
 const P = I.patterns;
@@ -50,6 +58,19 @@ const BACKEND_FACTORY =
 const CSS_FACTORY = ":root{--x:1}\nbody{margin:0}\n";
 
 function seedSandbox() {
+  // 带第二个 package 的用例（真机布局）跑完由这里清掉，免得后面的用例看到 4 份目标文件；
+  // 上一轮用例留在文件旁的 `.kiroproxy-bak-*` 同理（它会改变前置闸的备份清单）。
+  fs.rmSync(PKG2_DIR, { recursive: true, force: true });
+  for (const dir of new Set([path.dirname(CHUNK), path.dirname(STYLE), path.dirname(BACKEND)])) {
+    if (!fs.existsSync(dir)) {
+      continue;
+    }
+    for (const n of fs.readdirSync(dir)) {
+      if (n.includes(".kiroproxy-bak-")) {
+        fs.rmSync(path.join(dir, n), { force: true });
+      }
+    }
+  }
   fs.mkdirSync(path.dirname(BACKEND), { recursive: true });
   fs.mkdirSync(path.dirname(CHUNK), { recursive: true });
   fs.writeFileSync(BACKEND, BACKEND_FACTORY, "utf8");
@@ -98,6 +119,11 @@ test("①开补丁写入 a2k 段 → ②整轮带残留时逐文件跳过并点�
   assert.deepEqual(s2.targets, { style: "unavailable", selectorScript: "unavailable", backend: "unavailable" });
   assert.deepEqual(s2.extras, { ctxSelector: "unavailable", ctxHost: "unavailable", usageRetry: "unavailable" });
   assert.deepEqual([...s2.skippedBy].sort(), [shortName(CHUNK), shortName(STYLE), shortName(BACKEND)].sort(), JSON.stringify(s2.skippedBy));
+  assert.equal(s2.allSkipped, true, `全部目标都带残留必须显式报 allSkipped=true：${JSON.stringify(s2)}`);
+  const noticeAll = N.buildKiroProxyNotice(s2);
+  const textAll = noticeAll.head + noticeAll.why + noticeAll.hint;
+  assert.ok(textAll.includes("本次未写入任何 Kiro 文件"), textAll);
+  assert.ok(!textAll.includes("其余干净文件已照常打补丁"), textAll);
   assert.ok(s2.detail && s2.detail.includes("kiro-proxy"), String(s2.detail));
   assert.deepEqual(contents(), before2, "全部带残留时整轮不得写任何目标文件");
   assert.deepEqual(stamps(), stamps2, "mtime 也不得变");
@@ -124,6 +150,7 @@ test("逐文件：只有一个文件带残留 ⇒ 干净文件照常打补丁，
   const s = await S.syncGroupHeaderStyle(true);
   assert.equal(s.blockedBy, "kiro-proxy", JSON.stringify(s));
   assert.equal(s.status, "unavailable", JSON.stringify(s));
+  assert.equal(s.allSkipped, false, `部分跳过必须显式报 allSkipped=false：${JSON.stringify(s)}`);
   // 同 package 的 chunk 与 style.css 必须成对：这份 style.css 带残留 ⇒ 这一对一起跳过
   assert.deepEqual([...s.skippedBy].sort(), [shortName(CHUNK), shortName(STYLE)].sort(), JSON.stringify(s.skippedBy));
   assert.deepEqual(s.targets, { style: "unavailable", selectorScript: "unavailable", backend: "applied" }, JSON.stringify(s.targets));
@@ -202,4 +229,84 @@ test("闸门只对开启路径生效：关闭态（factory 夹具）不读残留
   assert.equal(s.blockedBy, undefined);
   assert.notEqual(s.status, "unavailable", JSON.stringify(s));
   assert.ok(read(STYLE).includes("kiroproxy-ctxwin-wrap"), "关闭路径不碰别人的字节");
+});
+
+// 回归：本机 4.13.66 的真实布局（5 份目标文件，脏 3 份）。修复前 `allSkipped` 由 targets 反推，
+// 三个字段全 unavailable ⇒ 被当成「一个字节都没写」，用户看到「本次未写入任何 Kiro 文件」而实际
+// session-details 那一对照常打上了补丁。
+test("回归：部分跳过（脏 3 份 / 干净 2 份）必须报 allSkipped=false，且文案不得说「未写入任何」", async () => {
+  fs.mkdirSync(path.dirname(CHUNK2), { recursive: true });
+  fs.writeFileSync(CHUNK2, syntheticChunk(), "utf8");
+  fs.writeFileSync(STYLE2, CSS_FACTORY, "utf8");
+  await S.syncGroupHeaderStyle(false);
+
+  // 真机上带残留的三处：agent-chat 的 chunk 与 style.css、后端 dist/extension.js（session-details 一对干净）
+  fs.appendFileSync(CHUNK, JS_RESIDUE, "utf8");
+  fs.appendFileSync(STYLE, CSS_RESIDUE, "utf8");
+  fs.appendFileSync(BACKEND, `\n${JS_RESIDUE}\n`, "utf8");
+  // 备份也照真机：chunk 与后端有，agent-chat 的 style.css 没有（成对规则因此解不开）
+  const bakOf = (f) => `${f}.kiroproxy-bak-1.2.56`;
+  fs.writeFileSync(bakOf(CHUNK), syntheticChunk(), "utf8");
+  fs.writeFileSync(bakOf(BACKEND), BACKEND_FACTORY, "utf8");
+
+  const s = await S.syncGroupHeaderStyle(true);
+  assert.equal(s.blockedBy, "kiro-proxy", JSON.stringify(s));
+  assert.equal(s.status, "unavailable", JSON.stringify(s));
+  assert.equal(s.allSkipped, false, `部分跳过必须显式报 false：${JSON.stringify(s)}`);
+  assert.deepEqual(
+    [...s.skippedBy].sort(),
+    [shortName(CHUNK), shortName(STYLE), shortName(BACKEND)].sort(),
+    JSON.stringify(s.skippedBy)
+  );
+  assert.deepEqual(
+    s.targets,
+    { style: "unavailable", selectorScript: "unavailable", backend: "unavailable" },
+    "三个字段全 unavailable 是部分跳过的正常形态——正因如此不能再拿它反推「什么都没写」"
+  );
+  assert.deepEqual(
+    [...(s.kiroProxyBackups || [])].sort(),
+    [bakOf(CHUNK), bakOf(BACKEND)].sort(),
+    JSON.stringify(s.kiroProxyBackups)
+  );
+
+  // 干净的那一对照常打上补丁（这正是修复前被「未写入任何」掩盖掉的事实）
+  assert.ok(marksIn(read(CHUNK2)).length > 0, `干净 chunk 应有 a2k 标记：${read(CHUNK2).slice(0, 200)}`);
+  assert.ok(read(CHUNK2).includes("a2k-card-head"));
+  assert.ok(read(STYLE2).includes("a2k-card-head"), read(STYLE2));
+  // 带残留的三份一个字节都没动
+  assert.ok(read(CHUNK).includes(JS_RESIDUE) && read(STYLE).includes(CSS_RESIDUE.trim()), "带残留的文件被改写了");
+  assert.deepEqual(marksIn(read(CHUNK)), []);
+  assert.equal(read(BACKEND), `${BACKEND_FACTORY}\n${JS_RESIDUE}\n`);
+
+  const notice = N.buildKiroProxyNotice(s);
+  const text = notice.head + notice.why + notice.hint;
+  assert.ok(!text.includes("未写入任何"), `部分跳过不得说「未写入任何」：${text}`);
+  for (const f of s.skippedBy) {
+    assert.ok(notice.head.includes(f), `head 未点名 ${f}：${notice.head}`);
+  }
+  assert.ok(notice.head.includes("其余干净文件已照常打补丁"), notice.head);
+  assert.ok(!notice.why.includes("那一处"), `跳过 3 份时不得用单数措辞：${notice.why}`);
+  // hint 逐份对应：有备份的两份列出「文件 ← 备份」，没有备份的 style.css 单独列出并说明成对规则的后果
+  assert.ok(notice.hint.includes(`${shortName(CHUNK)} ← ${bakOf(CHUNK)}`), notice.hint);
+  assert.ok(notice.hint.includes(`${shortName(BACKEND)} ← ${bakOf(BACKEND)}`), notice.hint);
+  assert.ok(notice.hint.includes(`没有出厂备份的被跳过文件：${shortName(STYLE)}`), notice.hint);
+  assert.ok(notice.hint.includes("成对打补丁"), notice.hint);
+  assert.ok(!notice.hint.includes(`没有出厂备份的被跳过文件：${shortName(CHUNK)}`), notice.hint);
+});
+
+test("部分跳过且只跳过一份时用单数措辞，并给出「到 kiro-proxy 一侧还原」的指引", async () => {
+  fs.writeFileSync(BACKEND, `${BACKEND_FACTORY}\n${JS_RESIDUE}\n`, "utf8");
+  const s = await S.syncGroupHeaderStyle(true);
+  assert.equal(s.allSkipped, false, JSON.stringify(s));
+  assert.deepEqual(s.skippedBy, [shortName(BACKEND)], JSON.stringify(s.skippedBy));
+
+  const n = N.buildKiroProxyNotice(s);
+  const text = n.head + n.why + n.hint;
+  assert.ok(!text.includes("未写入任何"), text);
+  assert.ok(n.why.includes("带残留的那一份不能动"), n.why);
+  assert.ok(n.why.includes("被跳过的那一处"), n.why);
+  assert.ok(!n.why.includes("那几份"), n.why);
+  assert.ok(n.hint.includes(`没有出厂备份的被跳过文件：${shortName(BACKEND)}`), n.hint);
+  assert.ok(n.hint.includes("kiro-proxy 一侧还原"), n.hint);
+  assert.ok(!n.hint.includes("成对打补丁"), `没有备份可还原时不必讲成对规则：${n.hint}`);
 });

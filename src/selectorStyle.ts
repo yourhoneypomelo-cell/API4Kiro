@@ -28,7 +28,8 @@ export type StyleSyncResult = {
   /**
    * 前置闸动过的痕迹（4.13.66 起**逐文件**粒度）。只要本轮有文件因为
    * kiro-proxy 残留（`kiroproxy-…`）被跳过就是 `"kiro-proxy"`——可能是部分跳过（其余文件照常打补丁），
-   * 也可能是全部跳过（那时 `status` / `targets` 全是 unavailable，一个字节都没写）。
+   * 也可能是全部跳过（那时 `status` / `targets` 全是 unavailable、`allSkipped === true`，一个字节都没写）。
+   * 区分这两者**只能**看 `allSkipped`：部分跳过时 `targets` 同样可能三个字段全 unavailable。
    * 既有构造点不传即 `undefined`，向后兼容。
    */
   blockedBy?: "kiro-proxy";
@@ -39,6 +40,13 @@ export type StyleSyncResult = {
    * 有值时提示文案里给出「可用它恢复该文件」的可操作指引（谁的备份归谁，不存在自动覆盖）。
    */
   kiroProxyBackups?: string[];
+  /**
+   * **显式**回答「本轮是不是所有目标文件都带残留、一个字节都没写」。只有 `blockedBy === "kiro-proxy"` 的结果才设它：
+   * 逐文件闸门下不得再由 `targets` 反推——部分跳过时被跳过的 chunk 与后端同样报 `unavailable`，
+   * 「三个字段都 unavailable」因此不再等于「什么也没写」（4.13.66 的误报来源）。
+   * 全部跳过 ⇒ `true`；部分跳过 ⇒ `false`；其它情况 `undefined`。
+   */
+  allSkipped?: boolean;
   /** 三个靶点文件各自的结果：style.css / mermaid-*.js / kiro-agent dist/extension.js */
   targets: { style: TargetStatus; selectorScript: TargetStatus; backend: TargetStatus };
   /**
@@ -2411,7 +2419,11 @@ function shortTargetName(file: string): string {
   return rel && !rel.startsWith("..") ? rel : path.basename(file);
 }
 
-/** 被跳过的文件旁边有没有 kiro-proxy 自己留下的出厂备份（有则在提示里给出恢复指引）。 */
+/**
+ * 被跳过的文件旁边有没有 kiro-proxy 自己留下的出厂备份（有则在提示里给出恢复指引）。
+ * 注意这里是「这些文件所在目录下的所有备份」，不保证每份被跳过的文件都有自己的备份——
+ * 提示文案按文件逐份配对、把没有备份的那几份单独列出来（见 `kiroProxyNotice.ts`）。
+ */
 async function findKiroProxyBackups(files: string[]): Promise<string[]> {
   const out: string[] = [];
   for (const dir of [...new Set(files.map((f) => path.dirname(f)))]) {
@@ -2465,6 +2477,8 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
       detail: `跳过 ${names.join("、")}（${KIRO_PROXY_DETAIL}）`,
       skippedBy: names,
       ...(backups.length > 0 ? { kiroProxyBackups: backups } : {}),
+      // 一个字节都没写：显式告诉调用方，别让它在 targets 上反推（见 allSkipped 的字段注释）。
+      allSkipped: true,
       targets: { style: "unavailable", selectorScript: "unavailable", backend: "unavailable" },
       extras: { ctxSelector: "unavailable", ctxHost: "unavailable", usageRetry: "unavailable" },
     };
@@ -2543,6 +2557,8 @@ async function syncGroupHeaderStyleUnlocked(enabled: boolean): Promise<StyleSync
     out.status = "unavailable";
     out.blockedBy = "kiro-proxy";
     out.skippedBy = names;
+    // 走到这里说明目标文件只被跳过了一部分（全部跳过在上面早退分支里）：显式报 false。
+    out.allSkipped = false;
     const backups = await findKiroProxyBackups(skippedFiles);
     if (backups.length > 0) {
       out.kiroProxyBackups = backups;
